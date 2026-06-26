@@ -17,6 +17,7 @@
 
 # Local Claude settings
 .claude/settings.local.json
+.claude-task-master/
 
 # Build artifacts
 *.deb
