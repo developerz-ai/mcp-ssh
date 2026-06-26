@@ -128,14 +128,14 @@ Requires Rust 1.85+ (edition 2024).
 
 ## ⚙️ Config & env
 
-File: `/etc/mcp-ssh/config.toml` (or `$XDG_CONFIG_HOME/mcp-ssh/config.toml`). **Env vars override the file** — handy in systemd units and containers.
+File: `/etc/mcp-ssh/config.toml` (or override the path with `$MCP_SSH_CONFIG`). **Env vars override the file** — handy in systemd units and containers.
 
 | Env var | Default | Meaning |
 |---|---|---|
 | `MCP_SSH_BIND` | `127.0.0.1:1337` | bind address — keep on loopback behind the proxy |
 | `MCP_SSH_USER` / `MCP_SSH_PASS` | — | credentials (prefer `mcp-ssh set-auth`) |
 | `MCP_SSH_INLINE_TIMEOUT_SECS` | `2` | inline window before `bash` backgrounds |
-| `MCP_SSH_JOB_DIR` | `/tmp/mcp-ssh-jobs` | per-job log files |
+| `MCP_SSH_JOB_DIR` | `/var/lib/mcp-ssh/jobs` | per-job log files |
 | `MCP_SSH_ALLOWED_HOSTS` | `localhost,127.0.0.1` | hostnames accepted in `Host` — **set to your public hostname** |
 
 ## ⚠️ Hardening checklist

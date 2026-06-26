@@ -118,7 +118,7 @@ file(action="move", src="/tmp/out.tar.gz", dest="/srv/releases/out.tar.gz")
 
 ## ⚙️ Configuration
 
-Config lives at `/etc/mcp-ssh/config.toml` (or `$XDG_CONFIG_HOME/mcp-ssh/config.toml`). **Env vars override the file.**
+Config lives at `/etc/mcp-ssh/config.toml` (or override the path with `$MCP_SSH_CONFIG`). **Env vars override the file.**
 
 | Env var | Default | Meaning |
 |---|---|---|
@@ -127,7 +127,7 @@ Config lives at `/etc/mcp-ssh/config.toml` (or `$XDG_CONFIG_HOME/mcp-ssh/config.
 | `MCP_SSH_USER` | — | Basic/OAuth username (set via `mcp-ssh set-auth`) |
 | `MCP_SSH_PASS` | — | password (set via `mcp-ssh set-auth`) |
 | `MCP_SSH_INLINE_TIMEOUT_SECS` | `2` | inline window before `bash` backgrounds |
-| `MCP_SSH_JOB_DIR` | `/tmp/mcp-ssh-jobs` | where per-job log files live |
+| `MCP_SSH_JOB_DIR` | `/var/lib/mcp-ssh/jobs` | where per-job log files live |
 | `MCP_SSH_ALLOWED_HOSTS` | `localhost,127.0.0.1` | hostnames accepted in the `Host` header (DNS-rebinding guard) — **set this to your public hostname** |
 
 ### Listen port
