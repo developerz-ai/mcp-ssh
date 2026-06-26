@@ -25,7 +25,9 @@ pub enum JobState {
 struct Job {
     cmd: String,
     log_path: PathBuf,
-    pid: Option<u32>,
+    /// Process group to signal on kill. The child leads its own group, so this
+    /// equals its pid (see `run`). `None` only if the OS withheld a pid.
+    pgid: Option<u32>,
     state: Arc<Mutex<JobState>>,
     started: tokio::time::Instant,
 }
@@ -106,9 +108,13 @@ impl JobStore {
         if let Some(dir) = cwd {
             command.current_dir(dir);
         }
+        // Own process group (child becomes leader, so pgid == pid). Lets `kill`
+        // signal the whole tree the command spawns, not just `sh` itself.
+        #[cfg(unix)]
+        command.process_group(0);
 
         let mut child = command.spawn()?;
-        let pid = child.id();
+        let pgid = child.id();
         let (tx, rx) = watch::channel(false);
         let state = Arc::new(Mutex::new(JobState::Running));
 
@@ -132,7 +138,7 @@ impl JobStore {
         let job = Arc::new(Job {
             cmd,
             log_path: log_path.clone(),
-            pid,
+            pgid,
             state: state.clone(),
             started: tokio::time::Instant::now(),
         });
@@ -187,15 +193,18 @@ impl JobStore {
         out
     }
 
-    /// Kill a running job by pid. Returns false if unknown id.
+    /// Kill a running job's whole process group. Returns false if unknown id.
     pub async fn kill(&self, id: &str) -> bool {
         let Some(job) = self.jobs.lock().await.get(id).cloned() else {
             return false;
         };
-        if let Some(pid) = job.pid {
-            // ponytail: shell out to `kill`; pid reuse is a non-issue at our scale.
+        if let Some(pgid) = job.pgid {
+            // Negative pid targets the process group, so descendants the command
+            // spawned die too — not just `sh`. `--` keeps `kill` from reading the
+            // leading `-` as an option. ponytail: pid reuse is a non-issue here.
             let _ = tokio::process::Command::new("kill")
-                .arg(pid.to_string())
+                .arg("--")
+                .arg(format!("-{pgid}"))
                 .status()
                 .await;
         }
@@ -304,6 +313,57 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         panic!("job never finished");
+    }
+
+    /// `kill -0` probes liveness without delivering a signal.
+    #[cfg(unix)]
+    async fn alive(pid: &str) -> bool {
+        tokio::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid)
+            .status()
+            .await
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_reaches_descendants() {
+        let store = store(Duration::from_millis(100));
+        // `sh` backgrounds a long sleep, prints its pid, then waits on it. Job
+        // control is off in `sh -c`, so the child shares the shell's group.
+        let r = store
+            .run("sleep 300 & echo \"pid:$!\"; wait".into(), None, None, true)
+            .await
+            .unwrap();
+        let RunResult::Backgrounded { id } = r else {
+            panic!("bg should background");
+        };
+
+        // Pull the descendant's pid out of the log.
+        let mut child_pid = None;
+        for _ in 0..50 {
+            let (_s, page) = store.poll(&id, 0, None).await.unwrap();
+            if let Some(line) = page.lines.iter().find_map(|l| l.strip_prefix("pid:")) {
+                child_pid = Some(line.trim().to_string());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let child_pid = child_pid.expect("never saw the child pid");
+        assert!(alive(&child_pid).await, "descendant should be running");
+
+        assert!(store.kill(&id).await);
+
+        // Group kill must reap the descendant, not just `sh`.
+        for _ in 0..50 {
+            if !alive(&child_pid).await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("descendant survived the kill");
     }
 
     #[tokio::test]
