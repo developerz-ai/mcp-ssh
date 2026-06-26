@@ -127,6 +127,102 @@ mod tests {
         assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
     }
 
+    /// Boot a session (initialize + notifications/initialized) and return the session id.
+    async fn open_session(app: axum::Router, creds: &str) -> String {
+        let init_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header(header::HOST, "localhost")
+                    .header(header::AUTHORIZATION, format!("Basic {creds}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::ACCEPT, "application/json, text/event-stream")
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(init_res.status(), StatusCode::OK);
+        let session_id = init_res
+            .headers()
+            .get("mcp-session-id")
+            .expect("mcp-session-id header must be present")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        // consume body so the connection is released before the next oneshot
+        axum::body::to_bytes(init_res.into_body(), 1 << 20)
+            .await
+            .unwrap();
+
+        let notif_res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header(header::HOST, "localhost")
+                    .header(header::AUTHORIZATION, format!("Basic {creds}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::ACCEPT, "application/json, text/event-stream")
+                    .header("mcp-session-id", &session_id)
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(notif_res.status(), StatusCode::ACCEPTED);
+        session_id
+    }
+
+    /// tools/list must return exactly the three tools: bash, job, file — never more.
+    /// This test is the canary; if someone adds a 4th tool it fails here first.
+    #[tokio::test]
+    async fn tool_surface_is_exactly_bash_job_file() {
+        let app = test_app();
+        let creds = base64::engine::general_purpose::STANDARD.encode("admin:secret");
+        let session_id = open_session(app.clone(), &creds).await;
+
+        let list_res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header(header::HOST, "localhost")
+                    .header(header::AUTHORIZATION, format!("Basic {creds}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::ACCEPT, "application/json, text/event-stream")
+                    .header("mcp-session-id", &session_id)
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list_res.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(list_res.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let msg = first_jsonrpc(std::str::from_utf8(&bytes).unwrap());
+        let tools = msg["result"]["tools"]
+            .as_array()
+            .expect("tools/list result must contain a tools array");
+        let mut names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            ["bash", "file", "job"],
+            "MCP surface must be exactly 3 tools: bash, job, file"
+        );
+    }
+
     /// Drive a real MCP JSON-RPC session through the built router:
     ///   initialize → capture mcp-session-id → notifications/initialized → tools/list
     ///
