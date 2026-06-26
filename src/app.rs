@@ -180,6 +180,128 @@ mod tests {
         session_id
     }
 
+    /// Send a `tools/call` request and return the full JSON-RPC response message.
+    async fn call_tool(
+        app: axum::Router,
+        creds: &str,
+        session_id: &str,
+        id: u32,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> serde_json::Value {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": { "name": name, "arguments": arguments }
+        });
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header(header::HOST, "localhost")
+                    .header(header::AUTHORIZATION, format!("Basic {creds}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::ACCEPT, "application/json, text/event-stream")
+                    .header("mcp-session-id", session_id)
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "tools/call HTTP status");
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        first_jsonrpc(std::str::from_utf8(&bytes).unwrap())
+    }
+
+    /// Exercise each tool end-to-end via tools/call:
+    ///   bash `echo hello`  → inline output contains "hello"
+    ///   file write→read    → roundtrip content survives the cycle
+    ///   job list           → returns parseable JSON
+    #[tokio::test]
+    async fn tools_call_exercises_bash_file_and_job() {
+        let app = test_app();
+        let creds = base64::engine::general_purpose::STANDARD.encode("admin:secret");
+        let session_id = open_session(app.clone(), &creds).await;
+
+        // ── bash: echo hello → inline result contains "hello" ────────────────
+        let bash_msg = call_tool(
+            app.clone(),
+            &creds,
+            &session_id,
+            3,
+            "bash",
+            serde_json::json!({"cmd": "echo hello"}),
+        )
+        .await;
+        let bash_text = bash_msg["result"]["content"][0]["text"]
+            .as_str()
+            .expect("bash result must have text content");
+        assert!(
+            bash_text.contains("hello"),
+            "bash echo hello output: {bash_text}"
+        );
+
+        // ── file: write then read roundtrip ───────────────────────────────────
+        // Keep the tempdir alive for the duration of the test so the path is valid.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("roundtrip.txt");
+        let path_str = path.to_str().unwrap();
+
+        let write_msg = call_tool(
+            app.clone(),
+            &creds,
+            &session_id,
+            4,
+            "file",
+            serde_json::json!({"action": "write", "path": path_str, "content": "roundtrip"}),
+        )
+        .await;
+        let write_text = write_msg["result"]["content"][0]["text"]
+            .as_str()
+            .expect("file write result must have text content");
+        assert!(
+            write_text.contains("wrote"),
+            "file write confirmation: {write_text}"
+        );
+
+        let read_msg = call_tool(
+            app.clone(),
+            &creds,
+            &session_id,
+            5,
+            "file",
+            serde_json::json!({"action": "read", "path": path_str}),
+        )
+        .await;
+        let read_text = read_msg["result"]["content"][0]["text"]
+            .as_str()
+            .expect("file read result must have text content");
+        assert!(
+            read_text.contains("roundtrip"),
+            "file read content: {read_text}"
+        );
+
+        // ── job: list → valid JSON (array, possibly empty since bash ran inline) ─
+        let job_msg = call_tool(
+            app.clone(),
+            &creds,
+            &session_id,
+            6,
+            "job",
+            serde_json::json!({"action": "list"}),
+        )
+        .await;
+        let job_text = job_msg["result"]["content"][0]["text"]
+            .as_str()
+            .expect("job list result must have text content");
+        serde_json::from_str::<serde_json::Value>(job_text)
+            .expect("job list must return valid JSON");
+    }
+
     /// tools/list must return exactly the three tools: bash, job, file — never more.
     /// This test is the canary; if someone adds a 4th tool it fails here first.
     #[tokio::test]
