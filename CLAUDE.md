@@ -77,7 +77,7 @@ Current tools (three, constant):
 
 ## Conventions
 
-The bar: idiomatic, boring, readable Rust. No spaghetti, no premature abstraction. A function reads top to bottom without chasing state. Equally-correct options → pick the one easier to delete. `clippy -D warnings` is the floor, not the ceiling.
+Non-negotiable: SOLID, SRP, tested code. The bar: idiomatic, boring, readable Rust. No spaghetti, no premature abstraction. A function reads top to bottom without chasing state. Equally-correct options → pick the one easier to delete. `clippy -D warnings` is the floor, not the ceiling.
 
 - Errors typed. `thiserror` for domain; `anyhow` only at the `main.rs` boundary.
 - No `unwrap`/`expect` outside `main` and tests. Panic in the request path crashes every client. Propagate with `?`; branch with `match`/`if let`/`let ... else`.
