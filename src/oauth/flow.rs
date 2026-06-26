@@ -94,12 +94,16 @@ pub async fn token(State(st): State<AuthState>, Form(p): Form<TokenParams>) -> R
         .redeem(&p.code, &p.code_verifier, &p.redirect_uri)
         .await
     {
-        Ok(access_token) => Json(json!({
-            "access_token": access_token,
-            "token_type": "Bearer",
-            "expires_in": store::TOKEN_TTL.as_secs(),
-        }))
-        .into_response(),
+        Ok(access_token) => (
+            // RFC 6749 §5.1 — token responses MUST NOT be cached.
+            [("Cache-Control", "no-store")],
+            Json(json!({
+                "access_token": access_token,
+                "token_type": "Bearer",
+                "expires_in": store::TOKEN_TTL.as_secs(),
+            })),
+        )
+            .into_response(),
         Err(e) => token_error(e),
     }
 }
@@ -132,4 +136,42 @@ fn redirect_error(redirect_uri: &str, error: &str, state: Option<&str>) -> Respo
         location.push_str(&format!("&state={}", urlencoding::encode(s)));
     }
     (StatusCode::FOUND, [("Location", location)]).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::header;
+    use store::Store;
+
+    #[tokio::test]
+    async fn token_response_sets_cache_control_no_store() {
+        let store = Store::default();
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        let challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+        let code = store.new_code(challenge.into(), "http://cb".into()).await;
+
+        let state = AuthState {
+            creds: crate::auth::Credentials {
+                user: "u".into(),
+                pass: "p".into(),
+            },
+            store: std::sync::Arc::new(store),
+            public_url: None,
+        };
+        let params = TokenParams {
+            grant_type: "authorization_code".into(),
+            code,
+            code_verifier: verifier.into(),
+            redirect_uri: "http://cb".into(),
+        };
+        let resp = token(State(state), Form(params)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store"),
+        );
+    }
 }
