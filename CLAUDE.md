@@ -53,7 +53,8 @@ Keep this accurate — it's the navigation aid.
 | `src/config.rs` | env + TOML file config; fails fast if auth creds missing |
 | `src/auth.rs` | HTTP Basic auth middleware |
 | `src/oauth/` | minimal OAuth 2.1 server: discovery metadata, dynamic client registration, authorize + token with PKCE, bearer validation |
-| `src/jobs.rs` | job engine: run a command, return inline if fast (<2s) else a job id (or immediately when `bg`); output streams to a per-job log file, polled paginated; hourly reaper drops jobs >24h old |
+| `src/jobs/mod.rs` | job engine: run a command, return inline if fast (<2s) else a job id (or immediately when `bg`); output streams to a per-job log file, polled paginated |
+| `src/jobs/reaper.rs` | hourly reaper drops jobs >24h old (killing any still-`Running` group first); process-group kill helpers (TERM→KILL escalation), shared with `job(action="kill")` |
 | `src/tools/mod.rs` | MCP tool surface (`#[tool_router]`/`#[tool]` from rmcp): 3 tools (`bash`/`job`/`file`) dispatching on `action`. Thin adapters over jobs + files |
 | `src/tools/files.rs` | file operations (`tokio::fs`; `ls`/`find`/`grep` shelled out) |
 
@@ -125,7 +126,8 @@ Non-negotiable: SOLID, SRP, tested code. The bar: idiomatic, boring, readable Ru
 | Config / env / required creds | `src/config.rs` |
 | HTTP Basic auth | `src/auth.rs` |
 | OAuth 2.1 (discovery, registration, PKCE, bearer) | `src/oauth/` |
-| Running commands, backgrounding, job logs | `src/jobs.rs` |
+| Running commands, backgrounding, job logs | `src/jobs/mod.rs` |
+| Reaper eviction + process-group kill helpers | `src/jobs/reaper.rs` |
 | Tool definitions / MCP surface | `src/tools/mod.rs` |
 | File operations | `src/tools/files.rs` |
 

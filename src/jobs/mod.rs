@@ -14,6 +14,10 @@ use std::{
 
 use tokio::sync::{Mutex, watch};
 
+mod reaper;
+
+use reaper::{kill_job, spawn_reaper};
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum JobState {
@@ -68,10 +72,6 @@ pub struct JobStore {
 }
 
 const DEFAULT_PAGE: usize = 200;
-/// Jobs (and their logs) older than this are reaped hourly.
-const RETENTION: Duration = Duration::from_secs(24 * 3600);
-/// Grace between `SIGTERM` and `SIGKILL` when killing a job's process group.
-const KILL_GRACE: Duration = Duration::from_secs(2);
 
 impl JobStore {
     pub fn new(dir: PathBuf, inline_timeout: Duration) -> std::io::Result<Self> {
@@ -199,48 +199,14 @@ impl JobStore {
         out
     }
 
-    /// Kill a running job by signalling its whole process group: `SIGTERM`, then
-    /// `SIGKILL` if it outlasts a short grace. Returns `false` when the id is
-    /// unknown or the job already finished — nothing to signal in either case.
+    /// Kill a running job by signalling its whole process group. Returns `false`
+    /// when the id is unknown or the job already finished — nothing to signal.
     pub async fn kill(&self, id: &str) -> bool {
         let Some(job) = self.jobs.lock().await.get(id).cloned() else {
             return false;
         };
-        if !matches!(*job.state.lock().await, JobState::Running) {
-            return false;
-        }
-        let Some(pgid) = job.pgid else {
-            return false;
-        };
-        signal_group(pgid, "TERM").await;
-        // Give the group a chance to exit on TERM; force it with KILL otherwise.
-        if !exited_within(job.done.clone(), KILL_GRACE).await {
-            signal_group(pgid, "KILL").await;
-        }
-        true
+        kill_job(&job).await
     }
-}
-
-/// Send `signal` (`"TERM"`, `"KILL"`, …) to process group `pgid`. The negative
-/// pid targets the whole group so descendants die too, not just `sh`; `--` stops
-/// `kill` reading it as an option. ponytail: pid reuse is a non-issue here.
-async fn signal_group(pgid: u32, signal: &str) {
-    let _ = tokio::process::Command::new("kill")
-        .arg(format!("-{signal}"))
-        .arg("--")
-        .arg(format!("-{pgid}"))
-        .status()
-        .await;
-}
-
-/// Wait up to `grace` for the job to exit, watching its completion flag rather
-/// than polling. Returns true if it exited in time, false if the grace elapsed.
-async fn exited_within(mut done: watch::Receiver<bool>, grace: Duration) -> bool {
-    // The waiter flips the flag to true exactly once, on exit. A receiver error
-    // means the sender dropped, which only happens after that same exit.
-    tokio::time::timeout(grace, done.wait_for(|&exited| exited))
-        .await
-        .is_ok()
 }
 
 /// Read lines `[cursor, cursor+limit)` from a log file. Re-reads the whole file
@@ -262,32 +228,6 @@ async fn read_page(path: &std::path::Path, cursor: usize, limit: usize) -> Page 
         total_lines: total,
         has_more: end < total,
     }
-}
-
-/// Hourly: drop jobs (and their log files) older than `RETENTION` so history
-/// doesn't grow without bound. ponytail: time-based only; a busy box could still
-/// hold ≤24h of jobs in memory — add a count cap if that ever bites.
-fn spawn_reaper(jobs: Arc<Mutex<HashMap<String, Arc<Job>>>>) {
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(3600));
-        loop {
-            tick.tick().await;
-            let now = tokio::time::Instant::now();
-            let mut map = jobs.lock().await;
-            let stale: Vec<(String, PathBuf)> = map
-                .iter()
-                .filter(|(_, j)| now.duration_since(j.started) > RETENTION)
-                .map(|(id, j)| (id.clone(), j.log_path.clone()))
-                .collect();
-            for (id, _) in &stale {
-                map.remove(id);
-            }
-            drop(map);
-            for (_, path) in stale {
-                let _ = tokio::fs::remove_file(path).await;
-            }
-        }
-    });
 }
 
 #[cfg(test)]
@@ -445,6 +385,49 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         panic!("job survived TERM->KILL escalation");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reaper_kills_running_job_before_eviction() {
+        let store = store(Duration::from_millis(100));
+        // Backgrounded descendant; print its pid so we can probe it post-eviction.
+        let r = store
+            .run("sleep 300 & echo \"pid:$!\"; wait".into(), None, None, true)
+            .await
+            .unwrap();
+        let RunResult::Backgrounded { id } = r else {
+            panic!("bg should background");
+        };
+
+        let mut child_pid = None;
+        for _ in 0..50 {
+            let (_s, page) = store.poll(&id, 0, None).await.unwrap();
+            if let Some(line) = page.lines.iter().find_map(|l| l.strip_prefix("pid:")) {
+                child_pid = Some(line.trim().to_string());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let child_pid = child_pid.expect("never saw the child pid");
+        assert!(alive(&child_pid).await, "descendant should be running");
+
+        // Retention zero => the just-started job is already stale.
+        reaper::reap_once(&store.jobs, Duration::ZERO).await;
+
+        // Evicted from the map (poll can't find it)...
+        assert!(
+            store.poll(&id, 0, None).await.is_none(),
+            "job should be evicted"
+        );
+        // ...and its process group reaped, not orphaned.
+        for _ in 0..50 {
+            if !alive(&child_pid).await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("descendant survived eviction");
     }
 
     #[tokio::test]
