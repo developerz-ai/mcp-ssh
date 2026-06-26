@@ -67,6 +67,79 @@ async fn serve(port: Option<u16>) -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(cfg.bind).await?;
     tracing::info!(addr = %cfg.bind, "mcp-ssh listening on /mcp");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
+}
+
+/// Resolves on Ctrl-C or (on Unix) SIGTERM, letting axum drain in-flight
+/// requests before exit. systemd sends SIGTERM on `stop`/`restart`.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            tracing::error!(%err, "failed to listen for Ctrl-C");
+            // Don't resolve: a broken handler must not trigger a spurious shutdown.
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                sigterm.recv().await;
+            }
+            Err(err) => {
+                tracing::error!(%err, "failed to install SIGTERM handler");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+
+    tracing::info!("shutdown signal received, draining connections");
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::signal::unix::{SignalKind, signal};
+    use tokio::time::timeout;
+
+    use super::*;
+
+    // SIGTERM (what systemd sends on stop) must resolve `shutdown_signal` so
+    // axum begins draining instead of the process being killed outright.
+    #[tokio::test]
+    async fn sigterm_resolves_shutdown_signal() {
+        // Install the global SIGTERM handler up front: once tokio owns the
+        // signal, raising it can never fall through to the default disposition
+        // (which would terminate the whole test process).
+        let _guard = signal(SignalKind::terminate()).expect("install SIGTERM guard");
+
+        let shutdown = tokio::spawn(shutdown_signal());
+        // Give the spawned task a chance to register its own SIGTERM stream.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let status = std::process::Command::new("kill")
+            .args(["-TERM", &std::process::id().to_string()])
+            .status()
+            .expect("run kill");
+        assert!(status.success(), "kill -TERM failed");
+
+        timeout(Duration::from_secs(5), shutdown)
+            .await
+            .expect("shutdown_signal did not resolve within 5s")
+            .expect("shutdown task panicked");
+    }
 }
