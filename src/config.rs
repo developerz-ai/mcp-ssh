@@ -44,26 +44,48 @@ pub enum ConfigError {
     Parse(String),
 }
 
+/// Source of environment variables. Production reads the real process env; tests
+/// supply an in-memory map, so config loading needs no process-env mutation
+/// (`unsafe` under Rust 2024) and stays race-free without a global lock.
+trait EnvSource {
+    fn get(&self, key: &str) -> Option<String>;
+}
+
+/// Reads the real process environment.
+#[derive(Debug)]
+struct ProcessEnv;
+
+impl EnvSource for ProcessEnv {
+    fn get(&self, key: &str) -> Option<String> {
+        std::env::var(key).ok()
+    }
+}
+
 /// Default config path: `$MCP_SSH_CONFIG`, else `/etc/mcp-ssh/config.toml`.
-pub fn config_path() -> PathBuf {
-    std::env::var("MCP_SSH_CONFIG")
+fn config_path(env: &dyn EnvSource) -> PathBuf {
+    env.get("MCP_SSH_CONFIG")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/etc/mcp-ssh/config.toml"))
+        .unwrap_or_else(|| PathBuf::from("/etc/mcp-ssh/config.toml"))
 }
 
 impl Config {
     /// Load file (if present) then overlay env vars. Env wins.
     pub fn load() -> Result<Self, ConfigError> {
-        let file = load_file(&config_path())?;
+        Self::from_env(&ProcessEnv)
+    }
 
-        let bind = pick("MCP_SSH_BIND", file.bind, "127.0.0.1:1337")
+    /// Load file then overlay `env`. Real env in production; an in-memory map in tests.
+    fn from_env(env: &dyn EnvSource) -> Result<Self, ConfigError> {
+        let file = load_file(&config_path(env))?;
+
+        let bind = pick(env, "MCP_SSH_BIND", file.bind, "127.0.0.1:1337")
             .parse()
             .map_err(|e| ConfigError::Invalid("bind", format!("{e}")))?;
 
-        let user = opt("MCP_SSH_USER", file.user).ok_or(ConfigError::NoCredentials)?;
-        let pass = opt("MCP_SSH_PASS", file.pass).ok_or(ConfigError::NoCredentials)?;
+        let user = opt(env, "MCP_SSH_USER", file.user).ok_or(ConfigError::NoCredentials)?;
+        let pass = opt(env, "MCP_SSH_PASS", file.pass).ok_or(ConfigError::NoCredentials)?;
 
-        let inline_timeout = match std::env::var("MCP_SSH_INLINE_TIMEOUT_SECS").ok() {
+        let inline_timeout = match env.get("MCP_SSH_INLINE_TIMEOUT_SECS") {
             Some(v) => v
                 .parse()
                 .map_err(|e| ConfigError::Invalid("inline_timeout", format!("{e}")))?,
@@ -71,19 +93,20 @@ impl Config {
         };
 
         let job_dir = PathBuf::from(pick(
+            env,
             "MCP_SSH_JOB_DIR",
             file.job_dir,
             "/var/lib/mcp-ssh/jobs",
         ));
 
-        let allowed_hosts = match std::env::var("MCP_SSH_ALLOWED_HOSTS").ok() {
+        let allowed_hosts = match env.get("MCP_SSH_ALLOWED_HOSTS") {
             Some(v) => split_hosts(&v),
             None => file
                 .allowed_hosts
                 .unwrap_or_else(|| vec!["localhost".into(), "127.0.0.1".into()]),
         };
 
-        let public_url = opt("MCP_SSH_PUBLIC_URL", file.public_url);
+        let public_url = opt(env, "MCP_SSH_PUBLIC_URL", file.public_url);
 
         Ok(Self {
             bind,
@@ -99,7 +122,11 @@ impl Config {
 
 /// Write `user`/`pass` into the config file, preserving other fields. Chmod 600.
 pub fn set_auth(user: &str, pass: &str) -> Result<PathBuf, ConfigError> {
-    let path = config_path();
+    set_auth_in(&ProcessEnv, user, pass)
+}
+
+fn set_auth_in(env: &dyn EnvSource, user: &str, pass: &str) -> Result<PathBuf, ConfigError> {
+    let path = config_path(env);
     let mut file = load_file(&path)?;
     file.user = Some(user.to_string());
     file.pass = Some(pass.to_string());
@@ -137,61 +164,39 @@ fn split_hosts(v: &str) -> Vec<String> {
 }
 
 /// env, else file value, else default.
-fn pick(env: &str, file: Option<String>, default: &str) -> String {
-    std::env::var(env)
-        .ok()
-        .or(file)
-        .unwrap_or_else(|| default.to_string())
+fn pick(env: &dyn EnvSource, key: &str, file: Option<String>, default: &str) -> String {
+    env.get(key).or(file).unwrap_or_else(|| default.to_string())
 }
 
 /// env, else file value.
-fn opt(env: &str, file: Option<String>) -> Option<String> {
-    std::env::var(env).ok().or(file)
+fn opt(env: &dyn EnvSource, key: &str, file: Option<String>) -> Option<String> {
+    env.get(key).or(file)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::collections::HashMap;
     use tempfile::tempdir;
 
-    /// All env-mutating tests must hold this lock to avoid races.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    /// In-memory `EnvSource`: tests inject vars without touching the process env,
+    /// so they need no `unsafe`, no global lock, and run in parallel safely.
+    struct MapEnv(HashMap<String, String>);
 
-    /// Set/unset env vars for the duration of `f`, then restore originals.
-    fn with_env<F: FnOnce() -> R, R>(set: &[(&str, &str)], unset: &[&str], f: F) -> R {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-
-        let saved_set: Vec<(&str, Option<String>)> = set
-            .iter()
-            .map(|(k, _)| (*k, std::env::var(k).ok()))
-            .collect();
-        let saved_unset: Vec<(&str, Option<String>)> =
-            unset.iter().map(|k| (*k, std::env::var(k).ok())).collect();
-
-        // SAFETY: tests are serialised by ENV_LOCK; no other thread mutates env while
-        // the lock is held, so the set_var / remove_var calls are race-free.
-        unsafe {
-            for (k, v) in set {
-                std::env::set_var(k, v);
-            }
-            for k in unset {
-                std::env::remove_var(k);
-            }
+    impl MapEnv {
+        fn new(vars: &[(&str, &str)]) -> Self {
+            Self(
+                vars.iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            )
         }
+    }
 
-        let result = f();
-
-        unsafe {
-            for (k, v) in saved_set.iter().chain(saved_unset.iter()) {
-                match v {
-                    Some(v) => std::env::set_var(k, v),
-                    None => std::env::remove_var(k),
-                }
-            }
+    impl EnvSource for MapEnv {
+        fn get(&self, key: &str) -> Option<String> {
+            self.0.get(key).cloned()
         }
-
-        result
     }
 
     #[test]
@@ -206,19 +211,14 @@ mod tests {
         };
         std::fs::write(&cfg_path, toml::to_string_pretty(&file_cfg).unwrap()).unwrap();
 
-        with_env(
-            &[
-                ("MCP_SSH_CONFIG", cfg_path.to_str().unwrap()),
-                ("MCP_SSH_USER", "env_user"),
-                ("MCP_SSH_PASS", "env_pass"),
-            ],
-            &[],
-            || {
-                let cfg = Config::load().expect("load should succeed");
-                assert_eq!(cfg.user, "env_user");
-                assert_eq!(cfg.pass, "env_pass");
-            },
-        );
+        let env = MapEnv::new(&[
+            ("MCP_SSH_CONFIG", cfg_path.to_str().unwrap()),
+            ("MCP_SSH_USER", "env_user"),
+            ("MCP_SSH_PASS", "env_pass"),
+        ]);
+        let cfg = Config::from_env(&env).expect("load should succeed");
+        assert_eq!(cfg.user, "env_user");
+        assert_eq!(cfg.pass, "env_pass");
     }
 
     #[test]
@@ -227,16 +227,12 @@ mod tests {
         // Point at a non-existent file so load_file returns FileConfig::default().
         let cfg_path = dir.path().join("absent.toml");
 
-        with_env(
-            &[("MCP_SSH_CONFIG", cfg_path.to_str().unwrap())],
-            &["MCP_SSH_USER", "MCP_SSH_PASS"],
-            || {
-                let err = Config::load().expect_err("should fail without credentials");
-                assert!(
-                    matches!(err, ConfigError::NoCredentials),
-                    "expected NoCredentials, got {err}"
-                );
-            },
+        // No USER/PASS keys present → treated as unset.
+        let env = MapEnv::new(&[("MCP_SSH_CONFIG", cfg_path.to_str().unwrap())]);
+        let err = Config::from_env(&env).expect_err("should fail without credentials");
+        assert!(
+            matches!(err, ConfigError::NoCredentials),
+            "expected NoCredentials, got {err}"
         );
     }
 
@@ -245,25 +241,20 @@ mod tests {
         let dir = tempdir().unwrap();
         let cfg_path = dir.path().join("config.toml");
 
-        with_env(
-            &[("MCP_SSH_CONFIG", cfg_path.to_str().unwrap())],
-            &[],
-            || {
-                let written = set_auth("bob", "s3cr3t").expect("set_auth should succeed");
-                assert_eq!(written, cfg_path);
+        let env = MapEnv::new(&[("MCP_SSH_CONFIG", cfg_path.to_str().unwrap())]);
+        let written = set_auth_in(&env, "bob", "s3cr3t").expect("set_auth should succeed");
+        assert_eq!(written, cfg_path);
 
-                let contents = std::fs::read_to_string(&cfg_path).unwrap();
-                let parsed: FileConfig = toml::from_str(&contents).unwrap();
-                assert_eq!(parsed.user.as_deref(), Some("bob"));
-                assert_eq!(parsed.pass.as_deref(), Some("s3cr3t"));
+        let contents = std::fs::read_to_string(&cfg_path).unwrap();
+        let parsed: FileConfig = toml::from_str(&contents).unwrap();
+        assert_eq!(parsed.user.as_deref(), Some("bob"));
+        assert_eq!(parsed.pass.as_deref(), Some("s3cr3t"));
 
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::MetadataExt;
-                    let mode = std::fs::metadata(&cfg_path).unwrap().mode();
-                    assert_eq!(mode & 0o777, 0o600, "expected mode 0o600, got {mode:o}");
-                }
-            },
-        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let mode = std::fs::metadata(&cfg_path).unwrap().mode();
+            assert_eq!(mode & 0o777, 0o600, "expected mode 0o600, got {mode:o}");
+        }
     }
 }
