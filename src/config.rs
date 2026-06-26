@@ -3,6 +3,7 @@
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -78,7 +79,7 @@ impl Config {
     fn from_env(env: &dyn EnvSource) -> Result<Self, ConfigError> {
         let file = load_file(&config_path(env))?;
 
-        let bind = pick(env, "MCP_SSH_BIND", file.bind, "127.0.0.1:1337")
+        let bind: SocketAddr = pick(env, "MCP_SSH_BIND", file.bind, "127.0.0.1:1337")
             .parse()
             .map_err(|e| ConfigError::Invalid("bind", format!("{e}")))?;
 
@@ -101,9 +102,18 @@ impl Config {
 
         let allowed_hosts = match env.get("MCP_SSH_ALLOWED_HOSTS") {
             Some(v) => split_hosts(&v),
-            None => file
-                .allowed_hosts
-                .unwrap_or_else(|| vec!["localhost".into(), "127.0.0.1".into()]),
+            None => {
+                // Warn if binding to non-loopback without explicit allowed hosts.
+                if !bind.ip().is_loopback() {
+                    warn!(
+                        "MCP_SSH_ALLOWED_HOSTS unset and bind is non-loopback ({}) — \
+                         DNS-rebinding attacks possible. Set MCP_SSH_ALLOWED_HOSTS explicitly.",
+                        bind.ip()
+                    );
+                }
+                file.allowed_hosts
+                    .unwrap_or_else(|| vec!["localhost".into(), "127.0.0.1".into()])
+            }
         };
 
         let public_url = opt(env, "MCP_SSH_PUBLIC_URL", file.public_url);
@@ -256,5 +266,42 @@ mod tests {
             let mode = std::fs::metadata(&cfg_path).unwrap().mode();
             assert_eq!(mode & 0o777, 0o600, "expected mode 0o600, got {mode:o}");
         }
+    }
+
+    #[test]
+    fn non_loopback_bind_without_allowed_hosts_env_loads() {
+        let dir = tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+
+        // Bind to non-loopback (0.0.0.0) without MCP_SSH_ALLOWED_HOSTS set.
+        // Should load successfully; warning issued at runtime.
+        let env = MapEnv::new(&[
+            ("MCP_SSH_CONFIG", cfg_path.to_str().unwrap()),
+            ("MCP_SSH_BIND", "0.0.0.0:8080"),
+            ("MCP_SSH_USER", "test"),
+            ("MCP_SSH_PASS", "test"),
+        ]);
+        let cfg = Config::from_env(&env).expect("should load with warning");
+        assert_eq!(cfg.bind.ip().to_string(), "0.0.0.0");
+        // Default allowed_hosts used (localhost/127.0.0.1).
+        assert_eq!(cfg.allowed_hosts, vec!["localhost", "127.0.0.1"]);
+    }
+
+    #[test]
+    fn loopback_bind_without_allowed_hosts_env_loads_silently() {
+        let dir = tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+
+        // Bind to loopback (127.0.0.1) without MCP_SSH_ALLOWED_HOSTS set.
+        // Should load without warning.
+        let env = MapEnv::new(&[
+            ("MCP_SSH_CONFIG", cfg_path.to_str().unwrap()),
+            ("MCP_SSH_BIND", "127.0.0.1:1337"),
+            ("MCP_SSH_USER", "test"),
+            ("MCP_SSH_PASS", "test"),
+        ]);
+        let cfg = Config::from_env(&env).expect("should load");
+        assert_eq!(cfg.bind.ip().to_string(), "127.0.0.1");
+        assert_eq!(cfg.allowed_hosts, vec!["localhost", "127.0.0.1"]);
     }
 }
