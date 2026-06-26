@@ -34,6 +34,22 @@ mod tests {
     use base64::Engine;
     use tower::ServiceExt; // oneshot
 
+    /// Collect every `data: <payload>` line from an SSE body and parse as JSON.
+    fn sse_json_lines(body: &str) -> Vec<serde_json::Value> {
+        body.lines()
+            .filter(|l| l.starts_with("data:"))
+            .filter_map(|l| serde_json::from_str(l.trim_start_matches("data:").trim()).ok())
+            .collect()
+    }
+
+    /// Find the first JSON-RPC message (has a `"jsonrpc"` key) in an SSE body.
+    fn first_jsonrpc(body: &str) -> serde_json::Value {
+        sse_json_lines(body)
+            .into_iter()
+            .find(|v| v.get("jsonrpc").is_some())
+            .expect("no JSON-RPC message found in SSE response body")
+    }
+
     fn test_app() -> Router {
         let dir = tempfile::tempdir().unwrap().keep();
         let store = JobStore::new(dir, std::time::Duration::from_secs(2)).unwrap();
@@ -109,5 +125,329 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Boot a session (initialize + notifications/initialized) and return the session id.
+    async fn open_session(app: axum::Router, creds: &str) -> String {
+        let init_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header(header::HOST, "localhost")
+                    .header(header::AUTHORIZATION, format!("Basic {creds}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::ACCEPT, "application/json, text/event-stream")
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(init_res.status(), StatusCode::OK);
+        let session_id = init_res
+            .headers()
+            .get("mcp-session-id")
+            .expect("mcp-session-id header must be present")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        // consume body so the connection is released before the next oneshot
+        axum::body::to_bytes(init_res.into_body(), 1 << 20)
+            .await
+            .unwrap();
+
+        let notif_res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header(header::HOST, "localhost")
+                    .header(header::AUTHORIZATION, format!("Basic {creds}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::ACCEPT, "application/json, text/event-stream")
+                    .header("mcp-session-id", &session_id)
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(notif_res.status(), StatusCode::ACCEPTED);
+        session_id
+    }
+
+    /// Send a `tools/call` request and return the full JSON-RPC response message.
+    async fn call_tool(
+        app: axum::Router,
+        creds: &str,
+        session_id: &str,
+        id: u32,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> serde_json::Value {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": { "name": name, "arguments": arguments }
+        });
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header(header::HOST, "localhost")
+                    .header(header::AUTHORIZATION, format!("Basic {creds}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::ACCEPT, "application/json, text/event-stream")
+                    .header("mcp-session-id", session_id)
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "tools/call HTTP status");
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        first_jsonrpc(std::str::from_utf8(&bytes).unwrap())
+    }
+
+    /// Exercise each tool end-to-end via tools/call:
+    ///   bash `echo hello`  → inline output contains "hello"
+    ///   file write→read    → roundtrip content survives the cycle
+    ///   job list           → returns parseable JSON
+    #[tokio::test]
+    async fn tools_call_exercises_bash_file_and_job() {
+        let app = test_app();
+        let creds = base64::engine::general_purpose::STANDARD.encode("admin:secret");
+        let session_id = open_session(app.clone(), &creds).await;
+
+        // ── bash: echo hello → inline result contains "hello" ────────────────
+        let bash_msg = call_tool(
+            app.clone(),
+            &creds,
+            &session_id,
+            3,
+            "bash",
+            serde_json::json!({"cmd": "echo hello"}),
+        )
+        .await;
+        let bash_text = bash_msg["result"]["content"][0]["text"]
+            .as_str()
+            .expect("bash result must have text content");
+        assert!(
+            bash_text.contains("hello"),
+            "bash echo hello output: {bash_text}"
+        );
+
+        // ── file: write then read roundtrip ───────────────────────────────────
+        // Keep the tempdir alive for the duration of the test so the path is valid.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("roundtrip.txt");
+        let path_str = path.to_str().unwrap();
+
+        let write_msg = call_tool(
+            app.clone(),
+            &creds,
+            &session_id,
+            4,
+            "file",
+            serde_json::json!({"action": "write", "path": path_str, "content": "roundtrip"}),
+        )
+        .await;
+        let write_text = write_msg["result"]["content"][0]["text"]
+            .as_str()
+            .expect("file write result must have text content");
+        assert!(
+            write_text.contains("wrote"),
+            "file write confirmation: {write_text}"
+        );
+
+        let read_msg = call_tool(
+            app.clone(),
+            &creds,
+            &session_id,
+            5,
+            "file",
+            serde_json::json!({"action": "read", "path": path_str}),
+        )
+        .await;
+        let read_text = read_msg["result"]["content"][0]["text"]
+            .as_str()
+            .expect("file read result must have text content");
+        assert!(
+            read_text.contains("roundtrip"),
+            "file read content: {read_text}"
+        );
+
+        // ── job: list → valid JSON (array, possibly empty since bash ran inline) ─
+        let job_msg = call_tool(
+            app.clone(),
+            &creds,
+            &session_id,
+            6,
+            "job",
+            serde_json::json!({"action": "list"}),
+        )
+        .await;
+        let job_text = job_msg["result"]["content"][0]["text"]
+            .as_str()
+            .expect("job list result must have text content");
+        serde_json::from_str::<serde_json::Value>(job_text)
+            .expect("job list must return valid JSON");
+    }
+
+    /// tools/list must return exactly the three tools: bash, job, file — never more.
+    /// This test is the canary; if someone adds a 4th tool it fails here first.
+    #[tokio::test]
+    async fn tool_surface_is_exactly_bash_job_file() {
+        let app = test_app();
+        let creds = base64::engine::general_purpose::STANDARD.encode("admin:secret");
+        let session_id = open_session(app.clone(), &creds).await;
+
+        let list_res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header(header::HOST, "localhost")
+                    .header(header::AUTHORIZATION, format!("Basic {creds}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::ACCEPT, "application/json, text/event-stream")
+                    .header("mcp-session-id", &session_id)
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list_res.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(list_res.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let msg = first_jsonrpc(std::str::from_utf8(&bytes).unwrap());
+        let tools = msg["result"]["tools"]
+            .as_array()
+            .expect("tools/list result must contain a tools array");
+        let mut names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            ["bash", "file", "job"],
+            "MCP surface must be exactly 3 tools: bash, job, file"
+        );
+    }
+
+    /// Drive a real MCP JSON-RPC session through the built router:
+    ///   initialize → capture mcp-session-id → notifications/initialized → tools/list
+    ///
+    /// Router clones share the same Arc<LocalSessionManager>, so the session
+    /// created in step 1 is visible to subsequent oneshot calls.
+    #[tokio::test]
+    async fn mcp_json_rpc_initialize_and_tools_list() {
+        let app = test_app();
+        let creds = base64::engine::general_purpose::STANDARD.encode("admin:secret");
+
+        // ── 1. initialize ────────────────────────────────────────────────────
+        let init_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header(header::HOST, "localhost")
+                    .header(header::AUTHORIZATION, format!("Basic {creds}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::ACCEPT, "application/json, text/event-stream")
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(init_res.status(), StatusCode::OK);
+
+        let session_id = init_res
+            .headers()
+            .get("mcp-session-id")
+            .expect("mcp-session-id header must be present on initialize response")
+            .to_str()
+            .unwrap()
+            .to_owned();
+
+        let init_bytes = axum::body::to_bytes(init_res.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let init_str = std::str::from_utf8(&init_bytes).unwrap();
+        let init_msg = first_jsonrpc(init_str);
+        assert_eq!(init_msg["id"], 1);
+        assert!(
+            init_msg["result"].is_object(),
+            "initialize must return a result"
+        );
+
+        // ── 2. notifications/initialized → 202 ──────────────────────────────
+        let notif_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header(header::HOST, "localhost")
+                    .header(header::AUTHORIZATION, format!("Basic {creds}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::ACCEPT, "application/json, text/event-stream")
+                    .header("mcp-session-id", &session_id)
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(notif_res.status(), StatusCode::ACCEPTED);
+
+        // ── 3. tools/list → exactly bash + job + file ───────────────────────
+        let list_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header(header::HOST, "localhost")
+                    .header(header::AUTHORIZATION, format!("Basic {creds}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::ACCEPT, "application/json, text/event-stream")
+                    .header("mcp-session-id", &session_id)
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list_res.status(), StatusCode::OK);
+
+        let list_bytes = axum::body::to_bytes(list_res.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let list_str = std::str::from_utf8(&list_bytes).unwrap();
+        let list_msg = first_jsonrpc(list_str);
+        assert_eq!(list_msg["id"], 2);
+
+        let tools = list_msg["result"]["tools"]
+            .as_array()
+            .expect("tools/list result must contain a tools array");
+        let mut names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["bash", "file", "job"], "exactly the 3 MCP tools");
     }
 }
