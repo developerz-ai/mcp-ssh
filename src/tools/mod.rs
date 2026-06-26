@@ -4,10 +4,12 @@
 //! `crate::jobs` and `files`.
 use rmcp::{
     ErrorData as McpError, ServerHandler,
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    handler::server::{common::RequestId, router::tool::ToolRouter, wrapper::Parameters},
     model::{CallToolResult, Content, ServerCapabilities, ServerInfo},
     schemars, tool, tool_handler, tool_router,
 };
+// `RequestId` above is rmcp's extractor for the per-call JSON-RPC request id.
+use tracing::Instrument;
 
 use crate::jobs::{JobState, JobStore, Page, RunResult};
 
@@ -116,49 +118,62 @@ impl Tools {
             timeout,
             bg,
         }): Parameters<BashArgs>,
+        RequestId(request_id): RequestId,
     ) -> Result<CallToolResult, McpError> {
-        match self.jobs.run(cmd, cwd, timeout, bg.unwrap_or(false)).await {
-            Ok(RunResult::Inline { state, page }) => Ok(ok(render(&state, &page))),
-            Ok(RunResult::Backgrounded { id }) => Ok(ok(format!(
-                "job {id} still running after the inline window. Monitor it with job(action=\"poll\", id=\"{id}\")."
-            ))),
-            Err(e) => Ok(err(e.to_string())),
+        async move {
+            match self.jobs.run(cmd, cwd, timeout, bg.unwrap_or(false)).await {
+                Ok(RunResult::Inline { state, page }) => Ok(ok(render(&state, &page))),
+                Ok(RunResult::Backgrounded { id }) => Ok(ok(format!(
+                    "job {id} still running after the inline window. Monitor it with job(action=\"poll\", id=\"{id}\")."
+                ))),
+                Err(e) => Ok(err(e.to_string())),
+            }
         }
+        .instrument(tracing::info_span!("tool", tool = "bash", %request_id))
+        .await
     }
 
     #[tool(
         description = "Manage background jobs created by `bash`. action=poll returns a paginated page (cursor/limit) of job `id`'s output + status — page through long logs without flooding context; action=list lists all jobs; action=kill kills job `id`."
     )]
-    async fn job(&self, Parameters(args): Parameters<JobArgs>) -> Result<CallToolResult, McpError> {
-        match args.action {
-            JobAction::Poll => {
-                let Some(id) = args.id else {
-                    return Ok(err("poll requires `id`"));
-                };
-                match self
-                    .jobs
-                    .poll(&id, args.cursor.unwrap_or(0), args.limit)
-                    .await
-                {
-                    Some((state, page)) => Ok(ok(render(&state, &page))),
-                    None => Ok(err(format!("no such job: {id}"))),
+    async fn job(
+        &self,
+        Parameters(args): Parameters<JobArgs>,
+        RequestId(request_id): RequestId,
+    ) -> Result<CallToolResult, McpError> {
+        async move {
+            match args.action {
+                JobAction::Poll => {
+                    let Some(id) = args.id else {
+                        return Ok(err("poll requires `id`"));
+                    };
+                    match self
+                        .jobs
+                        .poll(&id, args.cursor.unwrap_or(0), args.limit)
+                        .await
+                    {
+                        Some((state, page)) => Ok(ok(render(&state, &page))),
+                        None => Ok(err(format!("no such job: {id}"))),
+                    }
                 }
-            }
-            JobAction::List => {
-                let jobs = self.jobs.list().await;
-                Ok(ok(serde_json::to_string_pretty(&jobs).unwrap_or_default()))
-            }
-            JobAction::Kill => {
-                let Some(id) = args.id else {
-                    return Ok(err("kill requires `id`"));
-                };
-                if self.jobs.kill(&id).await {
-                    Ok(ok(format!("killed {id}")))
-                } else {
-                    Ok(err(format!("no such job: {id}")))
+                JobAction::List => {
+                    let jobs = self.jobs.list().await;
+                    Ok(ok(serde_json::to_string_pretty(&jobs).unwrap_or_default()))
+                }
+                JobAction::Kill => {
+                    let Some(id) = args.id else {
+                        return Ok(err("kill requires `id`"));
+                    };
+                    if self.jobs.kill(&id).await {
+                        Ok(ok(format!("killed {id}")))
+                    } else {
+                        Ok(err(format!("no such job: {id}")))
+                    }
                 }
             }
         }
+        .instrument(tracing::info_span!("tool", tool = "job", %request_id))
+        .await
     }
 
     #[tool(
@@ -167,44 +182,49 @@ impl Tools {
     async fn file(
         &self,
         Parameters(args): Parameters<FileArgs>,
+        RequestId(request_id): RequestId,
     ) -> Result<CallToolResult, McpError> {
-        let recursive = args.recursive.unwrap_or(false);
-        let result = match args.action {
-            FileAction::Read => match args.path {
-                Some(p) => {
-                    files::read(&p, args.cursor.unwrap_or(0), args.limit.unwrap_or(200)).await
-                }
-                None => Err("read requires `path`".into()),
-            },
-            FileAction::Write => match (args.path, args.content) {
-                (Some(p), Some(c)) => files::write(&p, &c).await,
-                _ => Err("write requires `path` and `content`".into()),
-            },
-            FileAction::Append => match (args.path, args.content) {
-                (Some(p), Some(c)) => files::append(&p, &c).await,
-                _ => Err("append requires `path` and `content`".into()),
-            },
-            FileAction::Delete => match args.path {
-                Some(p) => files::delete(&p).await,
-                None => Err("delete requires `path`".into()),
-            },
-            FileAction::List => match args.path {
-                Some(p) => files::list(&p, recursive).await,
-                None => Err("list requires `path`".into()),
-            },
-            FileAction::Grep => match (args.pattern, args.path) {
-                (Some(pat), Some(p)) => files::grep(&pat, &p, recursive).await,
-                _ => Err("grep requires `pattern` and `path`".into()),
-            },
-            FileAction::Move => match (args.src, args.dest) {
-                (Some(s), Some(d)) => files::rename(&s, &d).await,
-                _ => Err("move requires `src` and `dest`".into()),
-            },
-        };
-        Ok(match result {
-            Ok(s) => ok(s),
-            Err(e) => err(e),
-        })
+        async move {
+            let recursive = args.recursive.unwrap_or(false);
+            let result = match args.action {
+                FileAction::Read => match args.path {
+                    Some(p) => {
+                        files::read(&p, args.cursor.unwrap_or(0), args.limit.unwrap_or(200)).await
+                    }
+                    None => Err("read requires `path`".into()),
+                },
+                FileAction::Write => match (args.path, args.content) {
+                    (Some(p), Some(c)) => files::write(&p, &c).await,
+                    _ => Err("write requires `path` and `content`".into()),
+                },
+                FileAction::Append => match (args.path, args.content) {
+                    (Some(p), Some(c)) => files::append(&p, &c).await,
+                    _ => Err("append requires `path` and `content`".into()),
+                },
+                FileAction::Delete => match args.path {
+                    Some(p) => files::delete(&p).await,
+                    None => Err("delete requires `path`".into()),
+                },
+                FileAction::List => match args.path {
+                    Some(p) => files::list(&p, recursive).await,
+                    None => Err("list requires `path`".into()),
+                },
+                FileAction::Grep => match (args.pattern, args.path) {
+                    (Some(pat), Some(p)) => files::grep(&pat, &p, recursive).await,
+                    _ => Err("grep requires `pattern` and `path`".into()),
+                },
+                FileAction::Move => match (args.src, args.dest) {
+                    (Some(s), Some(d)) => files::rename(&s, &d).await,
+                    _ => Err("move requires `src` and `dest`".into()),
+                },
+            };
+            Ok(match result {
+                Ok(s) => ok(s),
+                Err(e) => err(e),
+            })
+        }
+        .instrument(tracing::info_span!("tool", tool = "file", %request_id))
+        .await
     }
 }
 
@@ -241,4 +261,82 @@ fn render(state: &JobState, page: &Page) -> String {
         ));
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rmcp::model::NumberOrString;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::fmt::format::FmtSpan;
+
+    /// A `MakeWriter` that appends everything the subscriber emits into a shared
+    /// buffer, so a test can assert on the formatted span/event output.
+    #[derive(Clone, Default)]
+    struct BufWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for BufWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if let Ok(mut guard) = self.0.lock() {
+                guard.extend_from_slice(buf);
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufWriter {
+        type Writer = BufWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn tools() -> Tools {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let store = JobStore::new(dir, std::time::Duration::from_secs(2)).unwrap();
+        Tools::new(store)
+    }
+
+    /// Every tool dispatch runs inside a span carrying `tool` + `request_id`
+    /// (CLAUDE.md). `bash` is representative; `job`/`file` wrap identically.
+    #[tokio::test]
+    async fn bash_dispatch_runs_in_a_span_with_tool_and_request_id() {
+        use tracing::instrument::WithSubscriber;
+
+        let buf = BufWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .with_span_events(FmtSpan::NEW)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+
+        tools()
+            .bash(
+                Parameters(BashArgs {
+                    cmd: "true".into(),
+                    cwd: None,
+                    timeout: None,
+                    bg: None,
+                }),
+                RequestId(NumberOrString::Number(42)),
+            )
+            .with_subscriber(subscriber)
+            .await
+            .unwrap();
+
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            out.contains("tool=\"bash\""),
+            "span must tag tool=bash: {out}"
+        );
+        assert!(
+            out.contains("request_id=42"),
+            "span must carry the request id: {out}"
+        );
+    }
 }
