@@ -128,7 +128,7 @@ Requires Rust 1.85+ (edition 2024).
 
 ## ⚙️ Config & env
 
-File: `/etc/mcp-ssh/config.toml` (or `$XDG_CONFIG_HOME/mcp-ssh/config.toml`). **Env vars override the file** — handy in systemd units and containers.
+File: `/etc/mcp-ssh/config.toml` (or override the path with `$MCP_SSH_CONFIG`). **Env vars override the file** — handy in systemd units and containers.
 
 | Env var | Default | Meaning |
 |---|---|---|

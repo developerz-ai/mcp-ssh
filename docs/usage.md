@@ -118,7 +118,7 @@ file(action="move", src="/tmp/out.tar.gz", dest="/srv/releases/out.tar.gz")
 
 ## ⚙️ Configuration
 
-Config lives at `/etc/mcp-ssh/config.toml` (or `$XDG_CONFIG_HOME/mcp-ssh/config.toml`). **Env vars override the file.**
+Config lives at `/etc/mcp-ssh/config.toml` (or override the path with `$MCP_SSH_CONFIG`). **Env vars override the file.**
 
 | Env var | Default | Meaning |
 |---|---|---|
