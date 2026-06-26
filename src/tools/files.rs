@@ -34,6 +34,8 @@ pub async fn append(path: &str, content: &str) -> Result<String, String> {
     f.write_all(content.as_bytes())
         .await
         .map_err(|e| e.to_string())?;
+    // Flush before returning so a follow-up read is guaranteed to see the bytes.
+    f.flush().await.map_err(|e| e.to_string())?;
     Ok(format!("appended {} bytes to {path}", content.len()))
 }
 
