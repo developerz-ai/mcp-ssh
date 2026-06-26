@@ -106,11 +106,11 @@ reviews:
         process group so kills reach descendants. Kill escalates TERM->KILL.
         Reaper drops jobs >24h, killing any still-Running group first.
 
-    # Integration tests — real server over HTTP
-    - path: "tests/**/*.rs"
+    # Tests — colocated in src/**/*tests*.rs
+    - path: "src/**/*tests*.rs"
       instructions: |
-        Boot the server and issue real MCP requests over HTTP. New behaviour
-        ships with the test that proves it.
+        Tests colocated in #[cfg(test)] mod blocks. New behaviour ships with
+        the test that proves it.
 
     # CI
     - path: ".github/workflows/**"

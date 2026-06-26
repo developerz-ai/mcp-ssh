@@ -104,6 +104,7 @@ mcp-ssh set-auth <user>    # configure the username/password
 | [docs/usage.md](docs/usage.md) | Every tool with params + examples, the execution & pagination model, config & env vars |
 | [docs/architecture.md](docs/architecture.md) | Module map, auto-backgrounding execution, the auth middleware, the stack |
 | [docs/deploy.md](docs/deploy.md) | systemd, Caddy & nginx+certbot TLS, Docker, hardening |
+| Code review | CodeRabbit (`.coderabbit.yaml`); install the GitHub App on the repo |
 
 ## 🧬 Stack
 
