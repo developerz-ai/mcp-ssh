@@ -5,7 +5,10 @@ use tokio::{fs, io::AsyncWriteExt};
 
 /// Read a file, paginated by line so a huge file can't flood the agent context.
 pub async fn read(path: &str, cursor: usize, limit: usize) -> Result<String, String> {
-    let content = fs::read_to_string(path).await.map_err(|e| e.to_string())?;
+    // Binary-safe: replace non-UTF-8 bytes with U+FFFD rather than hard-erroring.
+    let bytes = fs::read(path).await.map_err(|e| e.to_string())?;
+    let owned = String::from_utf8_lossy(&bytes).into_owned();
+    let content = owned.as_str();
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len();
     let end = (cursor + limit).min(total);
@@ -115,5 +118,18 @@ mod tests {
         let c = c.to_str().unwrap();
         write(c, "alpha\nbeta\ngamma").await.unwrap();
         assert!(grep("beta", c, false).await.unwrap().contains("beta"));
+    }
+
+    #[tokio::test]
+    async fn binary_file_reads_as_lossy_utf8_not_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("bin.dat");
+        // Write bytes that are not valid UTF-8.
+        tokio::fs::write(&p, b"hello\xff\xfeworld\n").await.unwrap();
+        let result = read(p.to_str().unwrap(), 0, 100).await;
+        assert!(result.is_ok(), "binary read should not hard-error");
+        let content = result.unwrap();
+        assert!(content.contains("hello"), "ASCII prefix should survive");
+        assert!(content.contains("world"), "ASCII suffix should survive");
     }
 }

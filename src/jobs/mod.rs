@@ -217,7 +217,10 @@ impl JobStore {
 /// Read lines `[cursor, cursor+limit)` from a log file. Re-reads the whole file
 /// each call — fine for typical logs; seek by byte offset if they get huge.
 async fn read_page(path: &std::path::Path, cursor: usize, limit: usize) -> Page {
-    let content = tokio::fs::read_to_string(path).await.unwrap_or_default();
+    // Binary-safe: a command that writes non-UTF-8 bytes (e.g. compiled output,
+    // escape sequences) must not produce a silently-empty log page.
+    let bytes = tokio::fs::read(path).await.unwrap_or_default();
+    let content = String::from_utf8_lossy(&bytes);
     let all: Vec<&str> = content.lines().collect();
     let total = all.len();
     let end = (cursor + limit).min(total);
@@ -533,5 +536,23 @@ mod tests {
         assert_eq!(page.next_cursor, 3);
         assert!(page.has_more);
         assert_eq!(page.total_lines, 10);
+    }
+
+    #[tokio::test]
+    async fn read_page_handles_binary_log_without_empty_output() {
+        // Simulate a command that writes non-UTF-8 bytes to its log.
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("bin.log");
+        // Valid UTF-8 prefix + invalid bytes + valid suffix.
+        tokio::fs::write(&log, b"line1\nline2\xff\xfeline3\n")
+            .await
+            .unwrap();
+        let page = read_page(&log, 0, 100).await;
+        // Must return lines, not an empty page.
+        assert!(
+            !page.lines.is_empty(),
+            "binary log must not produce empty page"
+        );
+        assert!(page.lines[0].contains("line1"));
     }
 }
