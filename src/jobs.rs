@@ -27,6 +27,7 @@ struct Job {
     log_path: PathBuf,
     pid: Option<u32>,
     state: Arc<Mutex<JobState>>,
+    started: tokio::time::Instant,
 }
 
 /// Result of starting a command.
@@ -62,24 +63,30 @@ pub struct JobStore {
 }
 
 const DEFAULT_PAGE: usize = 200;
+/// Jobs (and their logs) older than this are reaped hourly.
+const RETENTION: Duration = Duration::from_secs(24 * 3600);
 
 impl JobStore {
     pub fn new(dir: PathBuf, inline_timeout: Duration) -> std::io::Result<Self> {
         std::fs::create_dir_all(&dir)?;
+        let jobs = Arc::new(Mutex::new(HashMap::new()));
+        spawn_reaper(jobs.clone());
         Ok(Self {
             dir,
             inline_timeout,
             seq: Arc::new(AtomicU64::new(1)),
-            jobs: Arc::new(Mutex::new(HashMap::new())),
+            jobs,
         })
     }
 
-    /// Spawn `cmd`, wait up to the inline window, then return output or a job id.
+    /// Spawn `cmd`. With `background`, return a job id immediately; otherwise wait
+    /// up to the inline window and return output if it finishes in time.
     pub async fn run(
         &self,
         cmd: String,
         cwd: Option<String>,
         timeout_secs: Option<u64>,
+        background: bool,
     ) -> std::io::Result<RunResult> {
         let id = format!("j{}", self.seq.fetch_add(1, Ordering::Relaxed));
         let log_path = self.dir.join(format!("{id}.log"));
@@ -127,8 +134,14 @@ impl JobStore {
             log_path: log_path.clone(),
             pid,
             state: state.clone(),
+            started: tokio::time::Instant::now(),
         });
         self.jobs.lock().await.insert(id.clone(), job);
+
+        // `bg: true` — don't wait, hand back the id straight away.
+        if background {
+            return Ok(RunResult::Backgrounded { id });
+        }
 
         // Wait for completion or the inline window, whichever comes first.
         let window = timeout_secs
@@ -211,6 +224,32 @@ async fn read_page(path: &std::path::Path, cursor: usize, limit: usize) -> Page 
     }
 }
 
+/// Hourly: drop jobs (and their log files) older than `RETENTION` so history
+/// doesn't grow without bound. ponytail: time-based only; a busy box could still
+/// hold ≤24h of jobs in memory — add a count cap if that ever bites.
+fn spawn_reaper(jobs: Arc<Mutex<HashMap<String, Arc<Job>>>>) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(3600));
+        loop {
+            tick.tick().await;
+            let now = tokio::time::Instant::now();
+            let mut map = jobs.lock().await;
+            let stale: Vec<(String, PathBuf)> = map
+                .iter()
+                .filter(|(_, j)| now.duration_since(j.started) > RETENTION)
+                .map(|(id, j)| (id.clone(), j.log_path.clone()))
+                .collect();
+            for (id, _) in &stale {
+                map.remove(id);
+            }
+            drop(map);
+            for (_, path) in stale {
+                let _ = tokio::fs::remove_file(path).await;
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,7 +262,7 @@ mod tests {
     #[tokio::test]
     async fn fast_command_returns_inline() {
         let r = store(Duration::from_secs(5))
-            .run("echo hello".into(), None, None)
+            .run("echo hello".into(), None, None, false)
             .await
             .unwrap();
         match r {
@@ -236,10 +275,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bg_flag_backgrounds_a_fast_command() {
+        // Even though `echo` is instant, bg=true must return an id without waiting.
+        let r = store(Duration::from_secs(5))
+            .run("echo hi".into(), None, None, true)
+            .await
+            .unwrap();
+        assert!(matches!(r, RunResult::Backgrounded { .. }));
+    }
+
+    #[tokio::test]
     async fn slow_command_backgrounds_then_completes() {
         let store = store(Duration::from_millis(100));
         let r = store
-            .run("echo start; sleep 1; echo done".into(), None, None)
+            .run("echo start; sleep 1; echo done".into(), None, None, false)
             .await
             .unwrap();
         let id = match r {
@@ -260,7 +309,10 @@ mod tests {
     #[tokio::test]
     async fn poll_paginates() {
         let store = store(Duration::from_secs(5));
-        let r = store.run("seq 1 10".into(), None, None).await.unwrap();
+        let r = store
+            .run("seq 1 10".into(), None, None, false)
+            .await
+            .unwrap();
         // seq finishes inline; re-poll the job id to exercise pagination.
         let id = match r {
             RunResult::Inline { .. } => "j1".to_string(),

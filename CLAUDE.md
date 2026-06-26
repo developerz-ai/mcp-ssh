@@ -53,35 +53,27 @@ Keep this accurate — it's the navigation aid.
 | `src/config.rs` | env + TOML file config; fails fast if auth creds missing |
 | `src/auth.rs` | HTTP Basic auth middleware |
 | `src/oauth/` | minimal OAuth 2.1 server: discovery metadata, dynamic client registration, authorize + token with PKCE, bearer validation |
-| `src/jobs.rs` | job engine: run a command, return inline if fast (<2s) else a job id; output streams to a per-job log file, polled paginated |
-| `src/tools/mod.rs` | MCP tool surface (`#[tool_router]`/`#[tool]` from rmcp). Thin adapters over jobs + files |
+| `src/jobs.rs` | job engine: run a command, return inline if fast (<2s) else a job id (or immediately when `bg`); output streams to a per-job log file, polled paginated; hourly reaper drops jobs >24h old |
+| `src/tools/mod.rs` | MCP tool surface (`#[tool_router]`/`#[tool]` from rmcp): 3 tools (`bash`/`job`/`file`) dispatching on `action`. Thin adapters over jobs + files |
 | `src/tools/files.rs` | file operations (`tokio::fs`; `ls`/`find`/`grep` shelled out) |
 
 Files ≤300 LOC. One responsibility per module (SRP). Split when a module grows a second reason to change.
 
 ## Execution model
 
-`bash` runs a command. Finishes within `MCP_SSH_INLINE_TIMEOUT_SECS` (default 2) → output returns inline. Slower → auto-backgrounds to a **job id**; output streams to a per-job log file. `job_poll` paginates that log (cursor/limit) so a chatty command never floods the agent's context. This is the whole point: bounded output, no context blowups.
+`bash` runs a command. Finishes within `MCP_SSH_INLINE_TIMEOUT_SECS` (default 2) → output returns inline. Slower (or `bg=true`) → auto-backgrounds to a **job id**; output streams to a per-job log file. `job(action="poll")` paginates that log (cursor/limit) so a chatty command never floods the agent's context. This is the whole point: bounded output, no context blowups. Jobs >24h old are reaped hourly.
 
 ## MCP tool design
 
-**Constant, heavily-parametrized surface.** Push composition into params (`cursor`, `limit`, `recursive`, `timeout`) — do **NOT** add more tools. New capability = a new param on an existing tool, almost always.
+**Constant, heavily-parametrized surface — 3 resource-oriented tools.** Group by resource; push composition into params (`action`, `cursor`, `limit`, `recursive`, `timeout`, `bg`) — do **NOT** add more tools. New capability = a new param or `action` on an existing tool, almost always.
 
-Current tools:
+Current tools (three, constant):
 
-| Tool | Does |
-|---|---|
-| `bash` | run a command; inline if fast, else returns a job id |
-| `job_poll` | paginated read of a job's output (cursor/limit) |
-| `job_list` | list jobs + status |
-| `job_kill` | kill a running job |
-| `file_read` | read a file (offset/limit) |
-| `file_write` | write a file |
-| `file_append` | append to a file |
-| `file_delete` | delete a path |
-| `file_list` | list a directory (recursive optional) |
-| `file_grep` | search file contents |
-| `file_move` | move/rename a path |
+| Tool | Params | Does |
+|---|---|---|
+| `bash` | `cmd`, `cwd?`, `timeout?`, `bg?` | run a command; inline if fast, else a job id (`bg` backgrounds at once) |
+| `job` | `action`, `id?`, `cursor?`, `limit?` | jobs by `action`: `poll` (paginated output), `list` (jobs + status), `kill` |
+| `file` | `action`, `path?`, `content?`, `pattern?`, `recursive?`, `src?`, `dest?`, `cursor?`, `limit?` | file ops by `action`: `read`/`write`/`append`/`delete`/`list`/`grep`/`move` |
 
 ## Conventions
 

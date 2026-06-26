@@ -15,7 +15,11 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Command {
     /// Run the MCP server (default).
-    Serve,
+    Serve {
+        /// Listen port (default 1337; overrides MCP_SSH_BIND / config).
+        #[arg(long, short)]
+        port: Option<u16>,
+    },
     /// Set the HTTP username/password used for auth. Prompts for the password.
     SetAuth {
         /// Username.

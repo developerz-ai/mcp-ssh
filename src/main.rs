@@ -22,8 +22,11 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    match Cli::parse().command.unwrap_or(Command::Serve) {
-        Command::Serve => serve().await,
+    match Cli::parse()
+        .command
+        .unwrap_or(Command::Serve { port: None })
+    {
+        Command::Serve { port } => serve(port).await,
         Command::SetAuth { user } => set_auth(user),
     }
 }
@@ -39,8 +42,16 @@ fn set_auth(user: String) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn serve() -> anyhow::Result<()> {
-    let cfg = config::Config::load()?;
+async fn serve(port: Option<u16>) -> anyhow::Result<()> {
+    let mut cfg = config::Config::load()?;
+    // `--port` (or MCP_SSH_PORT) overrides just the port of the bind address.
+    if let Some(p) = port.or_else(|| {
+        std::env::var("MCP_SSH_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    }) {
+        cfg.bind.set_port(p);
+    }
     let store = jobs::JobStore::new(cfg.job_dir.clone(), cfg.inline_timeout)?;
 
     let auth_state = oauth::AuthState {

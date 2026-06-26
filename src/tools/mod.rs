@@ -1,5 +1,7 @@
-//! The MCP tool surface: a small set of heavily-parametrized tools. Every method
-//! is a thin adapter — real work lives in `crate::jobs` and `files`.
+//! The MCP tool surface. Per the resource principle (Claude Code bible): expose
+//! a tiny, constant set of tools grouped by *resource* and push everything else
+//! into *parameters*. Three tools — `bash`, `job`, `file`. Real work lives in
+//! `crate::jobs` and `files`.
 use rmcp::{
     ErrorData as McpError, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -19,73 +21,79 @@ pub struct Tools {
     tool_router: ToolRouter<Self>,
 }
 
-// ---- tool parameter schemas ----
+// ---- bash ----
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
-pub struct Bash {
-    #[schemars(description = "shell command to run")]
+pub struct BashArgs {
+    /// Shell command to run.
     pub cmd: String,
-    #[schemars(description = "working directory (optional)")]
+    /// Working directory (optional).
     pub cwd: Option<String>,
-    #[schemars(description = "seconds to wait inline before backgrounding (default 2)")]
+    /// Seconds to wait inline before backgrounding (default 2).
     pub timeout: Option<u64>,
+    /// Background immediately and return a job id without waiting.
+    pub bg: Option<bool>,
+}
+
+// ---- job ----
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum JobAction {
+    /// Fetch a page of a job's output + status.
+    Poll,
+    /// List all jobs.
+    List,
+    /// Kill a running job.
+    Kill,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
-pub struct JobPoll {
-    #[schemars(description = "job id returned by bash")]
-    pub id: String,
-    #[schemars(description = "line offset to start from (default 0)")]
+pub struct JobArgs {
+    /// What to do: poll, list, or kill.
+    pub action: JobAction,
+    /// [poll, kill] job id.
+    pub id: Option<String>,
+    /// [poll] line offset to start from (default 0).
     pub cursor: Option<usize>,
-    #[schemars(description = "max lines to return (default 200)")]
+    /// [poll] max lines to return (default 200).
     pub limit: Option<usize>,
 }
 
+// ---- file ----
+
 #[derive(serde::Deserialize, schemars::JsonSchema)]
-pub struct JobId {
-    #[schemars(description = "job id")]
-    pub id: String,
+#[serde(rename_all = "snake_case")]
+pub enum FileAction {
+    Read,
+    Write,
+    Append,
+    Delete,
+    List,
+    Grep,
+    Move,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
-pub struct ReadFile {
-    pub path: String,
-    #[schemars(description = "line offset to start from (default 0)")]
+pub struct FileArgs {
+    /// What to do.
+    pub action: FileAction,
+    /// [read, write, append, delete, list, grep] target path.
+    pub path: Option<String>,
+    /// [write, append] file content.
+    pub content: Option<String>,
+    /// [grep] pattern to search for.
+    pub pattern: Option<String>,
+    /// [list, grep] recurse into subdirectories.
+    pub recursive: Option<bool>,
+    /// [move] source path.
+    pub src: Option<String>,
+    /// [move] destination path.
+    pub dest: Option<String>,
+    /// [read] line offset to start from (default 0).
     pub cursor: Option<usize>,
-    #[schemars(description = "max lines to return (default 200)")]
+    /// [read] max lines to return (default 200).
     pub limit: Option<usize>,
-}
-
-#[derive(serde::Deserialize, schemars::JsonSchema)]
-pub struct WriteFile {
-    pub path: String,
-    pub content: String,
-}
-
-#[derive(serde::Deserialize, schemars::JsonSchema)]
-pub struct Path {
-    pub path: String,
-}
-
-#[derive(serde::Deserialize, schemars::JsonSchema)]
-pub struct ListDir {
-    pub path: String,
-    #[schemars(description = "recurse into subdirectories")]
-    pub recursive: Option<bool>,
-}
-
-#[derive(serde::Deserialize, schemars::JsonSchema)]
-pub struct Grep {
-    pub pattern: String,
-    pub path: String,
-    #[schemars(description = "recurse into subdirectories")]
-    pub recursive: Option<bool>,
-}
-
-#[derive(serde::Deserialize, schemars::JsonSchema)]
-pub struct Move {
-    pub src: String,
-    pub dest: String,
 }
 
 #[tool_router]
@@ -98,116 +106,105 @@ impl Tools {
     }
 
     #[tool(
-        description = "Run a shell command locally as the service user. Returns output inline if it finishes within the inline window (default 2s); otherwise returns a job id to poll with job_poll. Use it to launch long tasks (builds, deploys, `claude -p ...`) and monitor them without blocking."
+        description = "Run a shell command on the host (locally, as the service user). Returns output inline if it finishes within the inline window (default 2s); otherwise returns a job id — monitor it with the `job` tool. Pass bg=true to background immediately and get the id without waiting. Use it to launch long tasks (builds, deploys, `claude -p ...`) without blocking."
     )]
     async fn bash(
         &self,
-        Parameters(Bash { cmd, cwd, timeout }): Parameters<Bash>,
+        Parameters(BashArgs {
+            cmd,
+            cwd,
+            timeout,
+            bg,
+        }): Parameters<BashArgs>,
     ) -> Result<CallToolResult, McpError> {
-        match self.jobs.run(cmd, cwd, timeout).await {
+        match self.jobs.run(cmd, cwd, timeout, bg.unwrap_or(false)).await {
             Ok(RunResult::Inline { state, page }) => Ok(ok(render(&state, &page))),
             Ok(RunResult::Backgrounded { id }) => Ok(ok(format!(
-                "job {id} still running after the inline window. Poll it with job_poll(id=\"{id}\")."
+                "job {id} still running after the inline window. Monitor it with job(action=\"poll\", id=\"{id}\")."
             ))),
             Err(e) => Ok(err(e.to_string())),
         }
     }
 
     #[tool(
-        description = "Fetch a page of a job's output and its status. Paginated by line via cursor/limit so long logs don't flood context."
+        description = "Manage background jobs created by `bash`. action=poll returns a paginated page (cursor/limit) of job `id`'s output + status — page through long logs without flooding context; action=list lists all jobs; action=kill kills job `id`."
     )]
-    async fn job_poll(
-        &self,
-        Parameters(JobPoll { id, cursor, limit }): Parameters<JobPoll>,
-    ) -> Result<CallToolResult, McpError> {
-        match self.jobs.poll(&id, cursor.unwrap_or(0), limit).await {
-            Some((state, page)) => Ok(ok(render(&state, &page))),
-            None => Ok(err(format!("no such job: {id}"))),
+    async fn job(&self, Parameters(args): Parameters<JobArgs>) -> Result<CallToolResult, McpError> {
+        match args.action {
+            JobAction::Poll => {
+                let Some(id) = args.id else {
+                    return Ok(err("poll requires `id`"));
+                };
+                match self
+                    .jobs
+                    .poll(&id, args.cursor.unwrap_or(0), args.limit)
+                    .await
+                {
+                    Some((state, page)) => Ok(ok(render(&state, &page))),
+                    None => Ok(err(format!("no such job: {id}"))),
+                }
+            }
+            JobAction::List => {
+                let jobs = self.jobs.list().await;
+                Ok(ok(serde_json::to_string_pretty(&jobs).unwrap_or_default()))
+            }
+            JobAction::Kill => {
+                let Some(id) = args.id else {
+                    return Ok(err("kill requires `id`"));
+                };
+                if self.jobs.kill(&id).await {
+                    Ok(ok(format!("killed {id}")))
+                } else {
+                    Ok(err(format!("no such job: {id}")))
+                }
+            }
         }
-    }
-
-    #[tool(description = "List all jobs with their status.")]
-    async fn job_list(&self) -> Result<CallToolResult, McpError> {
-        let jobs = self.jobs.list().await;
-        Ok(ok(serde_json::to_string_pretty(&jobs).unwrap_or_default()))
-    }
-
-    #[tool(description = "Kill a running job by id.")]
-    async fn job_kill(
-        &self,
-        Parameters(JobId { id }): Parameters<JobId>,
-    ) -> Result<CallToolResult, McpError> {
-        if self.jobs.kill(&id).await {
-            Ok(ok(format!("killed {id}")))
-        } else {
-            Ok(err(format!("no such job: {id}")))
-        }
-    }
-
-    #[tool(description = "Read a file, paginated by line (cursor/limit) to bound output size.")]
-    async fn file_read(
-        &self,
-        Parameters(ReadFile {
-            path,
-            cursor,
-            limit,
-        }): Parameters<ReadFile>,
-    ) -> Result<CallToolResult, McpError> {
-        wrap(files::read(&path, cursor.unwrap_or(0), limit.unwrap_or(200)).await)
-    }
-
-    #[tool(description = "Write content to a file, creating or truncating it.")]
-    async fn file_write(
-        &self,
-        Parameters(WriteFile { path, content }): Parameters<WriteFile>,
-    ) -> Result<CallToolResult, McpError> {
-        wrap(files::write(&path, &content).await)
-    }
-
-    #[tool(description = "Append content to a file, creating it if absent.")]
-    async fn file_append(
-        &self,
-        Parameters(WriteFile { path, content }): Parameters<WriteFile>,
-    ) -> Result<CallToolResult, McpError> {
-        wrap(files::append(&path, &content).await)
-    }
-
-    #[tool(description = "Delete a file or directory.")]
-    async fn file_delete(
-        &self,
-        Parameters(Path { path }): Parameters<Path>,
-    ) -> Result<CallToolResult, McpError> {
-        wrap(files::delete(&path).await)
-    }
-
-    #[tool(description = "List a directory (ls), or the whole tree when recursive=true (find).")]
-    async fn file_list(
-        &self,
-        Parameters(ListDir { path, recursive }): Parameters<ListDir>,
-    ) -> Result<CallToolResult, McpError> {
-        wrap(files::list(&path, recursive.unwrap_or(false)).await)
     }
 
     #[tool(
-        description = "Grep a pattern in a file, or recursively under a directory when recursive=true."
+        description = "File operations on the host, run locally as the service user. action: read (paginated by line via cursor/limit), write (create/truncate `path` with `content`), append (`content` to `path`), delete (`path`, file or dir), list (`path`; recursive=true for the whole tree), grep (`pattern` in `path`; recursive=true under a dir), move (`src` -> `dest`)."
     )]
-    async fn file_grep(
+    async fn file(
         &self,
-        Parameters(Grep {
-            pattern,
-            path,
-            recursive,
-        }): Parameters<Grep>,
+        Parameters(args): Parameters<FileArgs>,
     ) -> Result<CallToolResult, McpError> {
-        wrap(files::grep(&pattern, &path, recursive.unwrap_or(false)).await)
-    }
-
-    #[tool(description = "Move or rename a file or directory.")]
-    async fn file_move(
-        &self,
-        Parameters(Move { src, dest }): Parameters<Move>,
-    ) -> Result<CallToolResult, McpError> {
-        wrap(files::rename(&src, &dest).await)
+        let recursive = args.recursive.unwrap_or(false);
+        let result = match args.action {
+            FileAction::Read => match args.path {
+                Some(p) => {
+                    files::read(&p, args.cursor.unwrap_or(0), args.limit.unwrap_or(200)).await
+                }
+                None => Err("read requires `path`".into()),
+            },
+            FileAction::Write => match (args.path, args.content) {
+                (Some(p), Some(c)) => files::write(&p, &c).await,
+                _ => Err("write requires `path` and `content`".into()),
+            },
+            FileAction::Append => match (args.path, args.content) {
+                (Some(p), Some(c)) => files::append(&p, &c).await,
+                _ => Err("append requires `path` and `content`".into()),
+            },
+            FileAction::Delete => match args.path {
+                Some(p) => files::delete(&p).await,
+                None => Err("delete requires `path`".into()),
+            },
+            FileAction::List => match args.path {
+                Some(p) => files::list(&p, recursive).await,
+                None => Err("list requires `path`".into()),
+            },
+            FileAction::Grep => match (args.pattern, args.path) {
+                (Some(pat), Some(p)) => files::grep(&pat, &p, recursive).await,
+                _ => Err("grep requires `pattern` and `path`".into()),
+            },
+            FileAction::Move => match (args.src, args.dest) {
+                (Some(s), Some(d)) => files::rename(&s, &d).await,
+                _ => Err("move requires `src` and `dest`".into()),
+            },
+        };
+        Ok(match result {
+            Ok(s) => ok(s),
+            Err(e) => err(e),
+        })
     }
 }
 
@@ -215,9 +212,10 @@ impl Tools {
 impl ServerHandler for Tools {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "Remote shell + file access for one host. `bash` auto-backgrounds slow commands and \
-             returns a job id; poll it with `job_poll` (paginated). File tools read/write/list/grep \
-             locally as the service user.",
+            "Remote shell + file access for one host. Three tools: `bash` runs a command \
+             (auto-backgrounds slow ones, returning a job id); `job` (action=poll/list/kill) \
+             monitors jobs with paginated output; `file` (action=read/write/append/delete/list/grep/move) \
+             operates locally as the service user.",
         )
     }
 }
@@ -230,13 +228,6 @@ fn ok(text: impl Into<String>) -> CallToolResult {
 
 fn err(text: impl Into<String>) -> CallToolResult {
     CallToolResult::error(vec![Content::text(text.into())])
-}
-
-fn wrap(r: Result<String, String>) -> Result<CallToolResult, McpError> {
-    Ok(match r {
-        Ok(s) => ok(s),
-        Err(e) => err(e),
-    })
 }
 
 fn render(state: &JobState, page: &Page) -> String {

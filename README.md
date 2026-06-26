@@ -11,7 +11,7 @@ You're in your car. From your phone, you point Claude at `https://your-vps/mcp` 
 
 - Claude calls `bash("./deploy.sh")`.
 - The deploy takes 20 minutes — so it **auto-backgrounds** and hands back a job id instead of blocking.
-- Claude polls `job_poll(id)` **page by page**, watching progress a few hundred lines at a time, so a 20-minute build never floods its context window.
+- Claude polls `job(action="poll", id)` **page by page**, watching progress a few hundred lines at a time, so a 20-minute build never floods its context window.
 - It finishes. Claude tells you it's done. You never touched a keyboard.
 
 Want to go further? Run `bash("claude -p 'fix the failing test and push'")` — **one agent supervising another agent** on your VPS. mcp-ssh is just the shell; what you run through it is up to you.
@@ -35,21 +35,13 @@ mcp-ssh now listens on `127.0.0.1:1337` at `/mcp`. Expose it as `https://your-ho
 
 ## 🧰 The tools
 
-A small, heavily-parametrized surface. Everything runs locally as the service user.
+A small, heavily-parametrized surface — **three resource-oriented tools**, composition pushed into params. Everything runs locally as the service user.
 
 | Tool | Params | What it does |
 |---|---|---|
-| `bash` | `cmd`, `cwd?`, `timeout?` | Run a shell command. Returns output inline if it finishes within the inline window (default 2s), else a **job id** to poll. `timeout` overrides the inline window. |
-| `job_poll` | `id`, `cursor?`, `limit?` | Status + **one page** of output lines (default 200). Returns `next_cursor`/`has_more` so you page through long logs. |
-| `job_list` | — | All jobs and their status. |
-| `job_kill` | `id` | Kill a running job. |
-| `file_read` | `path`, `cursor?`, `limit?` | Read a file, paginated by line. |
-| `file_write` | `path`, `content` | Create or truncate a file. |
-| `file_append` | `path`, `content` | Append to a file (creates it if absent). |
-| `file_delete` | `path` | Delete a file or directory. |
-| `file_list` | `path`, `recursive?` | `ls` a directory, or the full tree when `recursive=true`. |
-| `file_grep` | `pattern`, `path`, `recursive?` | Grep a file, or recursively under a directory. |
-| `file_move` | `src`, `dest` | Move or rename a file or directory. |
+| `bash` | `cmd`, `cwd?`, `timeout?`, `bg?` | Run a shell command. Returns output inline if it finishes within the inline window (default 2s), else a **job id** to monitor with `job`. `timeout` overrides the inline window; `bg=true` backgrounds immediately and returns the id without waiting. |
+| `job` | `action`, `id?`, `cursor?`, `limit?` | Manage jobs. `action="poll"` → status + **one page** of merged stdout+stderr (default 200 lines, with `next_cursor`/`has_more`); `action="list"` → all jobs + status; `action="kill"` → kill running job `id`. |
+| `file` | `action`, `path?`, `content?`, `pattern?`, `recursive?`, `src?`, `dest?`, `cursor?`, `limit?` | File operations by `action`: `read` (paginated), `write`, `append`, `delete`, `list` (`recursive` for the tree), `grep` (`pattern`, `recursive` under a dir), `move` (`src`→`dest`). |
 
 Full reference with examples → **[docs/usage.md](docs/usage.md)**.
 

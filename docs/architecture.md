@@ -22,8 +22,8 @@ TLS is deliberately **not** in the binary (keeps deps minimal). A reverse proxy 
 | `config.rs` | Runtime config from env + file. Fails fast at boot if credentials are missing. |
 | `auth.rs` | The auth middleware — **HTTP Basic** and **OAuth 2.1** in front of `/mcp`. |
 | `oauth` | A minimal **OAuth 2.1 authorization server** (per the MCP authorization spec) so GUI clients can log in. |
-| `jobs.rs` | The job engine: run a command, return inline-or-background, paginated logs. |
-| `tools/mod.rs` | The MCP tool surface — thin adapters over `jobs` and `files`. |
+| `jobs.rs` | The job engine: run a command, return inline-or-background (incl. immediate `bg`), paginated logs, and an hourly reaper that drops jobs >24h old. |
+| `tools/mod.rs` | The MCP tool surface — **three tools** (`bash`/`job`/`file`) dispatching on an `action` param; thin adapters over `jobs` and `files`. |
 | `tools/files.rs` | File operations (read/write/append/delete/list/grep/move). |
 
 ## 🔌 Request flow
@@ -36,9 +36,10 @@ client ──HTTPS──▶ reverse proxy ──HTTP──▶ axum (127.0.0.1:13
                                   /mcp  StreamableHttpService (rmcp)
                                             │
                                        Tools (tool_router)
+                                     bash · job · file (action)
                                           ╱        ╲
                                     jobs.rs       files.rs
-                                  (bash, jobs)   (file_* ops)
+                                  (bash, job)     (file ops)
 ```
 
 Every MCP request passes the auth middleware first; only authenticated requests reach the tool router.
@@ -51,11 +52,11 @@ When a command starts (`JobStore::run`):
 
 1. The command is spawned via `sh -c`, with stdout **and** stderr merged into a single per-job **log file** (`MCP_SSH_JOB_DIR/<id>.log`). Logging to a file — not memory — is what lets long output be paginated later without holding it all in RAM.
 2. A background task owns the child process, waits for it to exit, and records the final `JobState` (`Running` / `Exited{code}` / `Failed{error}`).
-3. The caller waits for **either** completion **or** the inline window (`MCP_SSH_INLINE_TIMEOUT_SECS`, default 2s; overridable per call via `bash`'s `timeout`):
+3. The caller waits for **either** completion **or** the inline window (`MCP_SSH_INLINE_TIMEOUT_SECS`, default 2s; overridable per call via `bash`'s `timeout`). Passing `bg=true` skips the wait entirely and backgrounds at once:
    - **Finished in time** → `RunResult::Inline` — status + first page of the log, returned now.
-   - **Still running** → `RunResult::Backgrounded { id }` — the agent gets a job id to poll.
+   - **Still running (or `bg`)** → `RunResult::Backgrounded { id }` — the agent gets a job id to poll.
 
-Jobs live in an in-memory map keyed by id (`j1`, `j2`, …); the log files persist on disk under the job dir.
+Jobs live in an in-memory map keyed by id (`j1`, `j2`, …); the log files persist on disk under the job dir. An **hourly reaper** drops any job whose age exceeds 24h — evicting it from the map and deleting its log file — so the map and the job dir stay bounded without manual cleanup.
 
 ```
 JobState = Running | Exited { code } | Failed { error }
@@ -67,7 +68,7 @@ RunResult = Inline { state, page } | Backgrounded { id }
 Long output is the enemy of a context window, so anything potentially large is **paginated by line**.
 
 - A `Page` carries `lines`, `next_cursor`, `total_lines`, and `has_more`.
-- `job_poll(id, cursor, limit)` and `file_read(path, cursor, limit)` both read a window `[cursor, cursor+limit)` (default limit 200) and report where to continue.
+- `job(action="poll", id, cursor, limit)` and `file(action="read", path, cursor, limit)` both read a window `[cursor, cursor+limit)` (default limit 200) and report where to continue.
 - The agent walks forward — `cursor = next_cursor` — until `has_more` is false.
 
 `read_page` re-reads the log file each call and slices by line. Simple and correct for typical logs; byte-offset seeking is the upgrade path if logs ever get huge.
@@ -76,7 +77,7 @@ Long output is the enemy of a context window, so anything potentially large is *
 
 `tools/mod.rs` defines one `Tools` struct whose methods are the MCP tools, registered via rmcp's `#[tool_router]`. Each method is a **thin adapter**: parse params → call `jobs` or `files` → wrap the result as MCP content. No business logic lives in the tool layer.
 
-The set is intentionally small and heavily parametrized: `bash` + 3 job tools + 7 file tools. See [usage.md](usage.md) for each one's params and examples.
+The surface is **three resource-oriented tools** — `bash`, `job`, `file` — grouped by resource, with composition pushed into params. `job` and `file` dispatch on an `action` param (`poll`/`list`/`kill`; `read`/`write`/`append`/`delete`/`list`/`grep`/`move`) rather than splitting into a tool per operation, keeping the surface constant. See [usage.md](usage.md) for each one's params and examples.
 
 ## 🔐 Auth
 
