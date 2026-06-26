@@ -1,0 +1,7 @@
+target/
+.git/
+.github/
+docs/
+.claude/
+*.deb
+.env

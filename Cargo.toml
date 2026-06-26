@@ -1,0 +1,72 @@
+[package]
+name = "mcp-ssh"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Remote shell + file access for AI agents over authenticated MCP-HTTP — an ssh replacement you talk to over /mcp"
+license = "MIT"
+repository = "https://github.com/developerz-ai/mcp-ssh"
+readme = "README.md"
+publish = false
+
+[[bin]]
+name = "mcp-ssh"
+path = "src/main.rs"
+
+[dependencies]
+# MCP server + Streamable HTTP transport
+rmcp = { version = "1.7", features = [
+    "server",
+    "macros",
+    "transport-streamable-http-server",
+    "transport-streamable-http-server-session",
+] }
+
+# async runtime + http
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+
+# serialization + tool schemas
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+
+# cli + config
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"
+rpassword = "7"
+
+# auth (opaque tokens + PKCE S256 — no JWT/JWKS needed)
+base64 = "0.22"
+sha2 = "0.10"
+rand = "0.8"
+urlencoding = "2"
+
+# errors + logging
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+# `cargo deb` packaging — produces the downloadable .deb.
+[package.metadata.deb]
+maintainer = "developerz-ai <admin@venom.is>"
+copyright = "2026, developerz-ai"
+extended-description = "An MCP server giving an AI agent remote shell + file access to the host it runs on, over authenticated MCP-HTTP at /mcp."
+depends = "$auto"
+section = "utils"
+priority = "optional"
+assets = [
+    ["target/release/mcp-ssh", "usr/bin/", "755"],
+    ["deploy/mcp-ssh.service", "lib/systemd/system/", "644"],
+    ["README.md", "usr/share/doc/mcp-ssh/README.md", "644"],
+]
+systemd-units = { unit-name = "mcp-ssh", enable = false, start = false }

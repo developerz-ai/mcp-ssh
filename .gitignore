@@ -1,0 +1,25 @@
+# Rust
+/target
+*.rs.bk
+
+# Env files (keep .env.example)
+.env
+.env.*
+!.env.example
+
+# Editors
+.idea/
+.vscode/
+*.swp
+
+# macOS
+.DS_Store
+
+# Local Claude settings
+.claude/settings.local.json
+
+# Build artifacts
+*.deb
+
+# Local config
+config.toml

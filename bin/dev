@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+if [ -f .env ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . ./.env
+  set +a
+fi
+
+if command -v cargo-watch >/dev/null 2>&1; then
+  exec cargo watch -x 'run -- serve'
+else
+  exec cargo run -- serve
+fi

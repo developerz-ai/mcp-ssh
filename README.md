@@ -1,0 +1,122 @@
+# 🔌 mcp-ssh
+
+> **ssh, but you talk to it over `/mcp` from any MCP client.**
+> A single Rust binary that gives an AI agent a remote shell + file access to **one host — the box it runs on.** No SSH client, no multi-server fan-out, no gateway. It runs commands **locally**, as the service user, and speaks MCP over HTTP.
+
+You point Claude (or any MCP client) at `https://your-host/mcp`, it authenticates, and now the agent can `bash`, read/write files, and supervise long-running jobs on that machine — from anywhere.
+
+## 🚗 The story
+
+You're in your car. From your phone, you point Claude at `https://your-vps/mcp` and say *"run the deploy."*
+
+- Claude calls `bash("./deploy.sh")`.
+- The deploy takes 20 minutes — so it **auto-backgrounds** and hands back a job id instead of blocking.
+- Claude polls `job_poll(id)` **page by page**, watching progress a few hundred lines at a time, so a 20-minute build never floods its context window.
+- It finishes. Claude tells you it's done. You never touched a keyboard.
+
+Want to go further? Run `bash("claude -p 'fix the failing test and push'")` — **one agent supervising another agent** on your VPS. mcp-ssh is just the shell; what you run through it is up to you.
+
+## ⚡ Quickstart
+
+```bash
+# 1. install (Debian/Ubuntu — grab the .deb from releases)
+sudo dpkg -i mcp-ssh_*.deb
+
+# 2. set the single username/password (prompts for the password)
+mcp-ssh set-auth admin
+
+# 3. start it as a systemd service
+sudo systemctl enable --now mcp-ssh
+
+# 4. put TLS in front (see docs/deploy.md) and connect from Claude
+```
+
+mcp-ssh now listens on `127.0.0.1:1337` at `/mcp`. Expose it as `https://your-host/mcp` with a reverse proxy → **[docs/deploy.md](docs/deploy.md)**.
+
+## 🧰 The tools
+
+A small, heavily-parametrized surface. Everything runs locally as the service user.
+
+| Tool | Params | What it does |
+|---|---|---|
+| `bash` | `cmd`, `cwd?`, `timeout?` | Run a shell command. Returns output inline if it finishes within the inline window (default 2s), else a **job id** to poll. `timeout` overrides the inline window. |
+| `job_poll` | `id`, `cursor?`, `limit?` | Status + **one page** of output lines (default 200). Returns `next_cursor`/`has_more` so you page through long logs. |
+| `job_list` | — | All jobs and their status. |
+| `job_kill` | `id` | Kill a running job. |
+| `file_read` | `path`, `cursor?`, `limit?` | Read a file, paginated by line. |
+| `file_write` | `path`, `content` | Create or truncate a file. |
+| `file_append` | `path`, `content` | Append to a file (creates it if absent). |
+| `file_delete` | `path` | Delete a file or directory. |
+| `file_list` | `path`, `recursive?` | `ls` a directory, or the full tree when `recursive=true`. |
+| `file_grep` | `pattern`, `path`, `recursive?` | Grep a file, or recursively under a directory. |
+| `file_move` | `src`, `dest` | Move or rename a file or directory. |
+
+Full reference with examples → **[docs/usage.md](docs/usage.md)**.
+
+## 🔗 Connect from Claude
+
+1. Deploy mcp-ssh behind TLS so it's reachable at `https://your-host/mcp`.
+2. In Claude, add a remote MCP server with URL `https://your-host/mcp`.
+3. Claude runs the **OAuth 2.1** flow (the spec-compliant auth GUI clients use); log in with the username/password you set via `mcp-ssh set-auth`.
+4. The tools above appear. Say *"run the deploy."*
+
+For scripts and curl, use **HTTP Basic** instead — same credentials, no OAuth dance:
+
+```bash
+curl -u admin:secret https://your-host/mcp -d @request.json
+```
+
+## 🔐 Auth
+
+Two modes, one credential set (a single username/password).
+
+| Mode | For | Set up |
+|---|---|---|
+| **OAuth 2.1** | Claude & most GUI MCP clients (required by them) | automatic — Claude drives it |
+| **HTTP Basic** | curl, scripts, simple clients | `-u user:pass` header |
+
+Set the credentials once:
+
+```bash
+mcp-ssh set-auth admin     # prompts for the password
+```
+
+## 🖥️ CLI
+
+```bash
+mcp-ssh serve              # run the server (this is the default)
+mcp-ssh set-auth <user>    # configure the username/password
+```
+
+## ⚠️ Security
+
+**This gives an agent full shell access as the service user.** Treat it accordingly:
+
+- Run it as a **dedicated low-privilege user** — never root.
+- Always put it **behind TLS** (reverse proxy). Never expose `:1337` directly.
+- Use a **strong password**.
+- Set `MCP_SSH_ALLOWED_HOSTS` to your public hostname — it's the DNS-rebinding guard.
+
+## 📦 Install
+
+| Method | How |
+|---|---|
+| **Debian/Ubuntu** | download `mcp-ssh_*.deb` from [releases](https://github.com/developerz-ai/mcp-ssh/releases) → `sudo dpkg -i mcp-ssh_*.deb` |
+| **Docker** | pull the image and run it (see [docs/deploy.md](docs/deploy.md)) |
+| **From source** | `cargo build --release` → binary at `target/release/mcp-ssh` |
+
+## 📚 Docs
+
+| Doc | What's in it |
+|---|---|
+| [docs/usage.md](docs/usage.md) | Every tool with params + examples, the execution & pagination model, config & env vars |
+| [docs/architecture.md](docs/architecture.md) | Module map, auto-backgrounding execution, the auth middleware, the stack |
+| [docs/deploy.md](docs/deploy.md) | systemd, Caddy & nginx+certbot TLS, Docker, hardening |
+
+## 🧬 Stack
+
+Rust 2024 · tokio · axum 0.8 · [rmcp](https://github.com/modelcontextprotocol/rust-sdk) 1.7 (MCP Streamable HTTP).
+
+## 📄 License
+
+MIT. Repository: <https://github.com/developerz-ai/mcp-ssh>.

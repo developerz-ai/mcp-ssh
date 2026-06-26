@@ -1,0 +1,22 @@
+[Unit]
+Description=mcp-ssh MCP server (executes shell commands locally)
+After=network.target
+
+[Service]
+Type=simple
+User=mcp-ssh
+Group=mcp-ssh
+ExecStart=/usr/bin/mcp-ssh serve
+EnvironmentFile=-/etc/mcp-ssh/mcp-ssh.env
+Restart=on-failure
+RestartSec=5
+
+# Hardening. NOTE: this tool intentionally shells out to run arbitrary
+# commands as the service user, so sandboxing is necessarily loose -- these
+# only raise the floor, they do not contain a determined command.
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
