@@ -7,7 +7,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use tokio::sync::{Mutex, watch};
 
-use super::{Job, JobState};
+use super::{Job, JobState, ProcessGroupId};
 
 /// Jobs (and their logs) older than this are reaped hourly.
 const RETENTION: Duration = Duration::from_secs(24 * 3600);
@@ -16,7 +16,8 @@ const KILL_GRACE: Duration = Duration::from_secs(2);
 
 /// Signal a job's process group dead: `SIGTERM`, then `SIGKILL` if it outlasts a
 /// short grace. Returns `true` if it signalled a running job, `false` if there
-/// was nothing to kill (already finished, or the OS withheld its pid).
+/// was nothing to kill (already finished, the OS withheld its pid) or the signal
+/// could not be delivered.
 pub(super) async fn kill_job(job: &Job) -> bool {
     if !matches!(*job.state.lock().await, JobState::Running) {
         return false;
@@ -24,24 +25,34 @@ pub(super) async fn kill_job(job: &Job) -> bool {
     let Some(pgid) = job.pgid else {
         return false;
     };
-    signal_group(pgid, "TERM").await;
+    if !signal_group(pgid, "TERM").await {
+        return false;
+    }
     // Give the group a chance to exit on TERM; force it with KILL otherwise.
-    if !exited_within(job.done.clone(), KILL_GRACE).await {
-        signal_group(pgid, "KILL").await;
+    if !exited_within(job.done.clone(), KILL_GRACE).await && !signal_group(pgid, "KILL").await {
+        return false;
     }
     true
 }
 
 /// Send `signal` (`"TERM"`, `"KILL"`, …) to process group `pgid`. The negative
 /// pid targets the whole group so descendants die too, not just `sh`; `--` stops
-/// `kill` reading it as an option. ponytail: pid reuse is a non-issue here.
-async fn signal_group(pgid: u32, signal: &str) {
-    let _ = tokio::process::Command::new("kill")
+/// `kill` reading it as an option. Returns whether the signal was delivered.
+/// ponytail: pid reuse is a non-issue here.
+async fn signal_group(pgid: ProcessGroupId, signal: &str) -> bool {
+    match tokio::process::Command::new("kill")
         .arg(format!("-{signal}"))
         .arg("--")
-        .arg(format!("-{pgid}"))
+        .arg(format!("-{}", pgid.0))
         .status()
-        .await;
+        .await
+    {
+        Ok(status) => status.success(),
+        Err(error) => {
+            tracing::warn!(%error, pgid = pgid.0, signal, "failed to signal process group");
+            false
+        }
+    }
 }
 
 /// Wait up to `grace` for the job to exit, watching its completion flag rather
@@ -71,18 +82,27 @@ pub(super) fn spawn_reaper(jobs: Arc<Mutex<HashMap<String, Arc<Job>>>>) {
 /// job is killed first, so eviction never orphans its process group.
 pub(super) async fn reap_once(jobs: &Mutex<HashMap<String, Arc<Job>>>, retention: Duration) {
     let now = tokio::time::Instant::now();
-    let mut map = jobs.lock().await;
+    let map = jobs.lock().await;
     let stale: Vec<(String, Arc<Job>)> = map
         .iter()
         .filter(|(_, j)| now.duration_since(j.started) > retention)
         .map(|(id, j)| (id.clone(), j.clone()))
         .collect();
+    drop(map);
+
+    // Kill first so a still-running group is never orphaned by eviction; the job
+    // stays in the map (pollable/killable) until its termination completes.
+    for (_, job) in &stale {
+        kill_job(job).await;
+    }
+
+    let mut map = jobs.lock().await;
     for (id, _) in &stale {
         map.remove(id);
     }
     drop(map);
+
     for (_, job) in &stale {
-        kill_job(job).await;
         let _ = tokio::fs::remove_file(&job.log_path).await;
     }
 }

@@ -26,12 +26,17 @@ pub enum JobState {
     Failed { error: String },
 }
 
+/// Process group id to signal on kill. Wrapping the raw pid keeps this
+/// lifecycle/security boundary from being confused with any other `u32`.
+#[derive(Debug, Clone, Copy)]
+struct ProcessGroupId(u32);
+
 struct Job {
     cmd: String,
     log_path: PathBuf,
     /// Process group to signal on kill. The child leads its own group, so this
     /// equals its pid (see `run`). `None` only if the OS withheld a pid.
-    pgid: Option<u32>,
+    pgid: Option<ProcessGroupId>,
     state: Arc<Mutex<JobState>>,
     /// Flips to `true` when the process exits; lets `kill` wait out its grace
     /// period instead of polling.
@@ -119,7 +124,7 @@ impl JobStore {
         command.process_group(0);
 
         let mut child = command.spawn()?;
-        let pgid = child.id();
+        let pgid = child.id().map(ProcessGroupId);
         let (tx, rx) = watch::channel(false);
         let state = Arc::new(Mutex::new(JobState::Running));
 
@@ -463,13 +468,13 @@ mod tests {
     #[tokio::test]
     async fn list_reports_all_jobs() {
         let store = store(Duration::from_secs(5));
-        // Two distinct commands — one fast (inline), one long (backgrounded).
+        // Two distinct commands — one inline, one explicitly backgrounded.
         store
             .run("echo alpha".into(), None, None, false)
             .await
             .unwrap();
         store
-            .run("echo beta".into(), None, None, false)
+            .run("echo beta".into(), None, None, true)
             .await
             .unwrap();
 

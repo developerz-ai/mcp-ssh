@@ -132,8 +132,6 @@ reviews:
   path_filters:
     - "!target/**"
     - "!**/target/**"
-    - "!**/*.lock"
-    - "!Cargo.lock"
     - "!**/*.log"
     - "!.env*"
     - "!**/.DS_Store"
