@@ -430,6 +430,58 @@ mod tests {
         panic!("descendant survived eviction");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_terminates_child_process() {
+        let store = store(Duration::from_millis(100));
+        let r = store
+            .run("sleep 1000".into(), None, None, true)
+            .await
+            .unwrap();
+        let RunResult::Backgrounded { id } = r else {
+            panic!("bg should background");
+        };
+        // Give the process a moment to start before we try to kill it.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert!(
+            store.kill(&id).await,
+            "kill should return true for a running job"
+        );
+
+        // After kill the state must transition away from Running.
+        for _ in 0..50 {
+            let (state, _) = store.poll(&id, 0, None).await.unwrap();
+            if !matches!(state, JobState::Running) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("job remained Running after kill");
+    }
+
+    #[tokio::test]
+    async fn list_reports_all_jobs() {
+        let store = store(Duration::from_secs(5));
+        // Two distinct commands — one fast (inline), one long (backgrounded).
+        store
+            .run("echo alpha".into(), None, None, false)
+            .await
+            .unwrap();
+        store
+            .run("echo beta".into(), None, None, false)
+            .await
+            .unwrap();
+
+        let jobs = store.list().await;
+        assert_eq!(jobs.len(), 2, "expected two jobs, got {}", jobs.len());
+        let cmds: Vec<&str> = jobs.iter().map(|j| j.cmd.as_str()).collect();
+        assert!(cmds.contains(&"echo alpha"), "missing 'echo alpha'");
+        assert!(cmds.contains(&"echo beta"), "missing 'echo beta'");
+        // IDs must be sorted so the list is deterministic.
+        assert!(jobs[0].id < jobs[1].id, "list should be sorted by id");
+    }
+
     #[tokio::test]
     async fn poll_paginates() {
         let store = store(Duration::from_secs(5));
