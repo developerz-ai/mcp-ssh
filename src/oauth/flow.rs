@@ -140,32 +140,51 @@ fn redirect_error(redirect_uri: &str, error: &str, state: Option<&str>) -> Respo
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use axum::http::{HeaderValue, header};
+    use base64::Engine;
+
     use super::*;
-    use axum::http::header;
     use store::Store;
 
-    #[tokio::test]
-    async fn token_response_sets_cache_control_no_store() {
-        let store = Store::default();
-        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
-        let challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
-        let code = store.new_code(challenge.into(), "http://cb".into()).await;
+    const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
 
-        let state = AuthState {
+    fn test_state(store: Store) -> AuthState {
+        AuthState {
             creds: crate::auth::Credentials {
                 user: "u".into(),
                 pass: "p".into(),
             },
-            store: std::sync::Arc::new(store),
+            store: Arc::new(store),
             public_url: None,
-        };
+        }
+    }
+
+    fn basic_headers(user: &str, pass: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        let enc = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Basic {enc}")).unwrap(),
+        );
+        headers
+    }
+
+    // --- /token ---
+
+    #[tokio::test]
+    async fn token_response_sets_cache_control_no_store() {
+        let store = Store::default();
+        let code = store.new_code(CHALLENGE.into(), "http://cb".into()).await;
         let params = TokenParams {
             grant_type: "authorization_code".into(),
             code,
-            code_verifier: verifier.into(),
+            code_verifier: VERIFIER.into(),
             redirect_uri: "http://cb".into(),
         };
-        let resp = token(State(state), Form(params)).await;
+        let resp = token(State(test_state(store)), Form(params)).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
             resp.headers()
@@ -173,5 +192,137 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("no-store"),
         );
+    }
+
+    #[tokio::test]
+    async fn token_rejects_unsupported_grant_type() {
+        let params = TokenParams {
+            grant_type: "client_credentials".into(),
+            code: "irrelevant".into(),
+            code_verifier: "irrelevant".into(),
+            redirect_uri: "http://cb".into(),
+        };
+        let resp = token(State(test_state(Store::default())), Form(params)).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"], "unsupported_grant_type");
+    }
+
+    // --- /authorize ---
+
+    #[tokio::test]
+    async fn authorize_rejects_missing_pkce_s256() {
+        // Valid Basic creds but no PKCE challenge → invalid_request redirect.
+        let params = AuthorizeParams {
+            response_type: "code".into(),
+            redirect_uri: "http://callback".into(),
+            code_challenge: None,
+            code_challenge_method: None,
+            state: None,
+            resource: None,
+        };
+        let resp = authorize(
+            State(test_state(Store::default())),
+            basic_headers("u", "p"),
+            Query(params),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        let location = resp.headers().get("Location").unwrap().to_str().unwrap();
+        assert!(
+            location.contains("error=invalid_request"),
+            "location={location}"
+        );
+    }
+
+    #[tokio::test]
+    async fn authorize_rejects_plain_challenge_method() {
+        // challenge present but method != S256 → invalid_request.
+        let params = AuthorizeParams {
+            response_type: "code".into(),
+            redirect_uri: "http://callback".into(),
+            code_challenge: Some("abc".into()),
+            code_challenge_method: Some("plain".into()),
+            state: None,
+            resource: None,
+        };
+        let resp = authorize(
+            State(test_state(Store::default())),
+            basic_headers("u", "p"),
+            Query(params),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        let location = resp.headers().get("Location").unwrap().to_str().unwrap();
+        assert!(
+            location.contains("error=invalid_request"),
+            "location={location}"
+        );
+    }
+
+    #[tokio::test]
+    async fn authorize_redirects_with_code_on_valid_basic_and_pkce() {
+        let params = AuthorizeParams {
+            response_type: "code".into(),
+            redirect_uri: "http://callback".into(),
+            code_challenge: Some(CHALLENGE.into()),
+            code_challenge_method: Some("S256".into()),
+            state: None,
+            resource: None,
+        };
+        let resp = authorize(
+            State(test_state(Store::default())),
+            basic_headers("u", "p"),
+            Query(params),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        let location = resp.headers().get("Location").unwrap().to_str().unwrap();
+        assert!(
+            location.starts_with("http://callback?code="),
+            "location={location}"
+        );
+    }
+
+    #[tokio::test]
+    async fn authorize_returns_401_on_bad_credentials() {
+        let params = AuthorizeParams {
+            response_type: "code".into(),
+            redirect_uri: "http://callback".into(),
+            code_challenge: Some(CHALLENGE.into()),
+            code_challenge_method: Some("S256".into()),
+            state: None,
+            resource: None,
+        };
+        let resp = authorize(
+            State(test_state(Store::default())),
+            basic_headers("u", "wrong"),
+            Query(params),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // --- /register ---
+
+    #[tokio::test]
+    async fn register_echoes_redirect_uris() {
+        let body = Json(serde_json::json!({ "redirect_uris": ["http://callback"] }));
+        let resp = register(Some(body)).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["redirect_uris"][0], "http://callback");
+        assert!(json["client_id"].is_string());
+    }
+
+    #[tokio::test]
+    async fn register_with_no_body_returns_empty_redirect_uris() {
+        let resp = register(None).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["redirect_uris"], serde_json::json!([]));
     }
 }
