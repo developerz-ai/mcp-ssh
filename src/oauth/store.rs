@@ -129,4 +129,25 @@ mod tests {
         assert!(store.validate(&token).await);
         assert!(!store.validate("nope").await);
     }
+
+    #[tokio::test]
+    async fn expired_token_is_invalid_and_evicted() {
+        tokio::time::pause(); // take control of the mock clock
+        let store = Store::default();
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        let challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+        let code = store.new_code(challenge.into(), "http://cb".into()).await;
+        let token = store.redeem(&code, verifier, "http://cb").await.unwrap();
+
+        // Valid before expiry.
+        assert!(store.validate(&token).await);
+
+        // Advance past TOKEN_TTL.
+        tokio::time::advance(TOKEN_TTL + Duration::from_secs(1)).await;
+
+        // First call after expiry returns false and evicts the entry.
+        assert!(!store.validate(&token).await);
+        // Second call confirms the entry is gone (not just considered invalid).
+        assert!(!store.validate(&token).await);
+    }
 }

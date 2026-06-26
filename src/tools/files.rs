@@ -121,6 +121,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_non_recursive_shows_top_level_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        tokio::fs::create_dir(&sub).await.unwrap();
+        let f_top = dir.path().join("top.txt");
+        let f_nested = sub.join("nested.txt");
+        write(f_top.to_str().unwrap(), "top").await.unwrap();
+        write(f_nested.to_str().unwrap(), "nested").await.unwrap();
+
+        let out = list(dir.path().to_str().unwrap(), false).await.unwrap();
+        assert!(out.contains("top.txt"), "should list top-level file: {out}");
+        assert!(out.contains("sub"), "should list sub dir: {out}");
+        assert!(!out.contains("nested.txt"), "should not recurse: {out}");
+    }
+
+    #[tokio::test]
+    async fn list_recursive_finds_nested_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        tokio::fs::create_dir(&sub).await.unwrap();
+        let f_nested = sub.join("deep.txt");
+        write(f_nested.to_str().unwrap(), "deep").await.unwrap();
+
+        let out = list(dir.path().to_str().unwrap(), true).await.unwrap();
+        assert!(
+            out.contains("deep.txt"),
+            "recursive find should reach nested file: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_directory_removes_entire_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("to_delete");
+        tokio::fs::create_dir(&sub).await.unwrap();
+        let f = sub.join("file.txt");
+        write(f.to_str().unwrap(), "content").await.unwrap();
+
+        delete(sub.to_str().unwrap()).await.unwrap();
+        assert!(
+            !sub.exists(),
+            "directory and its contents should be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_recursive_finds_match_in_subdirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        tokio::fs::create_dir(&sub).await.unwrap();
+        let f = sub.join("d.txt");
+        write(f.to_str().unwrap(), "alpha\nbeta\ngamma")
+            .await
+            .unwrap();
+
+        let out = grep("beta", dir.path().to_str().unwrap(), true)
+            .await
+            .unwrap();
+        assert!(
+            out.contains("beta"),
+            "recursive grep should find pattern in subdir: {out}"
+        );
+    }
+
+    #[tokio::test]
     async fn binary_file_reads_as_lossy_utf8_not_error() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("bin.dat");
