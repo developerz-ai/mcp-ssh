@@ -1,4 +1,5 @@
 //! mcp-ssh — remote shell + file access for AI agents over authenticated MCP-HTTP.
+mod app;
 mod auth;
 mod cli;
 mod config;
@@ -9,9 +10,6 @@ mod tools;
 use std::sync::Arc;
 
 use clap::Parser;
-use rmcp::transport::streamable_http_server::{
-    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
-};
 
 use cli::{Cli, Command};
 
@@ -54,21 +52,7 @@ async fn serve() -> anyhow::Result<()> {
         public_url: cfg.public_url.clone(),
     };
 
-    let mut http = StreamableHttpServerConfig::default();
-    http.stateful_mode = true;
-    http.allowed_hosts = cfg.allowed_hosts.clone();
-
-    let service = StreamableHttpService::new(
-        move || Ok(tools::Tools::new(store.clone())),
-        Arc::new(LocalSessionManager::default()),
-        http,
-    );
-
-    let mcp = axum::Router::new().nest_service("/mcp", service).layer(
-        axum::middleware::from_fn_with_state(auth_state.clone(), auth::require_auth),
-    );
-
-    let app = mcp.merge(oauth::router(auth_state));
+    let app = app::build(auth_state, store, cfg.allowed_hosts.clone());
 
     let listener = tokio::net::TcpListener::bind(cfg.bind).await?;
     tracing::info!(addr = %cfg.bind, "mcp-ssh listening on /mcp");
