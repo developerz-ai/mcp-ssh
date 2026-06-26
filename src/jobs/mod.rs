@@ -450,11 +450,11 @@ mod tests {
             pgid: None,
             state: Arc::new(Mutex::new(JobState::Running)),
             done: rx,
-            started: tokio::time::Instant::now(),
+            started: tokio::time::Instant::now() - Duration::from_secs(1),
         });
         store.jobs.lock().await.insert("jfake".into(), job);
 
-        // Retention zero => stale immediately; kill fails => must not be evicted.
+        // The backdated job is stale; kill fails => must not be evicted.
         reaper::reap_once(&store.jobs, Duration::ZERO).await;
 
         assert!(
