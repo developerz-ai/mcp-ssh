@@ -435,6 +435,35 @@ mod tests {
         panic!("descendant survived eviction");
     }
 
+    #[tokio::test]
+    async fn reaper_keeps_running_job_when_kill_fails() {
+        let store = store(Duration::from_millis(100));
+        // A job with no pgid can't be signalled, so kill always fails while the
+        // job still reads as Running. Evicting it would orphan a live group and
+        // delete its log, so the reaper must keep it tracked for a later pass.
+        let (_tx, rx) = watch::channel(false);
+        let log_path = store.dir.join("jfake.log");
+        tokio::fs::write(&log_path, "running\n").await.unwrap();
+        let job = Arc::new(Job {
+            cmd: "unkillable".into(),
+            log_path: log_path.clone(),
+            pgid: None,
+            state: Arc::new(Mutex::new(JobState::Running)),
+            done: rx,
+            started: tokio::time::Instant::now(),
+        });
+        store.jobs.lock().await.insert("jfake".into(), job);
+
+        // Retention zero => stale immediately; kill fails => must not be evicted.
+        reaper::reap_once(&store.jobs, Duration::ZERO).await;
+
+        assert!(
+            store.poll("jfake", 0, None).await.is_some(),
+            "running job whose kill failed must stay tracked"
+        );
+        assert!(log_path.exists(), "its log must not be deleted");
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn kill_terminates_child_process() {

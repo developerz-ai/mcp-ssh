@@ -90,19 +90,25 @@ pub(super) async fn reap_once(jobs: &Mutex<HashMap<String, Arc<Job>>>, retention
         .collect();
     drop(map);
 
-    // Kill first so a still-running group is never orphaned by eviction; the job
-    // stays in the map (pollable/killable) until its termination completes.
-    for (_, job) in &stale {
-        kill_job(job).await;
+    // Kill first so a still-running group is never orphaned by eviction. Only
+    // evict jobs that finished or whose group we actually signalled; a running
+    // job whose kill failed stays tracked (pollable/killable) for a later pass.
+    let mut removable: Vec<(String, Arc<Job>)> = Vec::new();
+    for (id, job) in &stale {
+        if kill_job(job).await || !matches!(*job.state.lock().await, JobState::Running) {
+            removable.push((id.clone(), job.clone()));
+        } else {
+            tracing::warn!(id = %id, "stale running job not evicted: kill failed");
+        }
     }
 
     let mut map = jobs.lock().await;
-    for (id, _) in &stale {
+    for (id, _) in &removable {
         map.remove(id);
     }
     drop(map);
 
-    for (_, job) in &stale {
+    for (_, job) in &removable {
         let _ = tokio::fs::remove_file(&job.log_path).await;
     }
 }
