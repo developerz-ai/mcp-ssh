@@ -148,3 +148,122 @@ fn pick(env: &str, file: Option<String>, default: &str) -> String {
 fn opt(env: &str, file: Option<String>) -> Option<String> {
     std::env::var(env).ok().or(file)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use tempfile::tempdir;
+
+    /// All env-mutating tests must hold this lock to avoid races.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Set/unset env vars for the duration of `f`, then restore originals.
+    fn with_env<F: FnOnce() -> R, R>(set: &[(&str, &str)], unset: &[&str], f: F) -> R {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let saved_set: Vec<(&str, Option<String>)> = set
+            .iter()
+            .map(|(k, _)| (*k, std::env::var(k).ok()))
+            .collect();
+        let saved_unset: Vec<(&str, Option<String>)> =
+            unset.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+
+        // SAFETY: tests are serialised by ENV_LOCK; no other thread mutates env while
+        // the lock is held, so the set_var / remove_var calls are race-free.
+        unsafe {
+            for (k, v) in set {
+                std::env::set_var(k, v);
+            }
+            for k in unset {
+                std::env::remove_var(k);
+            }
+        }
+
+        let result = f();
+
+        unsafe {
+            for (k, v) in saved_set.iter().chain(saved_unset.iter()) {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+
+        result
+    }
+
+    #[test]
+    fn env_overrides_file() {
+        let dir = tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+
+        let file_cfg = FileConfig {
+            user: Some("file_user".into()),
+            pass: Some("file_pass".into()),
+            ..Default::default()
+        };
+        std::fs::write(&cfg_path, toml::to_string_pretty(&file_cfg).unwrap()).unwrap();
+
+        with_env(
+            &[
+                ("MCP_SSH_CONFIG", cfg_path.to_str().unwrap()),
+                ("MCP_SSH_USER", "env_user"),
+                ("MCP_SSH_PASS", "env_pass"),
+            ],
+            &[],
+            || {
+                let cfg = Config::load().expect("load should succeed");
+                assert_eq!(cfg.user, "env_user");
+                assert_eq!(cfg.pass, "env_pass");
+            },
+        );
+    }
+
+    #[test]
+    fn missing_creds_returns_no_credentials() {
+        let dir = tempdir().unwrap();
+        // Point at a non-existent file so load_file returns FileConfig::default().
+        let cfg_path = dir.path().join("absent.toml");
+
+        with_env(
+            &[("MCP_SSH_CONFIG", cfg_path.to_str().unwrap())],
+            &["MCP_SSH_USER", "MCP_SSH_PASS"],
+            || {
+                let err = Config::load().expect_err("should fail without credentials");
+                assert!(
+                    matches!(err, ConfigError::NoCredentials),
+                    "expected NoCredentials, got {err}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn set_auth_writes_toml_and_chmod_600() {
+        let dir = tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+
+        with_env(
+            &[("MCP_SSH_CONFIG", cfg_path.to_str().unwrap())],
+            &[],
+            || {
+                let written = set_auth("bob", "s3cr3t").expect("set_auth should succeed");
+                assert_eq!(written, cfg_path);
+
+                let contents = std::fs::read_to_string(&cfg_path).unwrap();
+                let parsed: FileConfig = toml::from_str(&contents).unwrap();
+                assert_eq!(parsed.user.as_deref(), Some("bob"));
+                assert_eq!(parsed.pass.as_deref(), Some("s3cr3t"));
+
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    let mode = std::fs::metadata(&cfg_path).unwrap().mode();
+                    assert_eq!(mode & 0o777, 0o600, "expected mode 0o600, got {mode:o}");
+                }
+            },
+        );
+    }
+}
