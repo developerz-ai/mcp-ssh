@@ -151,8 +151,24 @@ File: `/etc/mcp-ssh/config.toml` (or override the path with `$MCP_SSH_CONFIG`). 
 
 Once `https://your-host/mcp` is live:
 
-- **All MCP clients** — add the URL; the client discovers `/.well-known/oauth-authorization-server`,
-  drives the **OAuth 2.1** flow, and logs in with your `set-auth` credentials. `/mcp` is
-  **bearer-only**; there is no HTTP Basic fallback on this endpoint.
+- **GUI MCP clients** (Claude desktop/web) — add the URL; the client discovers
+  `/.well-known/oauth-authorization-server`, drives the **OAuth 2.1** flow in a browser, and
+  logs in with your `set-auth` credentials. `/mcp` is **bearer-only**; there is no HTTP Basic
+  fallback on this endpoint.
+
+- **Headless / CLI clients** (the `claude` CLI, curl, scripts) have no browser to run the
+  flow. Mint a bearer token non-interactively with [`bin/mcp-token`](../bin/mcp-token) — it
+  runs the same Authorization-Code + PKCE flow against a running server using your
+  `MCP_SSH_USER`/`MCP_SSH_PASS` — then pass it as a header:
+
+  ```bash
+  claude mcp add --transport http mcp-ssh https://your-host/mcp \
+    --header "Authorization: Bearer $(MCP_SSH_URL=https://your-host bin/mcp-token)"
+
+  claude mcp list          # mcp-ssh: ... ✔ Connected
+  ```
+
+  Tokens are short-lived (1h) and reset on restart — re-run `bin/mcp-token` to refresh.
+  For a stable long-lived setup, prefer a GUI client's OAuth flow.
 
 Tool reference → [usage.md](usage.md).

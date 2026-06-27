@@ -25,3 +25,6 @@
 
 # Local config
 config.toml
+
+# Local runtime (dev job dir, server logs)
+.local/

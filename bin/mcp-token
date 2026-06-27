@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Mint an OAuth 2.1 bearer token from a running mcp-ssh server and print it to stdout.
+#
+# `/mcp` is bearer-only: GUI clients (Claude desktop/web) run the browser OAuth
+# flow automatically, but a headless client — the `claude` CLI, curl, a script —
+# has no browser. This runs the same Authorization-Code + PKCE flow non-interactively
+# so you can hand the token to such a client:
+#
+#   claude mcp add --transport http mcp-ssh http://localhost:1337/mcp \
+#     --header "Authorization: Bearer $(bin/mcp-token)"
+#
+# Credentials come from .env (MCP_SSH_USER/MCP_SSH_PASS) or the environment.
+# The base URL defaults to the local bind; override with $MCP_SSH_URL.
+# Tokens are short-lived (1h) and reset when the server restarts — re-run to refresh.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+if [ -f .env ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . ./.env
+  set +a
+fi
+
+: "${MCP_SSH_USER:?set MCP_SSH_USER (or put it in .env)}"
+: "${MCP_SSH_PASS:?set MCP_SSH_PASS (or put it in .env)}"
+BASE="${MCP_SSH_URL:-http://${MCP_SSH_BIND:-127.0.0.1:1337}}"
+REDIRECT="http://localhost/cb"
+
+for bin in curl openssl sed; do
+  command -v "$bin" >/dev/null || { echo "mcp-token: '$bin' not found" >&2; exit 1; }
+done
+
+# PKCE: random verifier, S256 challenge = BASE64URL(SHA256(verifier)).
+verifier=$(openssl rand -base64 60 | tr -d '\n=+/' | cut -c1-64)
+challenge=$(printf '%s' "$verifier" | openssl dgst -binary -sha256 | openssl base64 | tr '+/' '-_' | tr -d '=\n')
+
+# /authorize — authenticate with HTTP Basic, receive an auth code on the redirect.
+location=$(curl -fsS -o /dev/null -w '%{redirect_url}' -G "$BASE/authorize" \
+  -u "$MCP_SSH_USER:$MCP_SSH_PASS" \
+  --data-urlencode "response_type=code" \
+  --data-urlencode "redirect_uri=$REDIRECT" \
+  --data-urlencode "code_challenge=$challenge" \
+  --data-urlencode "code_challenge_method=S256")
+code=$(printf '%s' "$location" | sed -n 's/.*[?&]code=\([^&]*\).*/\1/p')
+[ -n "$code" ] || { echo "mcp-token: no auth code (bad credentials or server down?): $location" >&2; exit 1; }
+
+# /token — exchange the code + PKCE verifier for an access token.
+token=$(curl -fsS -X POST "$BASE/token" \
+  --data-urlencode "grant_type=authorization_code" \
+  --data-urlencode "code=$code" \
+  --data-urlencode "code_verifier=$verifier" \
+  --data-urlencode "redirect_uri=$REDIRECT" \
+  | sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p')
+[ -n "$token" ] || { echo "mcp-token: token exchange failed" >&2; exit 1; }
+
+printf '%s\n' "$token"
