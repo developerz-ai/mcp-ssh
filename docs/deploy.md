@@ -8,6 +8,18 @@ The login flow needs more than `/mcp` on the public origin: both the browser OAu
 
 ## ⚡ Install (Debian/Ubuntu)
 
+### One-liner (recommended)
+
+Downloads the latest release for your arch, prompts for a username + password, asks which OS user to run as, writes the config + a systemd drop-in, and starts the service:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/developerz-ai/mcp-ssh/main/deploy/install.sh | sudo bash
+```
+
+Re-running it just updates the binary and re-applies your answers. Source: [`deploy/install.sh`](../deploy/install.sh).
+
+### By hand
+
 ```bash
 # 1. install from the .deb (GitHub releases)
 sudo dpkg -i mcp-ssh_*.deb
@@ -24,6 +36,37 @@ curl -fsS http://127.0.0.1:1337/.well-known/oauth-authorization-server
 ```
 
 The `.deb` installs the binary, a systemd unit, and `/etc/mcp-ssh/config.toml`.
+
+## 🩺 Verify / debug with curl
+
+All checks hit the loopback bind (`127.0.0.1:1337`); swap in `https://your-host` once the proxy is up.
+
+```bash
+# 1. OAuth discovery returns JSON ⇒ server is up
+curl -fsS http://127.0.0.1:1337/.well-known/oauth-authorization-server | jq .
+
+# 2. /mcp is bearer-only — no creds ⇒ 401
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:1337/mcp   # → 401
+
+# 3. Mint a bearer from your username/password (runs the OAuth PKCE flow).
+#    `bin/mcp-token` ships in the source checkout, NOT the .deb — run it from a
+#    repo clone with MCP_SSH_USER/MCP_SSH_PASS in env or .env, or skip to a GUI
+#    client's browser OAuth (see Connect a client).
+read -rp 'MCP_SSH_USER: ' MCP_SSH_USER
+read -rsp 'MCP_SSH_PASS: ' MCP_SSH_PASS; echo
+TOKEN="$(MCP_SSH_USER="$MCP_SSH_USER" MCP_SSH_PASS="$MCP_SSH_PASS" bin/mcp-token)"
+unset MCP_SSH_PASS
+
+# 4. initialize a session — look for the `mcp-session-id:` response header
+curl -sS -D - -o /dev/null -X POST http://127.0.0.1:1337/mcp \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -H 'Host: localhost' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}'
+```
+
+Discovery 404s behind your proxy ⇒ it isn't forwarding `/.well-known/*`, `/authorize`, `/token`, `/register` (see [Connect a client](#-connect-a-client)). Logs: `journalctl -u mcp-ssh -e`.
 
 ## 🔧 systemd
 
