@@ -48,7 +48,9 @@ curl -fsS http://127.0.0.1:1337/.well-known/oauth-authorization-server | jq .
 # 2. /mcp is bearer-only — no creds ⇒ 401
 curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:1337/mcp   # → 401
 
-# 3. Mint a bearer from your username/password (runs the OAuth PKCE flow)
+# 3. Mint a bearer from your username/password (runs the OAuth PKCE flow).
+#    `bin/mcp-token` ships in the source checkout, NOT the .deb — run it from a
+#    repo clone, or skip to a GUI client's browser OAuth (see Connect a client).
 TOKEN=$(bin/mcp-token)
 
 # 4. initialize a session — look for the `mcp-session-id:` response header
