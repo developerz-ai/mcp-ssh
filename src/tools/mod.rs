@@ -35,6 +35,10 @@ pub struct BashArgs {
     pub timeout: Option<u64>,
     /// Background immediately and return a job id without waiting.
     pub bg: Option<bool>,
+    /// Run in an interactive bash that sources `~/.bashrc` so aliases and
+    /// version managers (mise/nvm/rbenv) resolve. Default false (faster bare
+    /// `sh -c`); set true when the command needs the user's shell setup.
+    pub interactive: Option<bool>,
 }
 
 // ---- job ----
@@ -108,7 +112,7 @@ impl Tools {
     }
 
     #[tool(
-        description = "Run a shell command on the host (locally, as the service user). Returns output inline if it finishes within the inline window (default 2s); otherwise returns a job id — monitor it with the `job` tool. Pass bg=true to background immediately and get the id without waiting. Use it to launch long tasks (builds, deploys, `claude -p ...`) without blocking."
+        description = "Run a shell command on the host (locally, as the service user). Returns output inline if it finishes within the inline window (default 2s); otherwise returns a job id — monitor it with the `job` tool. Pass bg=true to background immediately and get the id without waiting. Pass interactive=true to source the user's ~/.bashrc so aliases and version managers (mise/nvm/rbenv) resolve (default is the faster bare sh -c). Use it to launch long tasks (builds, deploys, `claude -p ...`) without blocking."
     )]
     async fn bash(
         &self,
@@ -117,6 +121,7 @@ impl Tools {
             cwd,
             timeout,
             bg,
+            interactive,
         }): Parameters<BashArgs>,
         RequestId(request_id): RequestId,
     ) -> Result<CallToolResult, McpError> {
@@ -124,7 +129,17 @@ impl Tools {
             // Emit inside the span so the prod subscriber (FmtSpan::NONE) logs the
             // dispatch with the span's `tool`/`request_id`; a bare span logs nothing.
             tracing::info!("dispatch");
-            match self.jobs.run(cmd, cwd, timeout, bg.unwrap_or(false)).await {
+            match self
+                .jobs
+                .run(
+                    cmd,
+                    cwd,
+                    timeout,
+                    bg.unwrap_or(false),
+                    interactive.unwrap_or(false),
+                )
+                .await
+            {
                 Ok(RunResult::Inline { state, page }) => Ok(ok(render(&state, &page))),
                 Ok(RunResult::Backgrounded { id }) => Ok(ok(format!(
                     "job {id} still running after the inline window. Monitor it with job(action=\"poll\", id=\"{id}\")."
@@ -304,7 +319,12 @@ mod tests {
 
     fn tools() -> Tools {
         let dir = tempfile::tempdir().unwrap().keep();
-        let store = JobStore::new(dir, std::time::Duration::from_secs(2)).unwrap();
+        let store = JobStore::new(
+            dir,
+            std::time::Duration::from_secs(2),
+            crate::jobs::Shell::sh(),
+        )
+        .unwrap();
         Tools::new(store)
     }
 
@@ -331,6 +351,7 @@ mod tests {
                     cwd: None,
                     timeout: None,
                     bg: None,
+                    interactive: None,
                 }),
                 RequestId(NumberOrString::Number(42)),
             )

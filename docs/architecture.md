@@ -53,7 +53,7 @@ This is the core design idea. `bash` must serve both *"echo hello"* and *"a 20-m
 
 When a command starts (`JobStore::run`):
 
-1. The command is spawned via `sh -c`, with stdout **and** stderr merged into a single per-job **log file** (`MCP_SSH_JOB_DIR/<id>.log`). Logging to a file — not memory — is what lets long output be paginated later without holding it all in RAM.
+1. The command is spawned via a bare `sh -c` by default — fast, no rc files. Pass `interactive=true` to `bash` and it runs through an **interactive bash** (`bash -ic`) instead, sourcing the service user's `~/.bashrc` so aliases and version managers (`mise`, `nvm`, `rbenv`) resolve exactly as in a real shell. Either way stdout **and** stderr are merged into a single per-job **log file** (`MCP_SSH_JOB_DIR/<id>.log`): the child's own stdio goes to `/dev/null` and the command re-points stdout+stderr at the log after startup, so bash's "no job control" warnings (no controlling TTY under systemd) never reach the log. Logging to a file — not memory — is what lets long output be paginated later without holding it all in RAM.
 2. A background task owns the child process, waits for it to exit, and records the final `JobState` (`Running` / `Exited{code}` / `Failed{error}`).
 3. The caller waits for **either** completion **or** the inline window (`MCP_SSH_INLINE_TIMEOUT_SECS`, default 2s; overridable per call via `bash`'s `timeout`). Passing `bg=true` skips the wait entirely and backgrounds at once:
    - **Finished in time** → `RunResult::Inline` — status + first page of the log, returned now.

@@ -63,22 +63,76 @@ pub struct JobSummary {
     pub state: JobState,
 }
 
+/// How a user command is launched. The default is a bare `sh -c`; a `bash` call
+/// that opts into `interactive` instead gets an interactive bash that sources
+/// the service user's `~/.bashrc` — so aliases and version managers
+/// (mise/nvm/rbenv) resolve, matching a real shell.
+///
+/// `program` plus `args` form the launcher prefix; `run` appends the (wrapped)
+/// command string as the final argument.
+#[derive(Debug, Clone)]
+pub struct Shell {
+    program: String,
+    args: Vec<String>,
+}
+
+impl Shell {
+    /// Bare `sh -c` — the default, fast path: no rc files, no per-call startup
+    /// cost. Output never depends on the host's shell config.
+    pub fn sh() -> Self {
+        Self {
+            program: "sh".into(),
+            args: vec!["-c".into()],
+        }
+    }
+
+    /// Interactive bash. `-i` sources `~/.bashrc`, where aliases and version
+    /// managers live behind its `case $- in *i*) ;; *) return;; esac`
+    /// non-interactive guard — so commands see the same environment an
+    /// interactive shell does. Opt-in per call (`bash` tool's `interactive`
+    /// flag) because sourcing `~/.bashrc` adds startup cost. Startup job-control
+    /// warnings (no controlling TTY under systemd) are discarded by the
+    /// exec-redirect in `run`.
+    pub fn interactive_bash() -> Self {
+        Self {
+            program: "bash".into(),
+            args: vec!["-ic".into()],
+        }
+    }
+}
+
+/// Single-quote a path for safe interpolation into a shell command. The job log
+/// path is engine-controlled, but quoting keeps an odd `job_dir` (spaces, `$`)
+/// from breaking the `exec` redirect in `run`.
+fn sh_single_quote(path: &std::path::Path) -> String {
+    let escaped = path.to_string_lossy().replace('\'', r"'\''");
+    format!("'{escaped}'")
+}
+
 #[derive(Clone)]
 pub struct JobStore {
     dir: PathBuf,
     inline_timeout: Duration,
+    /// Shell used when a `bash` call opts into `interactive` (sources `~/.bashrc`).
+    /// The default path uses a bare `sh -c` (`Shell::sh`).
+    interactive_shell: Shell,
     seq: Arc<AtomicU64>,
     jobs: Arc<Mutex<HashMap<JobId, Arc<Job>>>>,
 }
 
 impl JobStore {
-    pub fn new(dir: PathBuf, inline_timeout: Duration) -> std::io::Result<Self> {
+    pub fn new(
+        dir: PathBuf,
+        inline_timeout: Duration,
+        interactive_shell: Shell,
+    ) -> std::io::Result<Self> {
         std::fs::create_dir_all(&dir)?;
         let jobs = Arc::new(Mutex::new(HashMap::new()));
         spawn_reaper(jobs.clone());
         Ok(Self {
             dir,
             inline_timeout,
+            interactive_shell,
             seq: Arc::new(AtomicU64::new(1)),
             jobs,
         })
@@ -86,12 +140,15 @@ impl JobStore {
 
     /// Spawn `cmd`. With `background`, return a job id immediately; otherwise wait
     /// up to the inline window and return output if it finishes in time.
+    /// `interactive` runs it through `~/.bashrc` (aliases, version managers);
+    /// otherwise the fast bare `sh -c` is used.
     pub async fn run(
         &self,
         cmd: String,
         cwd: Option<String>,
         timeout_secs: Option<u64>,
         background: bool,
+        interactive: bool,
     ) -> std::io::Result<RunResult> {
         // Hold the jobs lock across id generation and insertion so the id is
         // reserved atomically: two jobs launched in the same minute can't both
@@ -107,18 +164,31 @@ impl JobStore {
         let id = JobId::generate(&self.seq, |candidate| jobs.contains_key(candidate));
         let log_path = self.dir.join(format!("{id}.log"));
 
-        // ponytail: stdout+stderr merged into one log (terminal-style). Split into
-        // two files if a caller ever needs them apart.
-        let out = std::fs::File::create(&log_path)?;
-        let err = out.try_clone()?;
+        // Create the log up front so a poll racing the spawn reads an empty page,
+        // not a NotFound — the command appends to it (see `wrapped`).
+        std::fs::File::create(&log_path)?;
 
-        let mut command = tokio::process::Command::new("sh");
+        // An interactive bash (production shell) prints two job-control warnings
+        // to stderr at startup when there's no controlling TTY (always, under
+        // systemd). So the child's own stdio goes to /dev/null and the command
+        // re-points stdout+stderr at the log itself, *after* startup: only the
+        // command's output is captured, merged terminal-style. `sh -c` (tests)
+        // runs the identical wrapper with no warnings to discard.
+        let wrapped = format!("exec >>{} 2>&1\n{}", sh_single_quote(&log_path), cmd);
+
+        let fast = Shell::sh();
+        let shell = if interactive {
+            &self.interactive_shell
+        } else {
+            &fast
+        };
+        let mut command = tokio::process::Command::new(&shell.program);
         command
-            .arg("-c")
-            .arg(&cmd)
+            .args(&shell.args)
+            .arg(&wrapped)
             .stdin(Stdio::null())
-            .stdout(Stdio::from(out))
-            .stderr(Stdio::from(err));
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         if let Some(dir) = cwd {
             command.current_dir(dir);
         }
@@ -241,18 +311,66 @@ impl JobStore {
 }
 
 #[cfg(test)]
+impl Shell {
+    /// Interactive bash pinned to a specific rc file — lets a test prove alias
+    /// resolution against a controlled rc instead of the host's `~/.bashrc`.
+    fn bash_with_rcfile(rcfile: &str) -> Self {
+        Self {
+            program: "bash".into(),
+            args: vec!["--rcfile".into(), rcfile.into(), "-ic".into()],
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     fn store(inline: Duration) -> JobStore {
         let dir = tempfile::tempdir().unwrap().keep();
-        JobStore::new(dir, inline).unwrap()
+        JobStore::new(dir, inline, Shell::sh()).unwrap()
+    }
+
+    /// The production shell (interactive bash) must expand aliases defined in
+    /// the sourced rc file — that's the whole point of `-i`. A controlled
+    /// rcfile keeps the test independent of the host's `~/.bashrc`, and the
+    /// startup job-control warnings must NOT leak into the captured log.
+    #[tokio::test]
+    async fn interactive_shell_expands_rc_aliases_without_leaking_startup_noise() {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let rc = dir.join("rc");
+        std::fs::write(&rc, "alias greet='echo ALIAS_OK'\n").unwrap();
+        let store = JobStore::new(
+            dir,
+            Duration::from_secs(5),
+            Shell::bash_with_rcfile(rc.to_str().unwrap()),
+        )
+        .unwrap();
+
+        let r = store
+            .run("greet".into(), None, None, false, true)
+            .await
+            .unwrap();
+        let RunResult::Inline { state, page } = r else {
+            panic!("fast command should be inline");
+        };
+        assert!(matches!(state, JobState::Exited { code: 0 }));
+        assert!(
+            page.lines.iter().any(|l| l.contains("ALIAS_OK")),
+            "alias should expand: {:?}",
+            page.lines
+        );
+        assert!(
+            !page.lines.iter().any(|l| l.contains("no job control")),
+            "startup job-control noise leaked into the log: {:?}",
+            page.lines
+        );
     }
 
     #[tokio::test]
     async fn fast_command_returns_inline() {
         let r = store(Duration::from_secs(5))
-            .run("echo hello".into(), None, None, false)
+            .run("echo hello".into(), None, None, false, false)
             .await
             .unwrap();
         match r {
@@ -268,7 +386,7 @@ mod tests {
     async fn bg_flag_backgrounds_a_fast_command() {
         // Even though `echo` is instant, bg=true must return an id without waiting.
         let r = store(Duration::from_secs(5))
-            .run("echo hi".into(), None, None, true)
+            .run("echo hi".into(), None, None, true, false)
             .await
             .unwrap();
         assert!(matches!(r, RunResult::Backgrounded { .. }));
@@ -278,7 +396,13 @@ mod tests {
     async fn slow_command_backgrounds_then_completes() {
         let store = store(Duration::from_millis(100));
         let r = store
-            .run("echo start; sleep 1; echo done".into(), None, None, false)
+            .run(
+                "echo start; sleep 1; echo done".into(),
+                None,
+                None,
+                false,
+                false,
+            )
             .await
             .unwrap();
         let id = match r {
@@ -315,7 +439,13 @@ mod tests {
         // `sh` backgrounds a long sleep, prints its pid, then waits on it. Job
         // control is off in `sh -c`, so the child shares the shell's group.
         let r = store
-            .run("sleep 300 & echo \"pid:$!\"; wait".into(), None, None, true)
+            .run(
+                "sleep 300 & echo \"pid:$!\"; wait".into(),
+                None,
+                None,
+                true,
+                false,
+            )
             .await
             .unwrap();
         let RunResult::Backgrounded { id } = r else {
@@ -361,7 +491,7 @@ mod tests {
         let store = store(Duration::from_secs(5));
         // Runs inline, so it has already exited by the time `run` returns.
         let r = store
-            .run("echo bye".into(), None, None, false)
+            .run("echo bye".into(), None, None, false, false)
             .await
             .unwrap();
         assert!(matches!(r, RunResult::Inline { .. }));
@@ -383,6 +513,7 @@ mod tests {
                 None,
                 None,
                 true,
+                false,
             )
             .await
             .unwrap();
@@ -410,7 +541,13 @@ mod tests {
         let store = store(Duration::from_millis(100));
         // Backgrounded descendant; print its pid so we can probe it post-eviction.
         let r = store
-            .run("sleep 300 & echo \"pid:$!\"; wait".into(), None, None, true)
+            .run(
+                "sleep 300 & echo \"pid:$!\"; wait".into(),
+                None,
+                None,
+                true,
+                false,
+            )
             .await
             .unwrap();
         let RunResult::Backgrounded { id } = r else {
@@ -481,7 +618,7 @@ mod tests {
     async fn kill_terminates_child_process() {
         let store = store(Duration::from_millis(100));
         let r = store
-            .run("sleep 1000".into(), None, None, true)
+            .run("sleep 1000".into(), None, None, true, false)
             .await
             .unwrap();
         let RunResult::Backgrounded { id } = r else {
@@ -511,11 +648,11 @@ mod tests {
         let store = store(Duration::from_secs(5));
         // Two commands — one inline, one explicitly backgrounded — both tracked.
         store
-            .run("echo alpha".into(), None, None, false)
+            .run("echo alpha".into(), None, None, false, false)
             .await
             .unwrap();
         store
-            .run("echo beta".into(), None, None, true)
+            .run("echo beta".into(), None, None, true, false)
             .await
             .unwrap();
 
@@ -529,7 +666,7 @@ mod tests {
     async fn poll_paginates() {
         let store = store(Duration::from_secs(5));
         store
-            .run("seq 1 10".into(), None, None, false)
+            .run("seq 1 10".into(), None, None, false, false)
             .await
             .unwrap();
         // seq finishes inline; fetch its id from the listing to re-poll and

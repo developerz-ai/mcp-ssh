@@ -69,13 +69,13 @@ Files ≤300 LOC. One responsibility per module (SRP). Split when a module grows
 
 ## MCP tool design
 
-**Constant, heavily-parametrized surface — 3 resource-oriented tools.** Group by resource; push composition into params (`action`, `cursor`, `limit`, `recursive`, `timeout`, `bg`) — do **NOT** add more tools. New capability = a new param or `action` on an existing tool, almost always.
+**Constant, heavily-parametrized surface — 3 resource-oriented tools.** Group by resource; push composition into params (`action`, `cursor`, `limit`, `recursive`, `timeout`, `bg`, `interactive`) — do **NOT** add more tools. New capability = a new param or `action` on an existing tool, almost always.
 
 Current tools (three, constant):
 
 | Tool | Params | Does |
 |---|---|---|
-| `bash` | `cmd`, `cwd?`, `timeout?`, `bg?` | run a command; inline if fast, else a job id (`bg` backgrounds at once) |
+| `bash` | `cmd`, `cwd?`, `timeout?`, `bg?`, `interactive?` | run a command; inline if fast, else a job id (`bg` backgrounds at once; `interactive` sources `~/.bashrc` via `bash -ic` for aliases/version managers, default fast `sh -c`) |
 | `job` | `action`, `id?`, `cursor?`, `limit?` | jobs by `action`: `poll` (paginated output), `list` (jobs + status), `kill` |
 | `file` | `action`, `path?`, `content?`, `pattern?`, `recursive?`, `src?`, `dest?`, `cursor?`, `limit?` | file ops by `action`: `read`/`write`/`append`/`delete`/`list`/`grep`/`move` |
 

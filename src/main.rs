@@ -52,7 +52,11 @@ async fn serve(port: Option<u16>) -> anyhow::Result<()> {
     }) {
         cfg.bind.set_port(p);
     }
-    let store = jobs::JobStore::new(cfg.job_dir.clone(), cfg.inline_timeout)?;
+    let store = jobs::JobStore::new(
+        cfg.job_dir.clone(),
+        cfg.inline_timeout,
+        jobs::Shell::interactive_bash(),
+    )?;
 
     let auth_state = oauth::AuthState {
         creds: auth::Credentials {

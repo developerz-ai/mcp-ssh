@@ -51,8 +51,8 @@ Output and stderr are merged into one stream, terminal-style.
 
 ## 🐚 Shell & jobs
 
-### `bash(cmd, cwd?, timeout?, bg?)`
-Run a shell command (`sh -c`). Returns output inline if it finishes within the inline window, else a job id to monitor with `job`.
+### `bash(cmd, cwd?, timeout?, bg?, interactive?)`
+Run a shell command. By default it's a fast bare `sh -c`. Pass `interactive=true` to run it in an **interactive bash** (`bash -ic`) that sources your `~/.bashrc`, so aliases and version managers (`mise`, `nvm`, `rbenv`) work just like a normal shell. Returns output inline if it finishes within the inline window, else a job id to monitor with `job`.
 
 | Param | Required | Default | Meaning |
 |---|---|---|---|
@@ -60,6 +60,7 @@ Run a shell command (`sh -c`). Returns output inline if it finishes within the i
 | `cwd` | no | process cwd | working directory |
 | `timeout` | no | 2s | seconds to wait inline before backgrounding |
 | `bg` | no | false | `true` backgrounds immediately, returning the job id without waiting |
+| `interactive` | no | false | `true` sources `~/.bashrc` (aliases, mise/nvm/rbenv) via `bash -ic` |
 
 ```
 bash("ls -la /var/www")

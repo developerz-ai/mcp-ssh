@@ -18,6 +18,14 @@ Want to go further? Run `bash("claude -p 'fix the failing test and push'")` — 
 
 ## ⚡ Quickstart
 
+**One-liner (Debian/Ubuntu)** — downloads the latest release, asks for a username + password, installs the service, and starts it:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/developerz-ai/mcp-ssh/main/deploy/install.sh | sudo bash
+```
+
+<details><summary>Or do it by hand</summary>
+
 ```bash
 # 1. install (Debian/Ubuntu — grab the .deb from releases)
 sudo dpkg -i mcp-ssh_*.deb
@@ -28,8 +36,13 @@ mcp-ssh set-auth admin
 # 3. start it as a systemd service
 sudo systemctl enable --now mcp-ssh
 
-# 4. put TLS in front (see docs/deploy.md) and connect from Claude
+# 4. verify it's up on loopback
+curl -fsS http://127.0.0.1:1337/.well-known/oauth-authorization-server
 ```
+
+</details>
+
+Then put TLS in front (see [docs/deploy.md](docs/deploy.md)) and connect from Claude.
 
 mcp-ssh now listens on `127.0.0.1:1337` at `/mcp`. Expose it as `https://your-host/mcp` with a reverse proxy → **[docs/deploy.md](docs/deploy.md)**.
 
@@ -86,6 +99,7 @@ mcp-ssh set-auth <user>    # configure the username/password
 
 | Method | How |
 |---|---|
+| **One-liner** | `curl -fsSL https://raw.githubusercontent.com/developerz-ai/mcp-ssh/main/deploy/install.sh \| sudo bash` — latest release, prompts for creds, installs + starts the service |
 | **Debian/Ubuntu** | download `mcp-ssh_*.deb` from [releases](https://github.com/developerz-ai/mcp-ssh/releases) → `sudo dpkg -i mcp-ssh_*.deb` |
 | **Docker** | pull the image and run it (see [docs/deploy.md](docs/deploy.md)) |
 | **From source** | `cargo build --release` → binary at `target/release/mcp-ssh` |
