@@ -121,6 +121,9 @@ impl Tools {
         RequestId(request_id): RequestId,
     ) -> Result<CallToolResult, McpError> {
         async move {
+            // Emit inside the span so the prod subscriber (FmtSpan::NONE) logs the
+            // dispatch with the span's `tool`/`request_id`; a bare span logs nothing.
+            tracing::info!("dispatch");
             match self.jobs.run(cmd, cwd, timeout, bg.unwrap_or(false)).await {
                 Ok(RunResult::Inline { state, page }) => Ok(ok(render(&state, &page))),
                 Ok(RunResult::Backgrounded { id }) => Ok(ok(format!(
@@ -142,6 +145,7 @@ impl Tools {
         RequestId(request_id): RequestId,
     ) -> Result<CallToolResult, McpError> {
         async move {
+            tracing::info!("dispatch");
             match args.action {
                 JobAction::Poll => {
                     let Some(id) = args.id else {
@@ -185,6 +189,7 @@ impl Tools {
         RequestId(request_id): RequestId,
     ) -> Result<CallToolResult, McpError> {
         async move {
+            tracing::info!("dispatch");
             let recursive = args.recursive.unwrap_or(false);
             let result = match args.action {
                 FileAction::Read => match args.path {
@@ -269,7 +274,6 @@ mod tests {
     use rmcp::model::NumberOrString;
     use std::io::Write;
     use std::sync::{Arc, Mutex};
-    use tracing_subscriber::fmt::format::FmtSpan;
 
     /// A `MakeWriter` that appends everything the subscriber emits into a shared
     /// buffer, so a test can assert on the formatted span/event output.
@@ -301,17 +305,19 @@ mod tests {
         Tools::new(store)
     }
 
-    /// Every tool dispatch runs inside a span carrying `tool` + `request_id`
-    /// (CLAUDE.md). `bash` is representative; `job`/`file` wrap identically.
+    /// Every tool dispatch emits an event inside a span carrying `tool` +
+    /// `request_id` (CLAUDE.md). The subscriber here mirrors prod (no
+    /// `FmtSpan` span events), so a green assertion proves the *event* — not
+    /// span lifecycle logging prod disables — carries the fields. `bash` is
+    /// representative; `job`/`file` wrap identically.
     #[tokio::test]
-    async fn bash_dispatch_runs_in_a_span_with_tool_and_request_id() {
+    async fn bash_dispatch_emits_event_with_tool_and_request_id() {
         use tracing::instrument::WithSubscriber;
 
         let buf = BufWriter::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(buf.clone())
             .with_ansi(false)
-            .with_span_events(FmtSpan::NEW)
             .with_max_level(tracing::Level::INFO)
             .finish();
 
