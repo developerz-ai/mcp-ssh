@@ -40,6 +40,7 @@ Deps pinned to latest stable at implementation time.
 | Single test by pattern | `cargo test <pattern>` |
 | Format + lint | `cargo fmt && cargo clippy` |
 | Run the binary | `cargo run -- serve` |
+| Mint a bearer for a headless client (OAuth PKCE) | `bin/mcp-token` |
 
 Secrets and local config: copy `.env.example` → `.env`. `.env` is gitignored.
 

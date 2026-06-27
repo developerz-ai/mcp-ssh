@@ -1,8 +1,10 @@
 # 🚀 Deploy
 
-mcp-ssh binds `127.0.0.1:1337` and serves `/mcp` over plain HTTP. **A reverse proxy terminates TLS** and exposes `https://your-host/mcp`. TLS is not in the binary by design.
+mcp-ssh binds `127.0.0.1:1337` and serves `/mcp` **plus the OAuth 2.1 login routes** over plain HTTP. **A reverse proxy terminates TLS** and exposes them at `https://your-host`. TLS is not in the binary by design.
 
-> **Golden rule:** bind to loopback, proxy `https://your-host/mcp → 127.0.0.1:1337`, never expose `:1337` to the internet.
+> **Golden rule:** bind to loopback, proxy `https://your-host → 127.0.0.1:1337` (the `/mcp` tool endpoint **and** the OAuth routes), never expose `:1337` to the internet.
+
+The login flow needs more than `/mcp` on the public origin: both the browser OAuth flow (Claude desktop/web) and the headless [`bin/mcp-token`](../bin/mcp-token) flow call `/.well-known/oauth-authorization-server`, `/.well-known/oauth-protected-resource`, `/authorize`, `/token`, and `/register`. The proxy snippets below forward every path to the backend so these don't 404 — see [Connect a client](#-connect-a-client).
 
 ## ⚡ Install (Debian/Ubuntu)
 
@@ -60,7 +62,9 @@ Caddy fetches and renews certificates automatically. Smallest possible config:
 ```caddyfile
 # /etc/caddy/Caddyfile
 your-host.example.com {
-    reverse_proxy /mcp* 127.0.0.1:1337
+    # Proxy every path: mcp-ssh serves /mcp plus the OAuth 2.1 endpoints
+    # (/.well-known/oauth-*, /authorize, /token, /register) the login flow needs.
+    reverse_proxy 127.0.0.1:1337
 }
 ```
 
@@ -86,7 +90,9 @@ server {
     ssl_certificate     /etc/letsencrypt/live/your-host.example.com/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/your-host.example.com/privkey.pem;
 
-    location /mcp {
+    # Proxy every path: mcp-ssh serves /mcp plus the OAuth 2.1 endpoints
+    # (/.well-known/oauth-*, /authorize, /token, /register) the login flow needs.
+    location / {
         proxy_pass http://127.0.0.1:1337;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
@@ -151,8 +157,24 @@ File: `/etc/mcp-ssh/config.toml` (or override the path with `$MCP_SSH_CONFIG`). 
 
 Once `https://your-host/mcp` is live:
 
-- **All MCP clients** — add the URL; the client discovers `/.well-known/oauth-authorization-server`,
-  drives the **OAuth 2.1** flow, and logs in with your `set-auth` credentials. `/mcp` is
-  **bearer-only**; there is no HTTP Basic fallback on this endpoint.
+- **GUI MCP clients** (Claude desktop/web) — add the URL; the client discovers
+  `/.well-known/oauth-authorization-server`, drives the **OAuth 2.1** flow in a browser, and
+  logs in with your `set-auth` credentials. `/mcp` is **bearer-only**; there is no HTTP Basic
+  fallback on this endpoint.
+
+- **Headless / CLI clients** (the `claude` CLI, curl, scripts) have no browser to run the
+  flow. Mint a bearer token non-interactively with [`bin/mcp-token`](../bin/mcp-token) — it
+  runs the same Authorization-Code + PKCE flow against a running server using your
+  `MCP_SSH_USER`/`MCP_SSH_PASS` — then pass it as a header:
+
+  ```bash
+  claude mcp add --transport http mcp-ssh https://your-host/mcp \
+    --header "Authorization: Bearer $(MCP_SSH_URL=https://your-host bin/mcp-token)"
+
+  claude mcp list          # mcp-ssh: ... ✔ Connected
+  ```
+
+  Tokens are short-lived (1h) and reset on restart — re-run `bin/mcp-token` to refresh.
+  For a stable long-lived setup, prefer a GUI client's OAuth flow.
 
 Tool reference → [usage.md](usage.md).

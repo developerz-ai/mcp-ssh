@@ -52,6 +52,8 @@ Full reference with examples → **[docs/usage.md](docs/usage.md)**.
 3. Claude runs the **OAuth 2.1** flow (the spec-compliant auth GUI clients use); log in with the username/password you set via `mcp-ssh set-auth`.
 4. The tools above appear. Say *"run the deploy."*
 
+Headless client (the `claude` CLI, curl) with no browser? Mint a bearer with [`bin/mcp-token`](bin/mcp-token) and pass it as `Authorization: Bearer …` → **[docs/deploy.md](docs/deploy.md#-connect-a-client)**.
+
 ## 🔐 Auth
 
 `/mcp` is **bearer-only** — all MCP clients must authenticate via OAuth 2.1. Claude and every
