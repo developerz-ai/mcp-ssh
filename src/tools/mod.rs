@@ -43,14 +43,17 @@ pub struct BashArgs {
 
 // ---- job ----
 
+// Variants carry NO `///` doc comments on purpose: schemars renders a doc'd
+// unit enum as `oneOf` of `{const, description}`, which some MCP clients
+// (Claude Desktop) mishandle — they send an `action` value serde can't parse,
+// so the call fails before dispatch. Bare variants render a flat `enum`, which
+// every client handles (same as `FileAction`). Per-action docs live in the
+// `bash`/`job` tool descriptions and the `action` field below.
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum JobAction {
-    /// Fetch a page of a job's output + status.
     Poll,
-    /// List all jobs.
     List,
-    /// Kill a running job.
     Kill,
 }
 
@@ -314,6 +317,27 @@ mod tests {
         type Writer = BufWriter;
         fn make_writer(&'a self) -> Self::Writer {
             self.clone()
+        }
+    }
+
+    /// A doc'd unit enum makes schemars emit `oneOf` of `{const, description}`,
+    /// which Claude Desktop mishandles — the `job` tool's `action` then fails
+    /// deserialization before dispatch. Both action enums must render as a flat
+    /// `enum` (string list). Lock it so a stray `///` can't silently regress.
+    #[test]
+    fn action_enums_render_as_flat_enum_not_oneof() {
+        for schema in [
+            serde_json::to_value(schemars::schema_for!(JobAction)).unwrap(),
+            serde_json::to_value(schemars::schema_for!(FileAction)).unwrap(),
+        ] {
+            assert!(
+                schema.get("enum").and_then(|e| e.as_array()).is_some(),
+                "action enum must be a flat string `enum`: {schema}"
+            );
+            assert!(
+                schema.get("oneOf").is_none(),
+                "action enum must NOT be `oneOf` (Claude Desktop mishandles it): {schema}"
+            );
         }
     }
 
