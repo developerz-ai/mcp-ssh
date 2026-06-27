@@ -77,8 +77,9 @@ reviews:
     # Auth + OAuth — security review required
     - path: "src/auth.rs"
       instructions: |
-        SECURITY REVIEW. HTTP Basic middleware. Never log/return the
-        password. Flag any path that bypasses or weakens auth.
+        SECURITY REVIEW. Bearer-only guard on /mcp; Basic auth is only
+        permitted inside /authorize (the OAuth login page). Never log/return
+        the password or token. Flag any path that bypasses or weakens auth.
     - path: "src/oauth/**"
       instructions: |
         SECURITY REVIEW. OAuth 2.1: discovery, dynamic registration, PKCE on

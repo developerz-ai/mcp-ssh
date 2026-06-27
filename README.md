@@ -52,20 +52,11 @@ Full reference with examples → **[docs/usage.md](docs/usage.md)**.
 3. Claude runs the **OAuth 2.1** flow (the spec-compliant auth GUI clients use); log in with the username/password you set via `mcp-ssh set-auth`.
 4. The tools above appear. Say *"run the deploy."*
 
-For scripts and curl, use **HTTP Basic** instead — same credentials, no OAuth dance:
-
-```bash
-curl -u admin:secret https://your-host/mcp -d @request.json
-```
-
 ## 🔐 Auth
 
-Two modes, one credential set (a single username/password).
-
-| Mode | For | Set up |
-|---|---|---|
-| **OAuth 2.1** | Claude & most GUI MCP clients (required by them) | automatic — Claude drives it |
-| **HTTP Basic** | curl, scripts, simple clients | `-u user:pass` header |
+`/mcp` is **bearer-only** — all MCP clients must authenticate via OAuth 2.1. Claude and every
+spec-compliant GUI client run this flow automatically; you just log in with the username/password
+you set via `mcp-ssh set-auth`.
 
 Set the credentials once:
 

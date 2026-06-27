@@ -20,7 +20,7 @@ TLS is deliberately **not** in the binary (keeps deps minimal). A reverse proxy 
 |---|---|
 | `main.rs` | Entry point. Boots tracing, loads config, builds the JobStore, mounts the rmcp `StreamableHttpService` at `/mcp`, wraps it in the auth middleware, serves it. |
 | `config.rs` | Runtime config from env + file. Fails fast at boot if credentials are missing. |
-| `auth.rs` | The auth middleware — **HTTP Basic** and **OAuth 2.1** in front of `/mcp`. |
+| `auth.rs` | The auth middleware — **bearer-only** guard on `/mcp`; rejects everything that is not a valid OAuth 2.1 access token. |
 | `oauth` | A minimal **OAuth 2.1 authorization server** (per the MCP authorization spec) so GUI clients can log in. |
 | `jobs.rs` | The job engine: run a command, return inline-or-background (incl. immediate `bg`), paginated logs, and an hourly reaper that drops jobs >24h old. |
 | `tools/mod.rs` | The MCP tool surface — **three tools** (`bash`/`job`/`file`) dispatching on an `action` param; thin adapters over `jobs` and `files`. |
@@ -81,14 +81,18 @@ The surface is **three resource-oriented tools** — `bash`, `job`, `file` — g
 
 ## 🔐 Auth
 
-The middleware in `auth.rs` guards `/mcp` with two interchangeable modes against **one** credential set:
+The middleware in `auth.rs` guards `/mcp` with a **bearer-only** check: every request must carry an
+`Authorization: Bearer <token>` header containing a valid OAuth 2.1 access token issued by the
+`oauth` module. There is no HTTP Basic fallback on `/mcp`.
 
-| Mode | Who uses it | How |
-|---|---|---|
-| **HTTP Basic** | curl, scripts, simple clients | `Authorization: Basic <base64(user:pass)>`, compared against the configured credentials |
-| **OAuth 2.1** | Claude & GUI MCP clients (they require it) | the `oauth` module is a minimal authorization server implementing the MCP authorization spec; the client drives the flow, the user logs in with the same username/password |
+The `oauth` module is a minimal authorization server implementing the MCP authorization spec:
+discovery metadata (`/.well-known/oauth-authorization-server`), dynamic client registration,
+`/authorize` (with HTTP Basic login for the resource-owner credential grant + PKCE), and
+`/token`. All MCP clients — Claude, Cursor, or any spec-compliant GUI — drive this flow
+automatically; the user logs in once with the username/password set via `mcp-ssh set-auth`.
 
-Credentials are a single username/password, set once with `mcp-ssh set-auth <user>` and read from config/env at boot. Missing credentials = the server refuses to start.
+Credentials are a single username/password, set once with `mcp-ssh set-auth <user>` and read
+from config/env at boot. Missing credentials = the server refuses to start.
 
 ## ⚠️ Trust boundary
 

@@ -154,11 +154,9 @@ mcp-ssh set-auth admin     # prompts for the password
 
 ## 🔐 Authenticating
 
-| Client | Mode |
-|---|---|
-| Claude, GUI MCP clients | **OAuth 2.1** — driven automatically by the client; log in with your username/password |
-| curl, scripts | **HTTP Basic** — `-u user:pass` |
+`/mcp` requires a bearer token — obtain one via the **OAuth 2.1** flow:
 
-```bash
-curl -u admin:secret https://your-host/mcp -d @request.json
-```
+1. Add `https://your-host/mcp` as a remote MCP server in your client (Claude, Cursor, etc.).
+2. The client discovers `/.well-known/oauth-authorization-server` and opens the `/authorize` page.
+3. Log in with the username/password you set via `mcp-ssh set-auth`.
+4. The client receives a bearer token and uses it for all subsequent `/mcp` requests.

@@ -74,6 +74,18 @@ impl Store {
         Ok(token)
     }
 
+    /// Insert a token directly — test seam only, bypasses the PKCE flow.
+    #[cfg(test)]
+    pub(crate) async fn insert_token(&self, token: &str) {
+        self.tokens.lock().await.insert(
+            token.to_owned(),
+            TokenEntry {
+                // 24-hour TTL; tests finish long before this expires.
+                expires: Instant::now() + Duration::from_secs(3600 * 24),
+            },
+        );
+    }
+
     /// True if the bearer token is known and unexpired.
     pub async fn validate(&self, token: &str) -> bool {
         let mut tokens = self.tokens.lock().await;
