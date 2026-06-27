@@ -157,8 +157,9 @@ impl Tools {
                         .poll(&id, args.cursor.unwrap_or(0), args.limit)
                         .await
                     {
-                        Some((state, page)) => Ok(ok(render(&state, &page))),
-                        None => Ok(err(format!("no such job: {id}"))),
+                        Ok(Some((state, page))) => Ok(ok(render(&state, &page))),
+                        Ok(None) => Ok(err(format!("no such job: {id}"))),
+                        Err(e) => Ok(err(e.to_string())),
                     }
                 }
                 JobAction::List => {

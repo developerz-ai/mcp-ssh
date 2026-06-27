@@ -1,7 +1,9 @@
-//! Human-readable job ids: a slug from the command plus the local `HH:MM` it
-//! started, e.g. `cargo-build-23:30` — far easier to refer to in conversation
-//! than an opaque counter. A monotonic sequence suffix disambiguates the rare
-//! case of two identical-slug commands starting within the same minute.
+//! Human-readable job ids: a neutral `job` label plus the local `HH:MM` it
+//! started, e.g. `job-23:30` — easier to refer to in conversation than an opaque
+//! counter. The id is deliberately free of command text: a command can carry a
+//! secret in its leading tokens, and the id surfaces in replies, `job(list)`,
+//! reaper logs, and the log filename, so slugging the command would leak it.
+//! A monotonic sequence suffix disambiguates jobs starting within the same minute.
 
 use std::borrow::Borrow;
 use std::fmt;
@@ -20,12 +22,14 @@ const MAX_SLUG: usize = 24;
 pub struct JobId(String);
 
 impl JobId {
-    /// Build an id from `cmd` and the current local time. `exists` reports
-    /// whether a candidate is already taken; only on a clash do we append a
-    /// `-<seq>` drawn from `seq`, so clean ids stay clean. The predicate keeps
-    /// this decoupled from however the caller tracks live ids.
-    pub fn generate(cmd: &str, seq: &AtomicU64, exists: impl Fn(&str) -> bool) -> Self {
-        let base = format!("{}-{}", slug(cmd), Local::now().format("%H:%M"));
+    /// Build an id from a neutral `label` and the current local time. Callers
+    /// pass a fixed label (e.g. `"job"`), never raw command text, so a secret on
+    /// the command line can't leak into the id. `exists` reports whether a
+    /// candidate is already taken; only on a clash do we append a `-<seq>` drawn
+    /// from `seq`, so clean ids stay clean. The predicate keeps this decoupled
+    /// from however the caller tracks live ids.
+    pub fn generate(label: &str, seq: &AtomicU64, exists: impl Fn(&str) -> bool) -> Self {
+        let base = format!("{}-{}", slug(label), Local::now().format("%H:%M"));
         if !exists(&base) {
             return Self(base);
         }
@@ -70,11 +74,16 @@ impl From<&str> for JobId {
     }
 }
 
-/// Turn the first few command tokens into a lowercase `[a-z0-9-]` slug: collapse
-/// runs of non-alphanumerics to single dashes, trim them off both ends, and cap
-/// the length. Falls back to `job` when nothing alphanumeric survives.
-fn slug(cmd: &str) -> String {
-    let head = cmd.split_whitespace().take(3).collect::<Vec<_>>().join(" ");
+/// Sanitize a label into a lowercase `[a-z0-9-]` slug so any caller-supplied
+/// string yields a well-formed id: take the first few tokens, collapse runs of
+/// non-alphanumerics to single dashes, trim them off both ends, and cap the
+/// length. Falls back to `job` when nothing alphanumeric survives.
+fn slug(label: &str) -> String {
+    let head = label
+        .split_whitespace()
+        .take(3)
+        .collect::<Vec<_>>()
+        .join(" ");
     let mut out = String::with_capacity(head.len());
     let mut prev_dash = false;
     for ch in head.chars() {

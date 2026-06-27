@@ -16,8 +16,8 @@ mod log;
 mod reaper;
 
 pub use id::JobId;
-pub use log::Page;
 use log::{DEFAULT_PAGE, read_page};
+pub use log::{JobLogError, Page};
 use reaper::{kill_job, spawn_reaper};
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -92,12 +92,17 @@ impl JobStore {
         background: bool,
     ) -> std::io::Result<RunResult> {
         // Hold the jobs lock across id generation and insertion so the id is
-        // reserved atomically: two identical commands launched in the same minute
-        // can't both see their `slug-HH:MM` as free and clobber each other's
-        // entry. Nothing awaits while the guard is held (file create + spawn are
-        // synchronous), so the critical section stays short.
+        // reserved atomically: two jobs launched in the same minute can't both
+        // see their `job-HH:MM` as free and clobber each other's entry. Nothing
+        // awaits while the guard is held (file create + spawn are synchronous),
+        // so the critical section stays short.
+        //
+        // The id is built from a fixed `"job"` label, never `cmd`: a command can
+        // carry a secret in its leading tokens (`mysql -psecret`, `PGPASSWORD=…`),
+        // and the id ends up in `bash`'s reply, `job(list)`, reaper logs, and the
+        // log filename — so deriving it from `cmd` would leak that secret.
         let mut jobs = self.jobs.lock().await;
-        let id = JobId::generate(&cmd, &self.seq, |candidate| jobs.contains_key(candidate));
+        let id = JobId::generate("job", &self.seq, |candidate| jobs.contains_key(candidate));
         let log_path = self.dir.join(format!("{id}.log"));
 
         // ponytail: stdout+stderr merged into one log (terminal-style). Split into
@@ -170,22 +175,26 @@ impl JobStore {
             JobState::Running => Ok(RunResult::Backgrounded { id }),
             finished => Ok(RunResult::Inline {
                 state: finished,
-                page: read_page(&log_path, 0, DEFAULT_PAGE).await,
+                page: read_page(&log_path, 0, DEFAULT_PAGE).await?,
             }),
         }
     }
 
-    /// Status + one page of a job's log.
+    /// Status + one page of a job's log. `Ok(None)` means the id is unknown;
+    /// `Err` means the log existed but could not be read — surfaced to the caller
+    /// rather than collapsed into an empty page.
     pub async fn poll(
         &self,
         id: &JobId,
         cursor: usize,
         limit: Option<usize>,
-    ) -> Option<(JobState, Page)> {
-        let job = self.jobs.lock().await.get(id).cloned()?;
+    ) -> Result<Option<(JobState, Page)>, JobLogError> {
+        let Some(job) = self.jobs.lock().await.get(id).cloned() else {
+            return Ok(None);
+        };
         let state = job.state.lock().await.clone();
-        let page = read_page(&job.log_path, cursor, limit.unwrap_or(DEFAULT_PAGE)).await;
-        Some((state, page))
+        let page = read_page(&job.log_path, cursor, limit.unwrap_or(DEFAULT_PAGE)).await?;
+        Ok(Some((state, page)))
     }
 
     pub async fn list(&self) -> Vec<JobSummary> {
@@ -264,7 +273,7 @@ mod tests {
             RunResult::Inline { .. } => panic!("slow command should background"),
         };
         for _ in 0..50 {
-            let (state, page) = store.poll(&id, 0, None).await.unwrap();
+            let (state, page) = store.poll(&id, 0, None).await.unwrap().unwrap();
             if matches!(state, JobState::Exited { .. }) {
                 assert!(page.lines.iter().any(|l| l.contains("done")));
                 return;
@@ -303,7 +312,7 @@ mod tests {
         // Pull the descendant's pid out of the log.
         let mut child_pid = None;
         for _ in 0..50 {
-            let (_s, page) = store.poll(&id, 0, None).await.unwrap();
+            let (_s, page) = store.poll(&id, 0, None).await.unwrap().unwrap();
             if let Some(line) = page.lines.iter().find_map(|l| l.strip_prefix("pid:")) {
                 child_pid = Some(line.trim().to_string());
                 break;
@@ -373,7 +382,7 @@ mod tests {
 
         // TERM is ignored; the post-grace KILL must still bring it down.
         for _ in 0..100 {
-            let (state, _) = store.poll(&id, 0, None).await.unwrap();
+            let (state, _) = store.poll(&id, 0, None).await.unwrap().unwrap();
             if matches!(state, JobState::Exited { .. }) {
                 return;
             }
@@ -397,7 +406,7 @@ mod tests {
 
         let mut child_pid = None;
         for _ in 0..50 {
-            let (_s, page) = store.poll(&id, 0, None).await.unwrap();
+            let (_s, page) = store.poll(&id, 0, None).await.unwrap().unwrap();
             if let Some(line) = page.lines.iter().find_map(|l| l.strip_prefix("pid:")) {
                 child_pid = Some(line.trim().to_string());
                 break;
@@ -412,7 +421,7 @@ mod tests {
 
         // Evicted from the map (poll can't find it)...
         assert!(
-            store.poll(&id, 0, None).await.is_none(),
+            store.poll(&id, 0, None).await.unwrap().is_none(),
             "job should be evicted"
         );
         // ...and its process group reaped, not orphaned.
@@ -449,7 +458,7 @@ mod tests {
         reaper::reap_once(&store.jobs, Duration::ZERO).await;
 
         assert!(
-            store.poll(&id, 0, None).await.is_some(),
+            store.poll(&id, 0, None).await.unwrap().is_some(),
             "running job whose kill failed must stay tracked"
         );
         assert!(log_path.exists(), "its log must not be deleted");
@@ -476,7 +485,7 @@ mod tests {
 
         // After kill the state must transition away from Running.
         for _ in 0..50 {
-            let (state, _) = store.poll(&id, 0, None).await.unwrap();
+            let (state, _) = store.poll(&id, 0, None).await.unwrap().unwrap();
             if !matches!(state, JobState::Running) {
                 return;
             }
@@ -517,7 +526,7 @@ mod tests {
         // seq finishes inline; fetch its id from the listing to re-poll and
         // exercise pagination.
         let id = store.list().await.first().expect("job tracked").id.clone();
-        let (_s, page) = store.poll(&id, 0, Some(3)).await.unwrap();
+        let (_s, page) = store.poll(&id, 0, Some(3)).await.unwrap().unwrap();
         assert_eq!(page.lines.len(), 3);
         assert_eq!(page.next_cursor, 3);
         assert!(page.has_more);

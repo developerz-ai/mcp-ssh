@@ -23,7 +23,7 @@ TLS is deliberately **not** in the binary (keeps deps minimal). A reverse proxy 
 | `auth.rs` | The auth middleware — **bearer-only** guard on `/mcp`; rejects everything that is not a valid OAuth 2.1 access token. |
 | `oauth` | A minimal **OAuth 2.1 authorization server** (per the MCP authorization spec) so GUI clients can log in. |
 | `jobs/mod.rs` | The job engine: run a command, return inline-or-background (incl. immediate `bg`), paginated logs, and an hourly reaper that drops jobs >24h old. |
-| `jobs/id.rs` | JobId newtype: human-readable ids from command names + local hour (e.g., `cargo-build-23:30`). |
+| `jobs/id.rs` | JobId newtype: human-readable ids — neutral `job` prefix + local `HH:MM` (e.g., `job-23:30`); free of command text so secrets can't leak. |
 | `jobs/log.rs` | Job log pagination: read log files by page (cursor + limit). |
 | `jobs/reaper.rs` | Hourly reaper evicts jobs >24h old; process-group kill helpers (TERM→KILL escalation). |
 | `tools/mod.rs` | The MCP tool surface — **three tools** (`bash`/`job`/`file`) dispatching on an `action` param; thin adapters over `jobs` and `files`. |
@@ -41,7 +41,7 @@ client ──HTTPS──▶ reverse proxy ──HTTP──▶ axum (127.0.0.1:13
                                        Tools (tool_router)
                                      bash · job · file (action)
                                           ╱        ╲
-                                    jobs.rs       files.rs
+                                  jobs/mod.rs    tools/files.rs
                                   (bash, job)     (file ops)
 ```
 
@@ -59,7 +59,7 @@ When a command starts (`JobStore::run`):
    - **Finished in time** → `RunResult::Inline` — status + first page of the log, returned now.
    - **Still running (or `bg`)** → `RunResult::Backgrounded { id }` — the agent gets a job id to poll.
 
-Jobs live in an in-memory map keyed by human-readable id (e.g., `cargo-build-23:30`); the log files persist on disk under the job dir. An **hourly reaper** drops any job whose age exceeds 24h — evicting it from the map and deleting its log file — so the map and the job dir stay bounded without manual cleanup. Job ids are derived from the command name (slugified) + local hour, giving context without UUIDs.
+Jobs live in an in-memory map keyed by human-readable id (e.g., `job-23:30`); the log files persist on disk under the job dir. An **hourly reaper** drops any job whose age exceeds 24h — evicting it from the map and deleting its log file — so the map and the job dir stay bounded without manual cleanup. Job ids are a neutral `job` prefix + local `HH:MM` — deliberately free of command text so a secret on the command line can't leak into an id, log line, or filename; the full command stays available via `job(action="list")`.
 
 ```
 JobState = Running | Exited { code } | Failed { error }
