@@ -57,7 +57,7 @@ Keep this accurate — it's the navigation aid.
 | `src/jobs/mod.rs` | job engine: run a command, return inline if fast (<2s) else a job id (or immediately when `bg`); output streams to a per-job log file, polled paginated |
 | `src/jobs/id.rs` | JobId newtype: human-readable ids — neutral `job` prefix + local `HH:MM` (e.g., `job-23:30`); free of command text so secrets can't leak into an id, log line, or filename |
 | `src/jobs/log.rs` | job log pagination: read per-job log files by page (cursor + limit) |
-| `src/jobs/reaper.rs` | hourly reaper drops jobs >24h old (killing any still-`Running` group first); process-group kill helpers (TERM→KILL escalation), shared with `job(action="kill")` |
+| `src/jobs/reaper.rs` | hourly reaper: drops jobs >24h old (killing any still-`Running` group first), then compacts finished jobs' logs to a trailing tail (5000 lines <3h old, 500 lines after) so disk stays bounded over long uptime; process-group kill helpers (TERM→KILL escalation), shared with `job(action="kill")` |
 | `src/tools/mod.rs` | MCP tool surface (`#[tool_router]`/`#[tool]` from rmcp): 3 tools (`bash`/`job`/`file`) dispatching on `action`. Thin adapters over jobs + files |
 | `src/tools/files.rs` | file operations (`tokio::fs`; `ls`/`find`/`grep` shelled out) |
 
