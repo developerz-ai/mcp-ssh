@@ -47,38 +47,56 @@ pub struct BashArgs {
 
 // ---- job ----
 
-// Variants carry NO `///` doc comments on purpose: schemars renders a doc'd
-// unit enum as `oneOf` of `{const, description}`, which some MCP clients
-// (Claude Desktop) mishandle — they send an `action` value serde can't parse,
-// so the call fails before dispatch. Bare variants render a flat `enum`, which
-// every client handles (same as `FileAction`). Per-action docs live in the
-// `bash`/`job` tool descriptions and the `action` field below.
+// `#[schemars(inline)]`: emit this enum inline on the `action` property
+// (`{"type":"string","enum":[...]}`) instead of a `$ref` into `$defs`. Clients
+// (Claude Desktop, codex, n8n) routinely drop `$defs`, so a `$ref` enum resolves
+// to nothing — the model can't see it's a string and sends a garbage placeholder
+// (`null`, then `true`), which fails deserialization before dispatch. Inlining is
+// the documented fix (MCP python-sdk #1373: Literal inlines, Enum uses `$ref`).
+//
+// Variants also carry NO `///` doc comments on purpose: a doc'd unit enum renders
+// as `oneOf` of `{const, description}`, which the same clients mishandle. Bare
+// variants render a flat `enum`. Per-action docs live in the `job` tool
+// description and the `action` field below.
 #[derive(serde::Deserialize, schemars::JsonSchema, Default)]
 #[serde(rename_all = "snake_case")]
+#[schemars(inline)]
 pub enum JobAction {
     Poll,
-    // Read-only and id-free, so it's the safe fallback when `action` is absent
-    // or a literal `null` — a known Claude Desktop bug for required enums.
+    // Read-only and id-free, so it's the safe fallback when `action` arrives as a
+    // non-string placeholder or is absent — see `lenient_action`.
     #[default]
     List,
     Kill,
 }
 
-/// Claude Desktop sometimes sends a literal `null` for a required enum field
-/// instead of the value, so the call would fail deserialization before dispatch.
-/// Treat `null` — and an omitted key — as `T::default()` rather than erroring.
-fn null_as_default<'de, D, T>(de: D) -> Result<T, D::Error>
+/// Tolerate the malformed `action` clients still send despite the inlined schema:
+/// a literal `null`, a bare `true`, a number — anything non-string. Accept a valid
+/// string variant; coerce everything else (and an omitted key, via `#[serde(default)]`)
+/// to the read-only `list` default instead of dead-ending the whole call. `list`
+/// is safe to guess: it's id-free and has no side effects, so the model just gets
+/// the job list back and retries. Destructive `file` actions get no such fallback.
+fn lenient_action<'de, D>(de: D) -> Result<JobAction, D::Error>
 where
     D: serde::Deserializer<'de>,
-    T: serde::Deserialize<'de> + Default,
 {
-    Ok(<Option<T> as serde::Deserialize>::deserialize(de)?.unwrap_or_default())
+    use serde::Deserialize as _;
+    Ok(match Option::<serde_json::Value>::deserialize(de)? {
+        Some(serde_json::Value::String(s)) => match s.as_str() {
+            "poll" => JobAction::Poll,
+            "kill" => JobAction::Kill,
+            // "list" or any unknown string falls through to the safe default.
+            _ => JobAction::List,
+        },
+        // null, bool, number, object, or array — the client bug. Default safely.
+        _ => JobAction::List,
+    })
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub struct JobArgs {
     /// What to do: poll, list, or kill. Defaults to list.
-    #[serde(default, deserialize_with = "null_as_default")]
+    #[serde(default, deserialize_with = "lenient_action")]
     pub action: JobAction,
     /// [poll, kill] job id.
     pub id: Option<String>,
@@ -90,8 +108,13 @@ pub struct JobArgs {
 
 // ---- file ----
 
+// `#[schemars(inline)]` for the same reason as `JobAction`: keep the enum on the
+// `action` property instead of a `$ref` clients drop. No lenient fallback here —
+// `file` actions are destructive (delete/write/move) with no safe default, so a
+// malformed `action` must error rather than be guessed.
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
+#[schemars(inline)]
 pub enum FileAction {
     Read,
     Write,
@@ -374,20 +397,53 @@ mod tests {
         }
     }
 
-    /// Claude Desktop sends `{"action": null}` (and sometimes omits it) for the
-    /// `job` tool. Both must deserialize to the read-only `list` default instead
-    /// of erroring before dispatch; an explicit value still wins.
+    /// The `action` enum must be inlined onto the property — `{type:string, enum}` —
+    /// not a `$ref` into `$defs`. Clients (Claude Desktop, codex, n8n) drop `$defs`,
+    /// so a `$ref` enum resolves to nothing and the model sends a garbage placeholder.
+    /// Lock both arg structs: no `$ref`/`$defs` anywhere, `action` is a string enum.
     #[test]
-    fn job_action_null_or_missing_defaults_to_list() {
-        let null: JobArgs = serde_json::from_value(serde_json::json!({ "action": null })).unwrap();
-        assert!(matches!(null.action, JobAction::List));
+    fn action_enum_is_inlined_not_a_ref() {
+        for schema in [
+            serde_json::to_value(schemars::schema_for!(JobArgs)).unwrap(),
+            serde_json::to_value(schemars::schema_for!(FileArgs)).unwrap(),
+        ] {
+            let s = schema.to_string();
+            assert!(!s.contains("$ref"), "schema must not use $ref: {schema}");
+            assert!(!s.contains("$defs"), "schema must not use $defs: {schema}");
+            let action = &schema["properties"]["action"];
+            assert!(
+                action.get("enum").and_then(|e| e.as_array()).is_some(),
+                "`action` must be an inline string enum: {schema}"
+            );
+        }
+    }
 
-        let missing: JobArgs = serde_json::from_value(serde_json::json!({})).unwrap();
-        assert!(matches!(missing.action, JobAction::List));
+    /// Clients mishandle the enum's schema and send a non-string placeholder for
+    /// `action` — `null`, a bare `true`, or omit it entirely. Each must deserialize
+    /// to the read-only `list` default instead of erroring before dispatch; an
+    /// explicit valid value still wins.
+    #[test]
+    fn job_action_garbage_or_missing_defaults_to_list() {
+        for bad in [
+            serde_json::json!({ "action": null }),
+            serde_json::json!({ "action": true }),
+            serde_json::json!({ "action": 1 }),
+            serde_json::json!({ "action": "bogus" }),
+            serde_json::json!({}),
+        ] {
+            let args: JobArgs = serde_json::from_value(bad.clone()).unwrap();
+            assert!(
+                matches!(args.action, JobAction::List),
+                "expected list default for {bad}"
+            );
+        }
 
         let explicit: JobArgs =
             serde_json::from_value(serde_json::json!({ "action": "poll" })).unwrap();
         assert!(matches!(explicit.action, JobAction::Poll));
+        let kill: JobArgs =
+            serde_json::from_value(serde_json::json!({ "action": "kill" })).unwrap();
+        assert!(matches!(kill.action, JobAction::Kill));
 
         // MCP spec: the advertised inputSchema must match behavior. `action` now
         // has a default, so it must NOT be listed `required` — clients (and the
