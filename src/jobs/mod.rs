@@ -5,17 +5,19 @@ use std::{
     collections::HashMap,
     path::PathBuf,
     process::Stdio,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, atomic::AtomicU64},
     time::Duration,
 };
 
 use tokio::sync::{Mutex, watch};
 
+mod id;
+mod log;
 mod reaper;
 
+pub use id::JobId;
+use log::{DEFAULT_PAGE, read_page};
+pub use log::{JobLogError, Page};
 use reaper::{kill_job, spawn_reaper};
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -32,7 +34,6 @@ pub enum JobState {
 struct ProcessGroupId(u32);
 
 struct Job {
-    cmd: String,
     log_path: PathBuf,
     /// Process group to signal on kill. The child leads its own group, so this
     /// equals its pid (see `run`). `None` only if the OS withheld a pid.
@@ -49,22 +50,16 @@ pub enum RunResult {
     /// Finished within the inline window — output is ready now.
     Inline { state: JobState, page: Page },
     /// Still running — poll this id.
-    Backgrounded { id: String },
+    Backgrounded { id: JobId },
 }
 
-/// One page of log lines plus a cursor to fetch the next page.
-#[derive(Debug, serde::Serialize)]
-pub struct Page {
-    pub lines: Vec<String>,
-    pub next_cursor: usize,
-    pub total_lines: usize,
-    pub has_more: bool,
-}
-
+/// Public, per-job metadata for `job(action="list")`. Deliberately omits the
+/// command text: a command can carry a secret in its leading tokens
+/// (`PGPASSWORD=…`, bearer headers, pasted tokens), and this is returned in
+/// ordinary MCP responses — so the listing exposes only the id and status.
 #[derive(Debug, serde::Serialize)]
 pub struct JobSummary {
-    pub id: String,
-    pub cmd: String,
+    pub id: JobId,
     pub state: JobState,
 }
 
@@ -73,10 +68,8 @@ pub struct JobStore {
     dir: PathBuf,
     inline_timeout: Duration,
     seq: Arc<AtomicU64>,
-    jobs: Arc<Mutex<HashMap<String, Arc<Job>>>>,
+    jobs: Arc<Mutex<HashMap<JobId, Arc<Job>>>>,
 }
-
-const DEFAULT_PAGE: usize = 200;
 
 impl JobStore {
     pub fn new(dir: PathBuf, inline_timeout: Duration) -> std::io::Result<Self> {
@@ -100,7 +93,18 @@ impl JobStore {
         timeout_secs: Option<u64>,
         background: bool,
     ) -> std::io::Result<RunResult> {
-        let id = format!("j{}", self.seq.fetch_add(1, Ordering::Relaxed));
+        // Hold the jobs lock across id generation and insertion so the id is
+        // reserved atomically: two jobs launched in the same minute can't both
+        // see their `job-HH:MM` as free and clobber each other's entry. Nothing
+        // awaits while the guard is held (file create + spawn are synchronous),
+        // so the critical section stays short.
+        //
+        // The id uses a hard-coded `job` prefix, never `cmd`: a command can carry
+        // a secret in its leading tokens (`mysql -psecret`, `PGPASSWORD=…`), and
+        // the id ends up in `bash`'s reply, `job(list)`, reaper logs, and the log
+        // filename — so deriving it from `cmd` would leak that secret.
+        let mut jobs = self.jobs.lock().await;
+        let id = JobId::generate(&self.seq, |candidate| jobs.contains_key(candidate));
         let log_path = self.dir.join(format!("{id}.log"));
 
         // ponytail: stdout+stderr merged into one log (terminal-style). Split into
@@ -146,14 +150,14 @@ impl JobStore {
         }
 
         let job = Arc::new(Job {
-            cmd,
             log_path: log_path.clone(),
             pgid,
             state: state.clone(),
             done: rx.clone(),
             started: tokio::time::Instant::now(),
         });
-        self.jobs.lock().await.insert(id.clone(), job);
+        jobs.insert(id.clone(), job);
+        drop(jobs);
 
         // `bg: true` — don't wait, hand back the id straight away.
         if background {
@@ -172,27 +176,44 @@ impl JobStore {
             JobState::Running => Ok(RunResult::Backgrounded { id }),
             finished => Ok(RunResult::Inline {
                 state: finished,
-                page: read_page(&log_path, 0, DEFAULT_PAGE).await,
+                page: read_page(&log_path, 0, DEFAULT_PAGE).await?,
             }),
         }
     }
 
-    /// Status + one page of a job's log.
+    /// Status + one page of a job's log. `Ok(None)` means the id is unknown;
+    /// `Err` means the log existed but could not be read — surfaced to the caller
+    /// rather than collapsed into an empty page.
     pub async fn poll(
         &self,
-        id: &str,
+        id: &JobId,
         cursor: usize,
         limit: Option<usize>,
-    ) -> Option<(JobState, Page)> {
-        let job = self.jobs.lock().await.get(id).cloned()?;
+    ) -> Result<Option<(JobState, Page)>, JobLogError> {
+        let Some(job) = self.jobs.lock().await.get(id).cloned() else {
+            return Ok(None);
+        };
         let state = job.state.lock().await.clone();
-        let page = read_page(&job.log_path, cursor, limit.unwrap_or(DEFAULT_PAGE)).await;
-        Some((state, page))
+        // A reaper pass can evict this id and delete its log between the clone
+        // above and this read. If the log is gone *and* the id is no longer
+        // tracked, that's the stable "unknown job" result, not a read fault —
+        // re-check membership so an eviction race doesn't surface as an error.
+        let page = match read_page(&job.log_path, cursor, limit.unwrap_or(DEFAULT_PAGE)).await {
+            Ok(page) => page,
+            Err(JobLogError::Read(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                if self.jobs.lock().await.contains_key(id) {
+                    return Err(JobLogError::Read(error));
+                }
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        Ok(Some((state, page)))
     }
 
     pub async fn list(&self) -> Vec<JobSummary> {
         // Snapshot while holding the map lock, then drop it before any .await.
-        let snapshot: Vec<(String, Arc<Job>)> = {
+        let snapshot: Vec<(JobId, Arc<Job>)> = {
             let jobs = self.jobs.lock().await;
             jobs.iter()
                 .map(|(id, job)| (id.clone(), Arc::clone(job)))
@@ -202,7 +223,6 @@ impl JobStore {
         for (id, job) in snapshot {
             out.push(JobSummary {
                 id,
-                cmd: job.cmd.clone(),
                 state: job.state.lock().await.clone(),
             });
         }
@@ -212,35 +232,11 @@ impl JobStore {
 
     /// Kill a running job by signalling its whole process group. Returns `false`
     /// when the id is unknown or the job already finished — nothing to signal.
-    pub async fn kill(&self, id: &str) -> bool {
+    pub async fn kill(&self, id: &JobId) -> bool {
         let Some(job) = self.jobs.lock().await.get(id).cloned() else {
             return false;
         };
         kill_job(&job).await
-    }
-}
-
-/// Read lines `[cursor, cursor+limit)` from a log file. Re-reads the whole file
-/// each call — fine for typical logs; seek by byte offset if they get huge.
-async fn read_page(path: &std::path::Path, cursor: usize, limit: usize) -> Page {
-    // Binary-safe: a command that writes non-UTF-8 bytes (e.g. compiled output,
-    // escape sequences) must not produce a silently-empty log page.
-    let bytes = tokio::fs::read(path).await.unwrap_or_default();
-    let content = String::from_utf8_lossy(&bytes);
-    let all: Vec<&str> = content.lines().collect();
-    let total = all.len();
-    let end = (cursor + limit).min(total);
-    let lines = all
-        .get(cursor..end)
-        .unwrap_or(&[])
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    Page {
-        lines,
-        next_cursor: end,
-        total_lines: total,
-        has_more: end < total,
     }
 }
 
@@ -290,7 +286,7 @@ mod tests {
             RunResult::Inline { .. } => panic!("slow command should background"),
         };
         for _ in 0..50 {
-            let (state, page) = store.poll(&id, 0, None).await.unwrap();
+            let (state, page) = store.poll(&id, 0, None).await.unwrap().unwrap();
             if matches!(state, JobState::Exited { .. }) {
                 assert!(page.lines.iter().any(|l| l.contains("done")));
                 return;
@@ -329,7 +325,7 @@ mod tests {
         // Pull the descendant's pid out of the log.
         let mut child_pid = None;
         for _ in 0..50 {
-            let (_s, page) = store.poll(&id, 0, None).await.unwrap();
+            let (_s, page) = store.poll(&id, 0, None).await.unwrap().unwrap();
             if let Some(line) = page.lines.iter().find_map(|l| l.strip_prefix("pid:")) {
                 child_pid = Some(line.trim().to_string());
                 break;
@@ -353,7 +349,11 @@ mod tests {
 
     #[tokio::test]
     async fn kill_unknown_id_returns_false() {
-        assert!(!store(Duration::from_secs(5)).kill("nope").await);
+        assert!(
+            !store(Duration::from_secs(5))
+                .kill(&JobId::from("nope"))
+                .await
+        );
     }
 
     #[tokio::test]
@@ -365,7 +365,10 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(r, RunResult::Inline { .. }));
-        assert!(!store.kill("j1").await);
+        // Inline doesn't surface the id; fetch the finished job's id from the
+        // listing. Killing an already-exited job must return false.
+        let id = store.list().await.first().expect("job tracked").id.clone();
+        assert!(!store.kill(&id).await);
     }
 
     #[cfg(unix)]
@@ -392,7 +395,7 @@ mod tests {
 
         // TERM is ignored; the post-grace KILL must still bring it down.
         for _ in 0..100 {
-            let (state, _) = store.poll(&id, 0, None).await.unwrap();
+            let (state, _) = store.poll(&id, 0, None).await.unwrap().unwrap();
             if matches!(state, JobState::Exited { .. }) {
                 return;
             }
@@ -416,7 +419,7 @@ mod tests {
 
         let mut child_pid = None;
         for _ in 0..50 {
-            let (_s, page) = store.poll(&id, 0, None).await.unwrap();
+            let (_s, page) = store.poll(&id, 0, None).await.unwrap().unwrap();
             if let Some(line) = page.lines.iter().find_map(|l| l.strip_prefix("pid:")) {
                 child_pid = Some(line.trim().to_string());
                 break;
@@ -431,7 +434,7 @@ mod tests {
 
         // Evicted from the map (poll can't find it)...
         assert!(
-            store.poll(&id, 0, None).await.is_none(),
+            store.poll(&id, 0, None).await.unwrap().is_none(),
             "job should be evicted"
         );
         // ...and its process group reaped, not orphaned.
@@ -454,20 +457,20 @@ mod tests {
         let log_path = store.dir.join("jfake.log");
         tokio::fs::write(&log_path, "running\n").await.unwrap();
         let job = Arc::new(Job {
-            cmd: "unkillable".into(),
             log_path: log_path.clone(),
             pgid: None,
             state: Arc::new(Mutex::new(JobState::Running)),
             done: rx,
             started: tokio::time::Instant::now() - Duration::from_secs(1),
         });
-        store.jobs.lock().await.insert("jfake".into(), job);
+        let id = JobId::from("jfake");
+        store.jobs.lock().await.insert(id.clone(), job);
 
         // The backdated job is stale; kill fails => must not be evicted.
         reaper::reap_once(&store.jobs, Duration::ZERO).await;
 
         assert!(
-            store.poll("jfake", 0, None).await.is_some(),
+            store.poll(&id, 0, None).await.unwrap().is_some(),
             "running job whose kill failed must stay tracked"
         );
         assert!(log_path.exists(), "its log must not be deleted");
@@ -494,7 +497,7 @@ mod tests {
 
         // After kill the state must transition away from Running.
         for _ in 0..50 {
-            let (state, _) = store.poll(&id, 0, None).await.unwrap();
+            let (state, _) = store.poll(&id, 0, None).await.unwrap().unwrap();
             if !matches!(state, JobState::Running) {
                 return;
             }
@@ -506,7 +509,7 @@ mod tests {
     #[tokio::test]
     async fn list_reports_all_jobs() {
         let store = store(Duration::from_secs(5));
-        // Two distinct commands — one inline, one explicitly backgrounded.
+        // Two commands — one inline, one explicitly backgrounded — both tracked.
         store
             .run("echo alpha".into(), None, None, false)
             .await
@@ -518,9 +521,6 @@ mod tests {
 
         let jobs = store.list().await;
         assert_eq!(jobs.len(), 2, "expected two jobs, got {}", jobs.len());
-        let cmds: Vec<&str> = jobs.iter().map(|j| j.cmd.as_str()).collect();
-        assert!(cmds.contains(&"echo alpha"), "missing 'echo alpha'");
-        assert!(cmds.contains(&"echo beta"), "missing 'echo beta'");
         // IDs must be sorted so the list is deterministic.
         assert!(jobs[0].id < jobs[1].id, "list should be sorted by id");
     }
@@ -528,16 +528,14 @@ mod tests {
     #[tokio::test]
     async fn poll_paginates() {
         let store = store(Duration::from_secs(5));
-        let r = store
+        store
             .run("seq 1 10".into(), None, None, false)
             .await
             .unwrap();
-        // seq finishes inline; re-poll the job id to exercise pagination.
-        let id = match r {
-            RunResult::Inline { .. } => "j1".to_string(),
-            RunResult::Backgrounded { id } => id,
-        };
-        let (_s, page) = store.poll(&id, 0, Some(3)).await.unwrap();
+        // seq finishes inline; fetch its id from the listing to re-poll and
+        // exercise pagination.
+        let id = store.list().await.first().expect("job tracked").id.clone();
+        let (_s, page) = store.poll(&id, 0, Some(3)).await.unwrap().unwrap();
         assert_eq!(page.lines.len(), 3);
         assert_eq!(page.next_cursor, 3);
         assert!(page.has_more);
@@ -545,20 +543,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_page_handles_binary_log_without_empty_output() {
-        // Simulate a command that writes non-UTF-8 bytes to its log.
-        let dir = tempfile::tempdir().unwrap();
-        let log = dir.path().join("bin.log");
-        // Valid UTF-8 prefix + invalid bytes + valid suffix.
-        tokio::fs::write(&log, b"line1\nline2\xff\xfeline3\n")
-            .await
-            .unwrap();
-        let page = read_page(&log, 0, 100).await;
-        // Must return lines, not an empty page.
+    async fn poll_surfaces_read_error_while_job_is_tracked() {
+        let store = store(Duration::from_secs(5));
+        // A tracked job whose log has vanished is a genuine read fault, not an
+        // eviction race: poll must surface the error, never collapse it to
+        // Ok(None) (the NotFound -> Ok(None) mapping applies only once the id is
+        // gone from the map).
+        let (_tx, rx) = watch::channel(false);
+        let log_path = store.dir.join("gone.log"); // never created
+        let job = Arc::new(Job {
+            log_path,
+            pgid: None,
+            state: Arc::new(Mutex::new(JobState::Running)),
+            done: rx,
+            started: tokio::time::Instant::now(),
+        });
+        let id = JobId::from("gone");
+        store.jobs.lock().await.insert(id.clone(), job);
+
         assert!(
-            !page.lines.is_empty(),
-            "binary log must not produce empty page"
+            store.poll(&id, 0, None).await.is_err(),
+            "missing log for a still-tracked job must surface as an error"
         );
-        assert!(page.lines[0].contains("line1"));
     }
 }
