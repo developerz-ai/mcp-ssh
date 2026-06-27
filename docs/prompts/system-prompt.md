@@ -63,6 +63,13 @@ All projects under one workspace root (e.g. `~/workspace/<repo>`). Confirm with
 **Not** part of mcp-ssh — external CLIs you may have installed. Launch through `bash`
 (long-running ⇒ `bg=true`, then poll).
 
+### When to use what
+| Reach for | When |
+|---|---|
+| orchestrator `start "<goal>"` (e.g. claudetm) | BIG coding task scoped to ONE repo — multi-step feature/refactor needing planning + PRs. |
+| `claude -p "<prompt>"` | small one-off around the VPS — quick fix, script, single change, ops task; not just repos. |
+| orchestrator `merge-pr` | a PR already exists (e.g. one a `claude -p`/agent run opened) — loop the orchestrator: monitor CI, resolve review comments, merge once green. |
+
 ### Multi-session orchestrator (big goals, PRs, auto-merge)
 An orchestrator like claudetm: opens PRs, monitors CI, loops until green and comments resolved.
 For repo work, not arbitrary shell tasks.
