@@ -22,7 +22,10 @@ TLS is deliberately **not** in the binary (keeps deps minimal). A reverse proxy 
 | `config.rs` | Runtime config from env + file. Fails fast at boot if credentials are missing. |
 | `auth.rs` | The auth middleware — **bearer-only** guard on `/mcp`; rejects everything that is not a valid OAuth 2.1 access token. |
 | `oauth` | A minimal **OAuth 2.1 authorization server** (per the MCP authorization spec) so GUI clients can log in. |
-| `jobs.rs` | The job engine: run a command, return inline-or-background (incl. immediate `bg`), paginated logs, and an hourly reaper that drops jobs >24h old. |
+| `jobs/mod.rs` | The job engine: run a command, return inline-or-background (incl. immediate `bg`), paginated logs, and an hourly reaper that drops jobs >24h old. |
+| `jobs/id.rs` | JobId newtype: human-readable ids from command names + local hour (e.g., `cargo-build-23:30`). |
+| `jobs/log.rs` | Job log pagination: read log files by page (cursor + limit). |
+| `jobs/reaper.rs` | Hourly reaper evicts jobs >24h old; process-group kill helpers (TERM→KILL escalation). |
 | `tools/mod.rs` | The MCP tool surface — **three tools** (`bash`/`job`/`file`) dispatching on an `action` param; thin adapters over `jobs` and `files`. |
 | `tools/files.rs` | File operations (read/write/append/delete/list/grep/move). |
 
@@ -56,7 +59,7 @@ When a command starts (`JobStore::run`):
    - **Finished in time** → `RunResult::Inline` — status + first page of the log, returned now.
    - **Still running (or `bg`)** → `RunResult::Backgrounded { id }` — the agent gets a job id to poll.
 
-Jobs live in an in-memory map keyed by id (`j1`, `j2`, …); the log files persist on disk under the job dir. An **hourly reaper** drops any job whose age exceeds 24h — evicting it from the map and deleting its log file — so the map and the job dir stay bounded without manual cleanup.
+Jobs live in an in-memory map keyed by human-readable id (e.g., `cargo-build-23:30`); the log files persist on disk under the job dir. An **hourly reaper** drops any job whose age exceeds 24h — evicting it from the map and deleting its log file — so the map and the job dir stay bounded without manual cleanup. Job ids are derived from the command name (slugified) + local hour, giving context without UUIDs.
 
 ```
 JobState = Running | Exited { code } | Failed { error }
