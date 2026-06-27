@@ -18,7 +18,7 @@ sudo systemctl enable --now mcp-ssh
 
 # 4. check it's up on loopback
 sudo systemctl status mcp-ssh
-curl -u admin:secret http://127.0.0.1:1337/mcp
+curl -fsS http://127.0.0.1:1337/.well-known/oauth-authorization-server
 ```
 
 The `.deb` installs the binary, a systemd unit, and `/etc/mcp-ssh/config.toml`.
@@ -151,11 +151,8 @@ File: `/etc/mcp-ssh/config.toml` (or override the path with `$MCP_SSH_CONFIG`). 
 
 Once `https://your-host/mcp` is live:
 
-- **Claude / GUI clients** — add a remote MCP server with that URL; it runs the **OAuth 2.1** flow, log in with your `set-auth` credentials.
-- **curl / scripts** — **HTTP Basic**:
-
-  ```bash
-  curl -u admin:secret https://your-host.example.com/mcp -d @request.json
-  ```
+- **All MCP clients** — add the URL; the client discovers `/.well-known/oauth-authorization-server`,
+  drives the **OAuth 2.1** flow, and logs in with your `set-auth` credentials. `/mcp` is
+  **bearer-only**; there is no HTTP Basic fallback on this endpoint.
 
 Tool reference → [usage.md](usage.md).
