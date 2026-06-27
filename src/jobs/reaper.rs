@@ -3,15 +3,23 @@
 //! A job leads its own process group (so its pgid equals its pid; see
 //! `JobStore::run`), which lets a single signal to the negative pid reach the
 //! whole tree the command spawned, not just `sh` itself.
-use std::path::Path;
-use std::{collections::HashMap, sync::Arc, time::Duration};
+//!
+//! Job ages come from the DB `started_unix` (wall clock), so retention/trim tiers
+//! stay meaningful across restarts. The in-memory map is consulted only to kill a
+//! still-running group before evicting it.
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use tokio::sync::{Mutex, watch};
 
 use super::{Job, JobId, JobState, ProcessGroupId};
+use crate::db::{Db, now_unix};
 
-/// Jobs (and their logs) older than this are reaped hourly.
-const RETENTION: Duration = Duration::from_secs(24 * 3600);
+/// Jobs (and their logs) older than this are reaped hourly. Seconds, to compare
+/// against the DB's wall-clock `started_unix`.
+const RETENTION_SECS: i64 = 24 * 3600;
 /// Grace between `SIGTERM` and `SIGKILL` when killing a job's process group.
 const KILL_GRACE: Duration = Duration::from_secs(2);
 
@@ -20,8 +28,9 @@ const KILL_GRACE: Duration = Duration::from_secs(2);
 /// enough to debug a failure, not enough to fill the disk. Running jobs are never
 /// compacted (their log is still being appended). Tiers, by how long ago the job
 /// started: a finished job keeps its last `TRIM_RECENT_LINES` while fresh, drops
-/// to `TRIM_AGED_LINES` after `TRIM_AGED_AFTER`, then is purged at `RETENTION`.
-const TRIM_AGED_AFTER: Duration = Duration::from_secs(3 * 3600);
+/// to `TRIM_AGED_LINES` after `TRIM_AGED_AFTER_SECS`, then is purged at
+/// `RETENTION_SECS`.
+const TRIM_AGED_AFTER_SECS: i64 = 3 * 3600;
 const TRIM_RECENT_LINES: usize = 5_000;
 const TRIM_AGED_LINES: usize = 500;
 /// First line written into a compacted log. Recognised on the next pass so
@@ -79,44 +88,155 @@ async fn exited_within(mut done: watch::Receiver<bool>, grace: Duration) -> bool
         .is_ok()
 }
 
-/// Hourly: drop jobs (and their log files) older than `RETENTION` so history
-/// doesn't grow without bound. ponytail: time-based only; a busy box could still
-/// hold ≤24h of jobs in memory — add a count cap if that ever bites.
-pub(super) fn spawn_reaper(jobs: Arc<Mutex<HashMap<JobId, Arc<Job>>>>) {
+/// Run a reaping pass once on startup, then hourly. ponytail: time-based only; a
+/// busy box could still hold ≤24h of jobs — add a count cap if that ever bites.
+pub(super) fn spawn_reaper(jobs: Arc<Mutex<HashMap<JobId, Arc<Job>>>>, db: Db, dir: PathBuf) {
     tokio::spawn(async move {
+        // Run immediately so a long-dead job's log is reclaimed promptly after a
+        // restart, then settle into the hourly cadence.
+        reaper_pass(&jobs, &db, &dir).await;
         let mut tick = tokio::time::interval(Duration::from_secs(3600));
+        tick.tick().await; // the first tick fires immediately — already covered above
         loop {
             tick.tick().await;
-            // Purge aged-out jobs first, then compact the logs of whatever
-            // finished jobs remain so disk stays bounded over a long uptime.
-            reap_once(&jobs, RETENTION).await;
-            compact_once(&jobs, TRIM_AGED_AFTER).await;
+            reaper_pass(&jobs, &db, &dir).await;
         }
     });
 }
 
+/// One full pass: purge aged-out jobs, compact the logs of finished survivors, and
+/// sweep orphan log files left with no row.
+async fn reaper_pass(jobs: &Mutex<HashMap<JobId, Arc<Job>>>, db: &Db, dir: &Path) {
+    reap_once(jobs, db, dir, RETENTION_SECS).await;
+    compact_once(jobs, db, dir, TRIM_AGED_AFTER_SECS).await;
+    reap_orphans(db, dir, RETENTION_SECS).await;
+}
+
 /// Compact every *finished* job's log to a trailing tail: `TRIM_RECENT_LINES`
-/// while younger than `aged_after`, `TRIM_AGED_LINES` once older. Running jobs are
-/// skipped — their log is still being written, and truncating under the writer
-/// would corrupt it. Idempotent: an already-trimmed log is left alone.
-pub(super) async fn compact_once(jobs: &Mutex<HashMap<JobId, Arc<Job>>>, aged_after: Duration) {
-    let now = tokio::time::Instant::now();
-    let snapshot: Vec<Arc<Job>> = {
-        let map = jobs.lock().await;
-        map.values().cloned().collect()
+/// while younger than `aged_after_secs`, `TRIM_AGED_LINES` once older. Age comes
+/// from the DB `started_unix`. Running jobs are skipped — their log is still being
+/// written, and truncating under the writer would corrupt it. Idempotent: an
+/// already-trimmed log is left alone.
+pub(super) async fn compact_once(
+    jobs: &Mutex<HashMap<JobId, Arc<Job>>>,
+    db: &Db,
+    dir: &Path,
+    aged_after_secs: i64,
+) {
+    let rows = match db
+        .call(|conn| {
+            let mut stmt = conn.prepare("SELECT id, status, started_unix FROM jobs")?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(%error, "reaper: querying jobs to compact failed");
+            return;
+        }
     };
-    for job in snapshot {
-        // Never rewrite a log that's still being appended to.
-        if matches!(*job.state.lock().await, JobState::Running) {
+
+    let now = now_unix();
+    for (id, status, started) in rows {
+        // Never rewrite a log still being appended. The in-memory map is the
+        // authority on liveness in this process; for a row from a previous process
+        // (not tracked here) trust the persisted status.
+        let jid = JobId::from(id.clone());
+        let running = match jobs.lock().await.get(&jid) {
+            Some(job) => matches!(*job.state.lock().await, JobState::Running),
+            None => status == "running",
+        };
+        if running {
             continue;
         }
-        let keep = if now.duration_since(job.started) >= aged_after {
+        let keep = if now - started >= aged_after_secs {
             TRIM_AGED_LINES
         } else {
             TRIM_RECENT_LINES
         };
-        if let Err(error) = trim_log(&job.log_path, keep).await {
-            tracing::warn!(%error, path = %job.log_path.display(), "failed to trim job log");
+        let path = dir.join(format!("{id}.log"));
+        match trim_log(&path, keep).await {
+            Ok(()) => {}
+            // A finished job whose log is already gone (reaped/never produced) is
+            // not an error worth logging on every hourly pass.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(%error, path = %path.display(), "failed to trim job log");
+            }
+        }
+    }
+}
+
+/// Delete log files with no matching `jobs` row (orphans from a crash or a manually
+/// dropped row) once they're older than `retention_secs` by mtime — so a poll
+/// racing a just-finished job still finds its log, but truly abandoned files don't
+/// accumulate.
+async fn reap_orphans(db: &Db, dir: &Path, retention_secs: i64) {
+    let known: HashSet<String> = match db
+        .call(|conn| {
+            let mut stmt = conn.prepare("SELECT id FROM jobs")?;
+            let ids = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            ids.collect::<rusqlite::Result<HashSet<_>>>()
+        })
+        .await
+    {
+        Ok(ids) => ids,
+        Err(error) => {
+            tracing::warn!(%error, "reaper: querying known job ids failed");
+            return;
+        }
+    };
+
+    let mut entries = match tokio::fs::read_dir(dir).await {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::warn!(%error, dir = %dir.display(), "reaper: reading job dir failed");
+            return;
+        }
+    };
+    let retention = Duration::from_secs(retention_secs.max(0) as u64);
+    loop {
+        let entry = match entries.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(error) => {
+                tracing::warn!(%error, "reaper: scanning job dir failed");
+                break;
+            }
+        };
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("log") {
+            continue;
+        }
+        // `<id>.log` -> `<id>`; ids never contain a `.`, so the stem is the id.
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if known.contains(stem) {
+            continue;
+        }
+        // Orphan: drop it only once it's aged past retention by mtime, so a log
+        // whose row hasn't been written yet (a brief race) isn't deleted early.
+        let aged = match entry.metadata().await.and_then(|m| m.modified()) {
+            Ok(modified) => SystemTime::now()
+                .duration_since(modified)
+                .map(|age| age > retention)
+                .unwrap_or(false),
+            Err(error) => {
+                tracing::warn!(%error, path = %path.display(), "reaper: stat orphan log failed");
+                continue;
+            }
+        };
+        if aged {
+            let _ = tokio::fs::remove_file(&path).await;
         }
     }
 }
@@ -152,38 +272,71 @@ async fn trim_log(path: &Path, keep: usize) -> std::io::Result<()> {
     tokio::fs::rename(&tmp, path).await
 }
 
-/// One reaping pass: evict every job older than `retention`. A still-`Running`
-/// job is killed first, so eviction never orphans its process group.
-pub(super) async fn reap_once(jobs: &Mutex<HashMap<JobId, Arc<Job>>>, retention: Duration) {
-    let now = tokio::time::Instant::now();
-    let map = jobs.lock().await;
-    let stale: Vec<(JobId, Arc<Job>)> = map
-        .iter()
-        .filter(|(_, j)| now.duration_since(j.started) > retention)
-        .map(|(id, j)| (id.clone(), j.clone()))
-        .collect();
-    drop(map);
+/// One reaping pass: evict every job whose row is older than `retention_secs`.
+/// A still-`Running` job tracked in this process is killed first, so eviction
+/// never orphans its process group; only then is the DB row, the in-memory entry,
+/// and the log file dropped. A running job whose kill fails stays fully tracked
+/// (pollable/killable, row + log intact) for a later pass.
+pub(super) async fn reap_once(
+    jobs: &Mutex<HashMap<JobId, Arc<Job>>>,
+    db: &Db,
+    dir: &Path,
+    retention_secs: i64,
+) {
+    let cutoff = now_unix() - retention_secs;
+    let stale = match db
+        .call(move |conn| {
+            let mut stmt = conn.prepare("SELECT id FROM jobs WHERE started_unix < ?1")?;
+            let ids = stmt.query_map([cutoff], |r| r.get::<_, String>(0))?;
+            ids.collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .await
+    {
+        Ok(ids) => ids,
+        Err(error) => {
+            tracing::warn!(%error, "reaper: querying stale jobs failed");
+            return;
+        }
+    };
 
-    // Kill first so a still-running group is never orphaned by eviction. Only
-    // evict jobs that finished or whose group we actually signalled; a running
-    // job whose kill failed stays tracked (pollable/killable) for a later pass.
-    let mut removable: Vec<(JobId, Arc<Job>)> = Vec::new();
-    for (id, job) in &stale {
-        if kill_job(job).await || !matches!(*job.state.lock().await, JobState::Running) {
-            removable.push((id.clone(), job.clone()));
-        } else {
-            tracing::warn!(id = %id, "stale running job not evicted: kill failed");
+    let mut evictable: Vec<String> = Vec::new();
+    for id in &stale {
+        let jid = JobId::from(id.clone());
+        let live = jobs.lock().await.get(&jid).cloned();
+        match live {
+            Some(job) if matches!(*job.state.lock().await, JobState::Running) => {
+                // Kill before evict so a live group is never orphaned. If the kill
+                // fails while it still reads Running, keep it for a later pass.
+                if kill_job(&job).await || !matches!(*job.state.lock().await, JobState::Running) {
+                    evictable.push(id.clone());
+                } else {
+                    tracing::warn!(id = %id, "stale running job not evicted: kill failed");
+                }
+            }
+            _ => evictable.push(id.clone()),
         }
     }
 
-    let mut map = jobs.lock().await;
-    for (id, _) in &removable {
-        map.remove(id);
+    if evictable.is_empty() {
+        return;
     }
-    drop(map);
 
-    for (_, job) in &removable {
-        let _ = tokio::fs::remove_file(&job.log_path).await;
+    let ids = evictable.clone();
+    if let Err(error) = db
+        .call(move |conn| {
+            for id in &ids {
+                conn.execute("DELETE FROM jobs WHERE id = ?1", [id.as_str()])?;
+            }
+            Ok(())
+        })
+        .await
+    {
+        tracing::warn!(%error, "reaper: deleting stale rows failed");
+    }
+
+    for id in &evictable {
+        jobs.lock().await.remove(&JobId::from(id.clone()));
+        let _ = tokio::fs::remove_file(dir.join(format!("{id}.log"))).await;
     }
 }
 

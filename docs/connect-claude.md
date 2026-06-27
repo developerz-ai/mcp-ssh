@@ -75,7 +75,7 @@ mobile.
 | **Connection fails / "can't reach server"** | Server isn't public. Claude dials from **Anthropic's cloud**, not your device — `localhost`/LAN/VPN-only won't work. Expose `https://your-host/mcp` on the public internet (allowlist Anthropic IP ranges if firewalled). |
 | **Discovery 404 / OAuth never starts** | Proxy only forwards `/mcp`. It must also forward `/.well-known/oauth-authorization-server`, `/.well-known/oauth-protected-resource`, `/authorize`, `/token`, `/register`. Verify: `curl -fsS https://your-host/.well-known/oauth-authorization-server` returns JSON. See [docs/deploy.md](deploy.md). |
 | **Login page errors / blank, or 421/400 on connect** | Host not allowed. Set `MCP_SSH_ALLOWED_HOSTS` to your **public hostname** (DNS-rebinding guard) and restart: `journalctl -u mcp-ssh -e` shows the rejected `Host`. |
-| **Worked, then tools go unauthorized after a while** | Bearer expired (tokens are short-lived, ~1h; they also reset when the server restarts). For GUI clients Claude refreshes automatically — remove and re-add the connector if it doesn't. For headless tokens, re-mint (below). |
+| **Worked, then tools go unauthorized after a while** | Access tokens last 24h; Claude silently renews them with the refresh token, so this should be rare. Tokens also reset when the server restarts — GUI clients re-auth automatically (remove/re-add the connector if not); for headless tokens, re-mint (below). |
 | **Tools don't appear in a chat** | Connector added but not enabled for that conversation. Click **+** → **Connectors** → toggle **mcp-ssh** on. |
 
 Quick reachability check from the public side:

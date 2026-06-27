@@ -1,13 +1,16 @@
 //! Human-readable job ids: an agent-supplied `title` (or the neutral `job`
-//! fallback) plus the local `HH:MM:SS` it started — e.g. `claudetm-doing-mvp-03:01:05`
-//! or `job-23:30:07`. The title lets the agent tell its own jobs apart at a glance
-//! (`job(list)` shows what each one is doing). It is NEVER derived from the command:
-//! command text can carry a secret in its leading tokens, and the id surfaces in
-//! replies, `job(list)`, reaper logs, and the log filename. The title comes from a
-//! dedicated `bash` param the agent writes deliberately, and is normalized to a
-//! single `[A-Za-z0-9_-]+` path component (so it can't inject shell/path
-//! metacharacters into the log filename or escape the job dir). A monotonic
-//! sequence suffix disambiguates jobs starting within the same second.
+//! fallback) plus the local `HH-MM-SS` it started — e.g. `claudetm-doing-mvp-03-01-05`
+//! or `job-23-30-07`. The time uses `-`, not `:`: the id *is* the `<id>.log`
+//! filename, and a colon, though legal on Linux, is a portability/tooling hazard
+//! (Windows forbids it, scp/globbing trip on it) — dashes are safe everywhere. The
+//! title lets the agent tell its own jobs apart at a glance (`job(list)` shows what
+//! each one is doing). It is NEVER derived from the command: command text can carry
+//! a secret in its leading tokens, and the id surfaces in replies, `job(list)`,
+//! reaper logs, and the log filename. The title comes from a dedicated `bash` param
+//! the agent writes deliberately, and is normalized to a single `[A-Za-z0-9_-]+`
+//! path component (so it can't inject shell/path metacharacters into the log
+//! filename or escape the job dir). A monotonic sequence suffix disambiguates jobs
+//! starting within the same second.
 
 use std::borrow::Borrow;
 use std::fmt;
@@ -19,9 +22,9 @@ use chrono::Local;
 /// readable no matter what the agent passes.
 const MAX_TITLE_LEN: usize = 32;
 
-/// A human-readable job identifier: `<label>-<HH:MM:SS>` with an optional `-<seq>`
+/// A human-readable job identifier: `<label>-<HH-MM-SS>` with an optional `-<seq>`
 /// collision suffix, where `<label>` is a normalized title or `job`. A generated id
-/// matches `^[A-Za-z0-9_-]+-\d{2}:\d{2}:\d{2}(-\d+)?$`; ids wrapped from client
+/// matches `^[A-Za-z0-9_-]+-\d{2}-\d{2}-\d{2}(-\d+)?$`; ids wrapped from client
 /// input for lookup are not revalidated.
 #[derive(Debug, Clone, Hash, Eq, PartialEq, PartialOrd, Ord, serde::Serialize)]
 pub struct JobId(String);
@@ -37,7 +40,7 @@ impl JobId {
         let label = title
             .and_then(normalize_title)
             .unwrap_or_else(|| "job".to_string());
-        let base = format!("{label}-{}", Local::now().format("%H:%M:%S"));
+        let base = format!("{label}-{}", Local::now().format("%H-%M-%S"));
         if !exists(&base) {
             return Self(base);
         }
@@ -108,29 +111,21 @@ impl From<&str> for JobId {
 mod tests {
     use super::*;
 
-    /// Mirror the documented `^<label>-\d{2}:\d{2}:\d{2}(-\d+)?$` shape (label is
-    /// `[a-z0-9-_]+`) without a regex dependency. The two `:` only ever appear in
-    /// the `HH:MM:SS` time, so the first `-` before the time splits label from time.
+    /// Mirror the documented `^<label>-\d{2}-\d{2}-\d{2}(-\d+)?$` shape without a
+    /// regex dependency. Everything is `-`-separated now, so strip the exact
+    /// `<label>-` prefix (the label may itself contain dashes) and check the
+    /// remainder is `HH-MM-SS` or `HH-MM-SS-<seq>`.
     fn valid_format(s: &str, expected_label: &str) -> bool {
         let two_digits = |x: &str| x.len() == 2 && x.bytes().all(|b| b.is_ascii_digit());
-        // Time is the `HH:MM:SS` slice; split it off by its two colons.
-        let Some((before_ss, tail)) = s.rsplit_once(':') else {
+        let digits = |x: &str| !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit());
+        let Some(rest) = s.strip_prefix(&format!("{expected_label}-")) else {
             return false;
         };
-        let Some((label_hh, mm)) = before_ss.rsplit_once(':') else {
-            return false;
-        };
-        let Some((label, hh)) = label_hh.rsplit_once('-') else {
-            return false;
-        };
-        let (ss, suffix_ok) = match tail.split_once('-') {
-            Some((ss, sfx)) => (
-                ss,
-                !sfx.is_empty() && sfx.bytes().all(|b| b.is_ascii_digit()),
-            ),
-            None => (tail, true),
-        };
-        two_digits(hh) && two_digits(mm) && two_digits(ss) && suffix_ok && label == expected_label
+        match rest.split('-').collect::<Vec<_>>().as_slice() {
+            [hh, mm, ss] => two_digits(hh) && two_digits(mm) && two_digits(ss),
+            [hh, mm, ss, seq] => two_digits(hh) && two_digits(mm) && two_digits(ss) && digits(seq),
+            _ => false,
+        }
     }
 
     #[test]
@@ -187,10 +182,12 @@ mod tests {
         let id = JobId::generate(&seq, None, |_| false);
         let s = id.as_ref();
         assert!(valid_format(s, "job"));
-        // No trailing `-<seq>`: the only `-` after the time would be a suffix.
-        let after_time = s.rsplit_once(':').unwrap().1;
-        assert!(
-            !after_time.contains('-'),
+        // No trailing `-<seq>`: after the `job-` label the remainder is exactly the
+        // three time components `HH-MM-SS`, nothing more.
+        let after_label = s.strip_prefix("job-").unwrap();
+        assert_eq!(
+            after_label.split('-').count(),
+            3,
             "unexpected collision suffix: {s}"
         );
         assert_eq!(

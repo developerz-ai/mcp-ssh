@@ -46,7 +46,7 @@ Slower commands **auto-background** to a job id; page their output with `job`.
   context. Page through via the `next_cursor` it returns.
 - `interactive=true` sources `~/.bashrc` (aliases, version managers — mise/nvm/rbenv). Default
   is the faster bare `sh -c`.
-- `title="deploy-check"` labels the job id (`deploy-check-HH:MM:SS`) vs. the neutral default —
+- `title="deploy-check"` labels the job id (`deploy-check-HH-MM-SS`) vs. the neutral default —
   useful when several jobs run at once. Keep titles secret-free.
 
 ## Files

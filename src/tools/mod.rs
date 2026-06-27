@@ -365,6 +365,7 @@ mod tests {
             dir,
             std::time::Duration::from_secs(2),
             crate::jobs::Shell::sh(),
+            crate::db::Db::memory(),
         )
         .unwrap();
         Tools::new(store)

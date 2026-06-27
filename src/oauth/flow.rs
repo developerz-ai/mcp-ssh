@@ -86,28 +86,48 @@ pub async fn authorize(
 #[derive(Deserialize)]
 pub struct TokenParams {
     grant_type: String,
-    code: String,
-    code_verifier: String,
-    redirect_uri: String,
+    // Present for `authorization_code`; absent for `refresh_token`.
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    code_verifier: Option<String>,
+    #[serde(default)]
+    redirect_uri: Option<String>,
+    // Present for `refresh_token`.
+    #[serde(default)]
+    refresh_token: Option<String>,
 }
 
-/// `/token` — exchange an auth code + PKCE verifier for an opaque access token.
+/// `/token` — issue an access + refresh pair. Two grants: `authorization_code`
+/// (code + PKCE verifier, first login) and `refresh_token` (silent renewal once
+/// the access token expires, so the client doesn't re-run the browser flow).
 pub async fn token(State(st): State<AuthState>, Form(p): Form<TokenParams>) -> Response {
-    if p.grant_type != "authorization_code" {
-        return bad_request("unsupported_grant_type");
-    }
-    match st
-        .store
-        .redeem(&p.code, &p.code_verifier, &p.redirect_uri)
-        .await
-    {
-        Ok(access_token) => (
+    let issued = match p.grant_type.as_str() {
+        "authorization_code" => {
+            let (Some(code), Some(verifier), Some(redirect_uri)) =
+                (p.code, p.code_verifier, p.redirect_uri)
+            else {
+                return bad_request("invalid_request");
+            };
+            st.store.redeem(&code, &verifier, &redirect_uri).await
+        }
+        "refresh_token" => {
+            let Some(refresh_token) = p.refresh_token else {
+                return bad_request("invalid_request");
+            };
+            st.store.refresh(&refresh_token).await
+        }
+        _ => return bad_request("unsupported_grant_type"),
+    };
+    match issued {
+        Ok(tokens) => (
             // RFC 6749 §5.1 — token responses MUST NOT be cached.
             [("Cache-Control", "no-store")],
             Json(json!({
-                "access_token": access_token,
+                "access_token": tokens.access,
                 "token_type": "Bearer",
                 "expires_in": store::TOKEN_TTL.as_secs(),
+                "refresh_token": tokens.refresh,
             })),
         )
             .into_response(),
@@ -214,17 +234,27 @@ mod tests {
 
     // --- /token ---
 
+    fn auth_code_params(code: String) -> TokenParams {
+        TokenParams {
+            grant_type: "authorization_code".into(),
+            code: Some(code),
+            code_verifier: Some(VERIFIER.into()),
+            redirect_uri: Some("http://cb".into()),
+            refresh_token: None,
+        }
+    }
+
+    /// Parse a `/token` JSON body out of a response.
+    async fn token_body(resp: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
     #[tokio::test]
     async fn token_response_sets_cache_control_no_store() {
-        let store = Store::default();
+        let store = Store::new(crate::db::Db::memory());
         let code = store.new_code(CHALLENGE.into(), "http://cb".into()).await;
-        let params = TokenParams {
-            grant_type: "authorization_code".into(),
-            code,
-            code_verifier: VERIFIER.into(),
-            redirect_uri: "http://cb".into(),
-        };
-        let resp = token(State(test_state(store)), Form(params)).await;
+        let resp = token(State(test_state(store)), Form(auth_code_params(code))).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
             resp.headers()
@@ -235,18 +265,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authorization_code_grant_returns_access_and_refresh() {
+        let store = Store::new(crate::db::Db::memory());
+        let code = store.new_code(CHALLENGE.into(), "http://cb".into()).await;
+        let resp = token(State(test_state(store)), Form(auth_code_params(code))).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = token_body(resp).await;
+        assert!(body["access_token"].is_string());
+        assert!(
+            body["refresh_token"].is_string(),
+            "must issue a refresh token"
+        );
+        assert_eq!(body["token_type"], "Bearer");
+        assert_eq!(body["expires_in"], store::TOKEN_TTL.as_secs());
+    }
+
+    #[tokio::test]
+    async fn refresh_token_grant_renews_silently() {
+        let st = test_state(Store::new(crate::db::Db::memory()));
+        // First login.
+        let code = st
+            .store
+            .new_code(CHALLENGE.into(), "http://cb".into())
+            .await;
+        let first = token_body(token(State(st.clone()), Form(auth_code_params(code))).await).await;
+        let refresh = first["refresh_token"].as_str().unwrap().to_string();
+
+        // Exchange the refresh token — no code, no browser.
+        let params = TokenParams {
+            grant_type: "refresh_token".into(),
+            code: None,
+            code_verifier: None,
+            redirect_uri: None,
+            refresh_token: Some(refresh),
+        };
+        let resp = token(State(st.clone()), Form(params)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = token_body(resp).await;
+        let new_access = body["access_token"].as_str().unwrap();
+        assert!(
+            st.store.validate(new_access).await,
+            "renewed token is valid"
+        );
+        assert_ne!(new_access, first["access_token"].as_str().unwrap());
+    }
+
+    #[tokio::test]
+    async fn refresh_token_grant_rejects_unknown_token() {
+        let params = TokenParams {
+            grant_type: "refresh_token".into(),
+            code: None,
+            code_verifier: None,
+            redirect_uri: None,
+            refresh_token: Some("not-a-real-refresh-token".into()),
+        };
+        let resp = token(
+            State(test_state(Store::new(crate::db::Db::memory()))),
+            Form(params),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(token_body(resp).await["error"], "invalid_grant");
+    }
+
+    #[tokio::test]
     async fn token_rejects_unsupported_grant_type() {
         let params = TokenParams {
             grant_type: "client_credentials".into(),
-            code: "irrelevant".into(),
-            code_verifier: "irrelevant".into(),
-            redirect_uri: "http://cb".into(),
+            code: Some("irrelevant".into()),
+            code_verifier: Some("irrelevant".into()),
+            redirect_uri: Some("http://cb".into()),
+            refresh_token: None,
         };
-        let resp = token(State(test_state(Store::default())), Form(params)).await;
+        let resp = token(
+            State(test_state(Store::new(crate::db::Db::memory()))),
+            Form(params),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["error"], "unsupported_grant_type");
+        assert_eq!(token_body(resp).await["error"], "unsupported_grant_type");
     }
 
     // --- /authorize ---
@@ -263,7 +360,7 @@ mod tests {
             resource: None,
         };
         let resp = authorize(
-            State(test_state(Store::default())),
+            State(test_state(Store::new(crate::db::Db::memory()))),
             basic_headers("u", "p"),
             Query(params),
         )
@@ -288,7 +385,7 @@ mod tests {
             resource: None,
         };
         let resp = authorize(
-            State(test_state(Store::default())),
+            State(test_state(Store::new(crate::db::Db::memory()))),
             basic_headers("u", "p"),
             Query(params),
         )
@@ -312,7 +409,7 @@ mod tests {
             resource: None,
         };
         let resp = authorize(
-            State(test_state(Store::default())),
+            State(test_state(Store::new(crate::db::Db::memory()))),
             basic_headers("u", "p"),
             Query(params),
         )
@@ -336,7 +433,7 @@ mod tests {
             resource: None,
         };
         let resp = authorize(
-            State(test_state(Store::default())),
+            State(test_state(Store::new(crate::db::Db::memory()))),
             basic_headers("u", "wrong"),
             Query(params),
         )
@@ -357,7 +454,7 @@ mod tests {
             resource: None,
         };
         let resp = authorize(
-            State(test_state(Store::default())),
+            State(test_state(Store::new(crate::db::Db::memory()))),
             basic_headers("u", "p"),
             Query(params),
         )

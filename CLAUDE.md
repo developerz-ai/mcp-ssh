@@ -21,6 +21,7 @@
 | Runtime | tokio |
 | HTTP | axum 0.8 |
 | MCP | rmcp 1.7 (Streamable HTTP server transport) |
+| Durable state | SQLite via `rusqlite` (`bundled` — compiled in, no system libsqlite). OAuth tokens + job metadata durable across restarts |
 | Errors | thiserror (domain) + anyhow (main boundary) |
 | Logging | tracing |
 | Auth | OAuth 2.1 (MCP spec, for Claude) + HTTP Basic (simple clients) |
@@ -52,12 +53,13 @@ Keep this accurate — it's the navigation aid.
 |---|---|
 | `src/main.rs` | entry: CLI parse, config load, build axum router, serve |
 | `src/config.rs` | env + TOML file config; fails fast if auth creds missing |
+| `src/db.rs` | SQLite durable-state layer (`rusqlite`, `bundled`): OAuth `access_tokens`/`refresh_tokens` + job metadata + output tail. DB at `/var/lib/mcp-ssh/mcp-ssh.db`, WAL, auto-created; one serialized connection driven via `spawn_blocking` |
 | `src/auth.rs` | HTTP Basic auth middleware |
-| `src/oauth/` | minimal OAuth 2.1 server: discovery metadata, dynamic client registration, authorize + token with PKCE, bearer validation |
-| `src/jobs/mod.rs` | job engine: run a command, return inline if fast (<2s) else a job id (or immediately when `bg`); output streams to a per-job log file, polled paginated |
-| `src/jobs/id.rs` | JobId newtype: human-readable ids — neutral `job` prefix + local `HH:MM` (e.g., `job-23:30`); free of command text so secrets can't leak into an id, log line, or filename |
+| `src/oauth/` | minimal OAuth 2.1 server: discovery metadata, dynamic client registration, authorize + token with PKCE, bearer validation; tokens persisted in SQLite (`src/db.rs`) so logins survive a restart |
+| `src/jobs/mod.rs` | job engine: run a command, return inline if fast (<2s) else a job id (or immediately when `bg`); live output streams to a per-job log file (polled paginated), metadata + output tail persisted to SQLite so history survives restarts |
+| `src/jobs/id.rs` | JobId newtype: human-readable ids — neutral `job` prefix + local `HH-MM-SS` (e.g., `job-23-30-07`); free of command text so secrets can't leak into an id, log line, or filename |
 | `src/jobs/log.rs` | job log pagination: read per-job log files by page (cursor + limit) |
-| `src/jobs/reaper.rs` | hourly reaper: drops jobs >24h old (killing any still-`Running` group first), then compacts finished jobs' logs to a trailing tail (5000 lines <3h old, 500 lines after) so disk stays bounded over long uptime; process-group kill helpers (TERM→KILL escalation), shared with `job(action="kill")` |
+| `src/jobs/reaper.rs` | reaper (startup + hourly): drops jobs >24h old (DB rows + log files, killing any still-`Running` group first), trims finished jobs' logs to a trailing tail (5000 lines <3h old, 500 after), mtime-ages orphaned files from a previous run, marks jobs stuck `running` across a restart as failed; process-group kill helpers (TERM→KILL escalation), shared with `job(action="kill")` |
 | `src/tools/mod.rs` | MCP tool surface (`#[tool_router]`/`#[tool]` from rmcp): 3 tools (`bash`/`job`/`file`) dispatching on `action`. Thin adapters over jobs + files |
 | `src/tools/files.rs` | file operations (`tokio::fs`; `ls`/`find`/`grep` shelled out) |
 
@@ -65,7 +67,9 @@ Files ≤300 LOC. One responsibility per module (SRP). Split when a module grows
 
 ## Execution model
 
-`bash` runs a command. Finishes within `MCP_SSH_INLINE_TIMEOUT_SECS` (default 2) → output returns inline. Slower (or `bg=true`) → auto-backgrounds to a **job id**; output streams to a per-job log file. `job(action="poll")` paginates that log (cursor/limit) so a chatty command never floods the agent's context. This is the whole point: bounded output, no context blowups. Jobs >24h old are reaped hourly.
+`bash` runs a command. Finishes within `MCP_SSH_INLINE_TIMEOUT_SECS` (default 2) → output returns inline. Slower (or `bg=true`) → auto-backgrounds to a **job id**; live output streams to a per-job log file. `job(action="poll")` paginates that log (cursor/limit) so a chatty command never floods the agent's context — falling back to the bounded output tail saved in SQLite when the live log is gone (e.g. a finished job after a restart). This is the whole point: bounded output, no context blowups.
+
+**Hybrid persistence:** structured state lives in SQLite (`src/db.rs`) — OAuth tokens + job metadata + output tail, durable across restarts; the high-frequency, append-heavy live output stays a per-job log file on disk. SQLite only sees low-frequency writes (token issue/validate, job create/finish), so one serialized connection is ample. Jobs >24h old are reaped (startup + hourly).
 
 ## MCP tool design
 
@@ -75,7 +79,7 @@ Current tools (three, constant):
 
 | Tool | Params | Does |
 |---|---|---|
-| `bash` | `cmd`, `cwd?`, `timeout?`, `bg?`, `interactive?`, `title?` | run a command; inline if fast, else a job id (`bg` backgrounds at once; `interactive` sources `~/.bashrc` via `bash -ic` for aliases/version managers, default fast `sh -c`; `title` labels the job id as `<title>-HH:MM:SS`) |
+| `bash` | `cmd`, `cwd?`, `timeout?`, `bg?`, `interactive?`, `title?` | run a command; inline if fast, else a job id (`bg` backgrounds at once; `interactive` sources `~/.bashrc` via `bash -ic` for aliases/version managers, default fast `sh -c`; `title` labels the job id as `<title>-HH-MM-SS`) |
 | `job` | `action`, `id?`, `cursor?`, `limit?` | jobs by `action`: `poll` (paginated output), `list` (jobs + status), `kill` |
 | `file` | `action`, `path?`, `content?`, `pattern?`, `recursive?`, `src?`, `dest?`, `cursor?`, `limit?` | file ops by `action`: `read`/`write`/`append`/`delete`/`list`/`grep`/`move` |
 
@@ -127,10 +131,11 @@ Non-negotiable: SOLID, SRP, tested code. The bar: idiomatic, boring, readable Ru
 |---|---|
 | Startup, router wiring, CLI | `src/main.rs` |
 | Config / env / required creds | `src/config.rs` |
+| SQLite durable state (tokens, job metadata, output tail) | `src/db.rs` |
 | HTTP Basic auth | `src/auth.rs` |
 | OAuth 2.1 (discovery, registration, PKCE, bearer) | `src/oauth/` |
 | Running commands, backgrounding, job logs | `src/jobs/mod.rs` |
-| Reaper eviction + process-group kill helpers | `src/jobs/reaper.rs` |
+| Reaper (DB + log-file cleanup) + process-group kill helpers | `src/jobs/reaper.rs` |
 | Tool definitions / MCP surface | `src/tools/mod.rs` |
 | File operations | `src/tools/files.rs` |
 

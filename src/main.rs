@@ -3,6 +3,7 @@ mod app;
 mod auth;
 mod cli;
 mod config;
+mod db;
 mod jobs;
 mod oauth;
 mod tools;
@@ -52,10 +53,18 @@ async fn serve(port: Option<u16>) -> anyhow::Result<()> {
     }) {
         cfg.bind.set_port(p);
     }
+    // The single SQLite database (OAuth tokens + job metadata) under the systemd
+    // StateDirectory. Ensure its parent dir exists before opening it.
+    if let Some(parent) = cfg.db_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let database = db::Db::open(&cfg.db_path)?;
+
     let store = jobs::JobStore::new(
         cfg.job_dir.clone(),
         cfg.inline_timeout,
         jobs::Shell::interactive_bash(),
+        database.clone(),
     )?;
 
     let auth_state = oauth::AuthState {
@@ -63,7 +72,7 @@ async fn serve(port: Option<u16>) -> anyhow::Result<()> {
             user: cfg.user.clone(),
             pass: cfg.pass.clone(),
         },
-        store: Arc::new(oauth::Store::default()),
+        store: Arc::new(oauth::Store::new(database)),
         public_url: cfg.public_url.clone(),
     };
 

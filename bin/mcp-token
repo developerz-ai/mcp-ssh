@@ -11,7 +11,8 @@
 #
 # Credentials come from .env (MCP_SSH_USER/MCP_SSH_PASS) or the environment.
 # The base URL defaults to the local bind; override with $MCP_SSH_URL.
-# Tokens are short-lived (1h) and reset when the server restarts — re-run to refresh.
+# Access tokens last 24h (the response also carries a 30-day refresh_token for
+# silent renewal); all tokens reset when the server restarts — re-run to refresh.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."

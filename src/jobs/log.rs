@@ -77,6 +77,22 @@ pub async fn read_page(
     Ok(paginate(&all, cursor, limit))
 }
 
+/// Read the last `keep` lines of a log file, newline-joined with a trailing
+/// newline. Used to snapshot a finished job's output into the DB so the tail
+/// survives the live log later being trimmed or reaped. A missing/unreadable log
+/// propagates as the same typed error as `read_page`.
+pub async fn tail(path: &std::path::Path, keep: usize) -> Result<String, JobLogError> {
+    let bytes = tokio::fs::read(path).await?;
+    let content = String::from_utf8_lossy(&bytes);
+    let lines: Vec<&str> = content.lines().collect();
+    let start = lines.len().saturating_sub(keep);
+    let mut out = lines[start..].join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    Ok(out)
+}
+
 /// Slice `[cursor, …)` from already-split lines, bounded by BOTH the line `limit`
 /// and `MAX_PAGE_BYTES`, with each line clamped to `MAX_LINE_BYTES`. `next_cursor`
 /// reflects exactly how many lines were returned, so byte-capping never desyncs the

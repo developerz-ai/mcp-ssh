@@ -1,6 +1,6 @@
 [package]
 name = "mcp-ssh"
-version = "1.1.5"
+version = "1.2.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Remote shell + file access for AI agents over authenticated MCP-HTTP — an ssh replacement you talk to over /mcp"
@@ -33,6 +33,11 @@ schemars = "1"
 
 # time — local HH:MM stamped into human-readable job ids
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+# durable state: OAuth tokens/refresh + job metadata + saved output tails.
+# `bundled` compiles SQLite into the binary (no system libsqlite dep), keeping
+# the single-binary deploy. Accessed via spawn_blocking — see `src/db.rs`.
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 # cli + config
 clap = { version = "4", features = ["derive"] }

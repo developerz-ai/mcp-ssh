@@ -25,10 +25,14 @@ fn test_app() -> Router {
 
 fn test_app_with(public_url: Option<&str>) -> Router {
     let dir = tempfile::tempdir().unwrap().keep();
+    // One in-memory DB shared by the job store and the OAuth store, mirroring prod
+    // where both back onto the single SQLite database.
+    let database = crate::db::Db::memory();
     let jobs = JobStore::new(
         dir,
         std::time::Duration::from_secs(2),
         crate::jobs::Shell::sh(),
+        database.clone(),
     )
     .unwrap();
     let state = oauth::AuthState {
@@ -36,7 +40,7 @@ fn test_app_with(public_url: Option<&str>) -> Router {
             user: "admin".into(),
             pass: "secret".into(),
         },
-        store: Arc::new(oauth::Store::default()),
+        store: Arc::new(oauth::Store::new(database)),
         public_url: public_url.map(Into::into),
     };
     build(state, jobs, vec!["localhost".into(), "127.0.0.1".into()])
@@ -45,13 +49,15 @@ fn test_app_with(public_url: Option<&str>) -> Router {
 /// Build a test app with a pre-minted bearer token ready for session tests.
 async fn test_app_with_token() -> (Router, String) {
     let dir = tempfile::tempdir().unwrap().keep();
+    let database = crate::db::Db::memory();
     let jobs = JobStore::new(
         dir,
         std::time::Duration::from_secs(2),
         crate::jobs::Shell::sh(),
+        database.clone(),
     )
     .unwrap();
-    let oauth_store = Arc::new(oauth::Store::default());
+    let oauth_store = Arc::new(oauth::Store::new(database));
     let token = "test-bearer-token".to_string();
     oauth_store.insert_token(&token).await;
     let state = oauth::AuthState {

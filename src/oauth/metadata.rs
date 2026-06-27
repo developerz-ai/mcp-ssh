@@ -53,7 +53,7 @@ pub async fn authorization_server(
         "token_endpoint": format!("{base}/token"),
         "registration_endpoint": format!("{base}/register"),
         "response_types_supported": ["code"],
-        "grant_types_supported": ["authorization_code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["none"],
     }))
@@ -74,7 +74,7 @@ mod tests {
                 user: "u".into(),
                 pass: "p".into(),
             },
-            store: Arc::new(Store::default()),
+            store: Arc::new(Store::new(crate::db::Db::memory())),
             public_url: Some(url.into()),
         }
     }
@@ -85,7 +85,7 @@ mod tests {
                 user: "u".into(),
                 pass: "p".into(),
             },
-            store: Arc::new(Store::default()),
+            store: Arc::new(Store::new(crate::db::Db::memory())),
             public_url: None,
         }
     }

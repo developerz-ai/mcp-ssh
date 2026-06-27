@@ -10,6 +10,7 @@ mcp-ssh is **one binary**: an [rmcp](https://github.com/modelcontextprotocol/rus
 | Async runtime | tokio |
 | HTTP server | axum 0.8 |
 | MCP transport | rmcp 1.7 — **Streamable HTTP** at `/mcp` |
+| Durable state | SQLite via `rusqlite` (**bundled** — compiled into the binary) |
 | License | MIT |
 
 TLS is deliberately **not** in the binary (keeps deps minimal). A reverse proxy terminates HTTPS → [deploy.md](deploy.md).
@@ -20,12 +21,13 @@ TLS is deliberately **not** in the binary (keeps deps minimal). A reverse proxy 
 |---|---|
 | `main.rs` | Entry point. Boots tracing, loads config, builds the JobStore, mounts the rmcp `StreamableHttpService` at `/mcp`, wraps it in the auth middleware, serves it. |
 | `config.rs` | Runtime config from env + file. Fails fast at boot if credentials are missing. |
+| `db.rs` | The **SQLite durable-state layer** (`rusqlite`, bundled): OAuth tokens + job metadata + output tail. Created on first run at `/var/lib/mcp-ssh/mcp-ssh.db`, WAL mode; one serialized connection driven via `spawn_blocking`. |
 | `auth.rs` | The auth middleware — **bearer-only** guard on `/mcp`; rejects everything that is not a valid OAuth 2.1 access token. |
-| `oauth` | A minimal **OAuth 2.1 authorization server** (per the MCP authorization spec) so GUI clients can log in. |
-| `jobs/mod.rs` | The job engine: run a command, return inline-or-background (incl. immediate `bg`), paginated logs, and an hourly reaper that drops jobs >24h old. |
-| `jobs/id.rs` | JobId newtype: human-readable ids — neutral `job` prefix + local `HH:MM` (e.g., `job-23:30`); free of command text so secrets can't leak. |
+| `oauth` | A minimal **OAuth 2.1 authorization server** (per the MCP authorization spec) so GUI clients can log in. Tokens are persisted in SQLite, so logins survive a restart. |
+| `jobs/mod.rs` | The job engine: run a command, return inline-or-background (incl. immediate `bg`), paginated logs, and job metadata persisted to SQLite so history survives restarts. |
+| `jobs/id.rs` | JobId newtype: human-readable ids — neutral `job` prefix + local `HH-MM-SS` (e.g., `job-23-30-07`); free of command text so secrets can't leak. |
 | `jobs/log.rs` | Job log pagination: read log files by page (cursor + limit). |
-| `jobs/reaper.rs` | Hourly reaper evicts jobs >24h old; process-group kill helpers (TERM→KILL escalation). |
+| `jobs/reaper.rs` | Reaper (startup + hourly): deletes jobs >24h old (DB rows + log files), trims finished jobs' logs to a tail, mtime-ages orphaned files, marks jobs stuck in `running` across a restart as failed; process-group kill helpers (TERM→KILL escalation). |
 | `tools/mod.rs` | The MCP tool surface — **three tools** (`bash`/`job`/`file`) dispatching on an `action` param; thin adapters over `jobs` and `files`. |
 | `tools/files.rs` | File operations (read/write/append/delete/list/grep/move). |
 
@@ -59,12 +61,31 @@ When a command starts (`JobStore::run`):
    - **Finished in time** → `RunResult::Inline` — status + first page of the log, returned now.
    - **Still running (or `bg`)** → `RunResult::Backgrounded { id }` — the agent gets a job id to poll.
 
-Jobs live in an in-memory map keyed by human-readable id (e.g., `job-23:30`); the log files persist on disk under the job dir. An **hourly reaper** drops any job whose age exceeds 24h — evicting it from the map and deleting its log file — so the map and the job dir stay bounded without manual cleanup. Job ids are a neutral `job` prefix + local `HH:MM` — deliberately free of command text so a secret on the command line can't leak into an id, log line, or filename. For the same reason `job(action="list")` exposes only non-sensitive metadata — the id and status — never the command text (which could carry a pasted secret).
+Job **metadata** (id, title, status, exit code/error, start time, and a bounded output tail) is persisted to SQLite, so `job(action="list")` shows history across restarts; the live, append-heavy output streams to per-job **log files** on disk under the job dir (see [Durable state](#-durable-state-sqlite) below). The **reaper** runs on startup and hourly: it drops any job whose age exceeds 24h — deleting both its DB row and its log file — and trims finished jobs' logs to a tail, so the database and the job dir stay bounded without manual cleanup. Job ids are a neutral `job` prefix + local `HH-MM-SS` — deliberately free of command text so a secret on the command line can't leak into an id, log line, or filename. For the same reason `job(action="list")` exposes only non-sensitive metadata — the id and status — never the command text (which could carry a pasted secret).
 
 ```
 JobState = Running | Exited { code } | Failed { error }
 RunResult = Inline { state, page } | Backgrounded { id }
 ```
+
+## 💾 Durable state (SQLite)
+
+State splits along a **hybrid** seam — structured rows in SQLite, streaming output on the filesystem — each on the side it's good at.
+
+A single SQLite database at `/var/lib/mcp-ssh/mcp-ssh.db` (sibling of the job-log dir `/var/lib/mcp-ssh/logs/jobs`) is created automatically on first run, in WAL mode, by `db.rs`. SQLite is **compiled into the binary** via `rusqlite`'s `bundled` feature — still a single-binary deploy, no system `libsqlite` dependency. The reads/writes are blocking, so they run on `spawn_blocking`; one serialized connection is ample because the DB only sees **low-frequency** writes.
+
+**In SQLite — durable, survives restarts:**
+
+- **OAuth tokens** — `access_tokens` and `refresh_tokens` (token + expiry). Logins now survive a service restart instead of forcing a re-auth every time — which matters because the agent can self-update and restart itself. Access tokens last 24h; refresh tokens 1 year, rotated on use.
+- **Job metadata** — id, title, status (`running`/`exited`/`failed`), exit code or error, start time, and a saved **output tail**. This is what makes `job(action="list")` show history across restarts.
+
+**On the filesystem — the high-frequency path:**
+
+- Live job output streams to per-job log files in the job dir via a plain shell redirect. That append-heavy, high-frequency write pattern is exactly what SQLite is poor at, so it stays a file. SQLite only sees the bracketing events (token issue/validate, job create/finish).
+
+`job(action="poll")` reads the live **log file** if it's present, else falls back to the bounded **output tail** saved in SQLite — e.g. for a finished job whose log was trimmed or whose process is gone after a restart.
+
+The **reaper** (`jobs/reaper.rs`) keeps both halves bounded — see the execution model above: startup + hourly, it deletes jobs >24h old (DB rows **and** log files), trims finished jobs' logs to a tail (≈5000 lines while under 3h old, ≈500 after — bounded disk over long uptime), uses log-file mtime to age orphaned files left by a previous run, and marks any job still `running` after a restart as failed (its process is gone).
 
 ## 📄 The pagination model
 

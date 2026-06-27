@@ -9,25 +9,25 @@ Three tools — `bash`, `job`, `file` — each heavily parametrized. Their param
 | Outcome | What you get back |
 |---|---|
 | Finishes within the window | Status + the first page of output, **inline** |
-| Still running after the window | A **job id** (e.g., `job-23:30`) — monitor it with `job(action="poll")` |
+| Still running after the window | A **job id** (e.g., `job-23-30-07`) — monitor it with `job(action="poll")` |
 
 This is what makes a 20-minute build safe: it backgrounds automatically, and you stream the log a page at a time instead of dumping it all into context.
 
 ```text
 bash("cargo build --release")
-→ "job job-23:30 still running after the inline window. Poll it with job(action=\"poll\", id=\"job-23:30\")."
+→ "job job-23-30-07 still running after the inline window. Poll it with job(action=\"poll\", id=\"job-23-30-07\")."
 
-job(action="poll", id="job-23:30")
+job(action="poll", id="job-23-30-07")
 → {"status":"running"}
   Compiling mcp-ssh v0.1.0
   ...200 lines...
   [lines ..200 of 540; next_cursor=200]
 
-job(action="poll", id="job-23:30", cursor=200)
+job(action="poll", id="job-23-30-07", cursor=200)
 → ...next 200 lines...
   [lines ..400 of 540; next_cursor=400]
 
-job(action="poll", id="job-23:30", cursor=400)
+job(action="poll", id="job-23-30-07", cursor=400)
 → {"status":"exited","code":0}
   Finished `release` profile [optimized] target(s)
 ```
@@ -82,11 +82,11 @@ Manage jobs created by `bash`. `action` is one of `poll`, `list`, `kill`.
 `action="poll"` returns the job's status plus **one page** of merged stdout+stderr, with `next_cursor`/`has_more` so you walk long logs forward without flooding context. `action="list"` returns all jobs with their status (`running` / `exited` / `failed`). `action="kill"` kills a running job.
 
 ```
-job(action="poll", id="job-23:30")                       # first page
-job(action="poll", id="job-23:30", cursor=200)           # next page
-job(action="poll", id="job-23:30", cursor=400, limit=500)
+job(action="poll", id="job-23-30-07")                       # first page
+job(action="poll", id="job-23-30-07", cursor=200)           # next page
+job(action="poll", id="job-23-30-07", cursor=400, limit=500)
 job(action="list")                                                # all jobs + status
-job(action="kill", id="job-23:30")                       # kill a running job
+job(action="kill", id="job-23-30-07")                       # kill a running job
 ```
 
 ## 📁 Files
@@ -129,7 +129,7 @@ Config lives at `/etc/mcp-ssh/config.toml` (or override the path with `$MCP_SSH_
 | `MCP_SSH_USER` | — | Basic/OAuth username (set via `mcp-ssh set-auth`) |
 | `MCP_SSH_PASS` | — | password (set via `mcp-ssh set-auth`) |
 | `MCP_SSH_INLINE_TIMEOUT_SECS` | `2` | inline window before `bash` backgrounds |
-| `MCP_SSH_JOB_DIR` | `/var/lib/mcp-ssh/jobs` | where per-job log files live |
+| `MCP_SSH_JOB_DIR` | `/var/lib/mcp-ssh/logs/jobs` | where per-job log files live |
 | `MCP_SSH_ALLOWED_HOSTS` | `localhost,127.0.0.1` | hostnames accepted in the `Host` header (DNS-rebinding guard) — **set this to your public hostname** |
 
 ### Listen port

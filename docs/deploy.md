@@ -209,8 +209,21 @@ File: `/etc/mcp-ssh/config.toml` (or override the path with `$MCP_SSH_CONFIG`). 
 | `MCP_SSH_BIND` | `127.0.0.1:1337` | bind address — keep on loopback behind the proxy |
 | `MCP_SSH_USER` / `MCP_SSH_PASS` | — | credentials (prefer `mcp-ssh set-auth`) |
 | `MCP_SSH_INLINE_TIMEOUT_SECS` | `2` | inline window before `bash` backgrounds |
-| `MCP_SSH_JOB_DIR` | `/var/lib/mcp-ssh/jobs` | per-job log files |
+| `MCP_SSH_JOB_DIR` | `/var/lib/mcp-ssh/logs/jobs` | per-job log files |
 | `MCP_SSH_ALLOWED_HOSTS` | `localhost,127.0.0.1` | hostnames accepted in `Host` — **set to your public hostname** |
+
+### 💾 Durable state (SQLite)
+
+OAuth tokens and job history are persisted to a **SQLite database** at
+`/var/lib/mcp-ssh/mcp-ssh.db` (sibling of the job-log dir, under the systemd
+`StateDirectory`). It's **auto-created on first run** in WAL mode — no config or
+env var; SQLite is compiled into the binary (`rusqlite` bundled), so there's no
+system `libsqlite` to install. Because tokens survive a restart, clients stay
+logged in across service restarts and self-updates.
+
+**Backup:** it's a normal SQLite file — `sqlite3 /var/lib/mcp-ssh/mcp-ssh.db '.backup /path/backup.db'`
+(or just copy the file while the service is stopped). Losing it only forces a
+re-login and drops job history; nothing else depends on it.
 
 ## ⚠️ Hardening checklist
 
@@ -242,7 +255,9 @@ Once `https://your-host/mcp` is live:
   claude mcp list          # mcp-ssh: ... ✔ Connected
   ```
 
-  Tokens are short-lived (1h) and reset on restart — re-run `bin/mcp-token` to refresh.
-  For a stable long-lived setup, prefer a GUI client's OAuth flow.
+  Access tokens last 24h; the `/token` response also returns a 1-year
+  `refresh_token` (rotated on use) for silent renewal. Tokens are persisted in
+  SQLite, so they **survive a service restart** — no need to re-run `bin/mcp-token`
+  after every restart. For a stable long-lived setup, prefer a GUI client's OAuth flow.
 
 Tool reference → [usage.md](usage.md).

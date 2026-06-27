@@ -31,7 +31,7 @@ commands auto-background to a job id.
 - Anything >2s ⇒ `bg=true`, poll with `job action="poll"` (byte/line-capped, paginated via
   `cursor`/`limit` — chatty output never floods context).
 - `interactive=true` sources `~/.bashrc` (aliases, mise/nvm/rbenv); default is faster `sh -c`.
-- `title="deploy-check"` labels the job id (`deploy-check-HH:MM:SS`). Keep titles secret-free.
+- `title="deploy-check"` labels the job id (`deploy-check-HH-MM-SS`). Keep titles secret-free.
 - Use `file` for reads/edits/search (`grep` with `recursive=true`), not shelling out.
 
 ## Optional: autonomous coding tools (only if installed on the host)

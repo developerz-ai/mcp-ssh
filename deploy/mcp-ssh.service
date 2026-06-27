@@ -7,7 +7,7 @@ Type=simple
 User=mcp-ssh
 Group=mcp-ssh
 ExecStart=/usr/bin/mcp-ssh serve
-# Writes job dir `/var/lib/mcp-ssh/jobs`. StateDirectory creates the dir
+# Writes job dir `/var/lib/mcp-ssh/logs/jobs`. StateDirectory creates the dir
 # writable by the service user even with ProtectSystem=full.
 StateDirectory=mcp-ssh
 # Optional env overrides. Config credentials live at `/etc/mcp-ssh/config.toml`

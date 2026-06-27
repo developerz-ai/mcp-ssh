@@ -52,7 +52,7 @@ A small, heavily-parametrized surface — **three resource-oriented tools**, com
 
 | Tool | Params | What it does |
 |---|---|---|
-| `bash` | `cmd`, `cwd?`, `timeout?`, `bg?`, `interactive?`, `title?` | Run a shell command. Returns output inline if it finishes within the inline window (default 2s), else a **job id** to monitor with `job`. `timeout` overrides the inline window; `bg=true` backgrounds immediately; `interactive=true` sources `~/.bashrc`; `title` labels the job id (`<title>-HH:MM:SS`). Output is byte/line-capped per page. |
+| `bash` | `cmd`, `cwd?`, `timeout?`, `bg?`, `interactive?`, `title?` | Run a shell command. Returns output inline if it finishes within the inline window (default 2s), else a **job id** to monitor with `job`. `timeout` overrides the inline window; `bg=true` backgrounds immediately; `interactive=true` sources `~/.bashrc`; `title` labels the job id (`<title>-HH-MM-SS`). Output is byte/line-capped per page. |
 | `job` | `action`, `id?`, `cursor?`, `limit?` | Manage jobs. `action="poll"` → status + **one page** of merged stdout+stderr (default 200 lines, byte-capped, with `next_cursor`/`has_more`); `action="list"` → all jobs + status; `action="kill"` → kill running job `id`. |
 | `file` | `action`, `path?`, `content?`, `pattern?`, `recursive?`, `src?`, `dest?`, `cursor?`, `limit?` | File operations by `action`: `read` (paginated), `write`, `append`, `delete`, `list` (`recursive` for the tree), `grep` (`pattern`, `recursive` under a dir), `move` (`src`→`dest`). |
 
@@ -71,7 +71,9 @@ Headless client (the `claude` CLI, curl) with no browser? Mint a bearer with [`b
 
 `/mcp` is **bearer-only** — all MCP clients must authenticate via OAuth 2.1. Claude and every
 spec-compliant GUI client run this flow automatically; you just log in with the username/password
-you set via `mcp-ssh set-auth`.
+you set via `mcp-ssh set-auth`. Tokens (and job history) are persisted to a bundled SQLite database,
+so **logins and job history survive a service restart** — handy since the agent can self-update and
+restart itself.
 
 Set the credentials once:
 
@@ -123,7 +125,7 @@ Treat it accordingly:
 
 ## 🧬 Stack
 
-Rust 2024 · tokio · axum 0.8 · [rmcp](https://github.com/modelcontextprotocol/rust-sdk) 1.7 (MCP Streamable HTTP).
+Rust 2024 · tokio · axum 0.8 · [rmcp](https://github.com/modelcontextprotocol/rust-sdk) 1.7 (MCP Streamable HTTP) · [rusqlite](https://github.com/rusqlite/rusqlite) (bundled SQLite — durable state, no system libsqlite).
 
 ## 📄 License
 

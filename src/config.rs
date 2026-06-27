@@ -14,6 +14,8 @@ pub struct Config {
     pub inline_timeout: Duration,
     /// Where per-job log files live.
     pub job_dir: PathBuf,
+    /// SQLite database file (OAuth tokens + job metadata + output tail).
+    pub db_path: PathBuf,
     /// Hostnames accepted in the `Host` header (rmcp DNS-rebinding guard).
     pub allowed_hosts: Vec<String>,
     /// Public base URL (e.g. https://mcp.example.com). When unset, OAuth metadata
@@ -29,6 +31,7 @@ pub struct FileConfig {
     pub pass: Option<String>,
     pub inline_timeout_secs: Option<u64>,
     pub job_dir: Option<String>,
+    pub db_path: Option<String>,
     pub allowed_hosts: Option<Vec<String>>,
     pub public_url: Option<String>,
 }
@@ -97,7 +100,16 @@ impl Config {
             env,
             "MCP_SSH_JOB_DIR",
             file.job_dir,
-            "/var/lib/mcp-ssh/jobs",
+            "/var/lib/mcp-ssh/logs/jobs",
+        ));
+
+        // SQLite DB at the StateDirectory root, independent of the (deeper) job-log
+        // dir so moving logs around never drags the database with them.
+        let db_path = PathBuf::from(pick(
+            env,
+            "MCP_SSH_DB",
+            file.db_path,
+            "/var/lib/mcp-ssh/mcp-ssh.db",
         ));
 
         let allowed_hosts = match env.get("MCP_SSH_ALLOWED_HOSTS") {
@@ -127,6 +139,7 @@ impl Config {
             pass,
             inline_timeout: Duration::from_secs(inline_timeout),
             job_dir,
+            db_path,
             allowed_hosts,
             public_url,
         })
