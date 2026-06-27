@@ -77,6 +77,22 @@ pub async fn read_page(
     Ok(paginate(&all, cursor, limit))
 }
 
+/// Like [`read_page`] but indexed from the END — the newest output is the first
+/// page. Used by `job(action="poll")` so monitoring a long-running job shows its
+/// latest output without paging to the end first. `file read` keeps the forward
+/// [`read_page`].
+pub async fn read_page_tail(
+    path: &std::path::Path,
+    cursor: usize,
+    limit: usize,
+) -> Result<Page, JobLogError> {
+    let limit = limit.max(1);
+    let bytes = tokio::fs::read(path).await?;
+    let content = String::from_utf8_lossy(&bytes);
+    let all: Vec<&str> = content.lines().collect();
+    Ok(paginate_tail(&all, cursor, limit))
+}
+
 /// Read the last `keep` lines of a log file, newline-joined with a trailing
 /// newline. Used to snapshot a finished job's output into the DB so the tail
 /// survives the live log later being trimmed or reaped. A missing/unreadable log
@@ -123,6 +139,44 @@ pub fn paginate(all: &[&str], cursor: usize, limit: usize) -> Page {
         next_cursor: end,
         total_lines: total,
         has_more: end < total,
+    }
+}
+
+/// Like [`paginate`], but indexed from the END: `cursor` is how many of the newest
+/// lines have already been consumed, so cursor 0 returns the newest `limit` lines
+/// and `next_cursor` walks *backward* into history. Lines stay in chronological
+/// order *within* the page (a stack trace still reads top-to-bottom); only the page
+/// window moves newest-first. Same `MAX_PAGE_BYTES` / `MAX_LINE_BYTES` ceilings as
+/// `paginate`, trimmed from the OLDEST end of the window so the newest line is
+/// always kept. Used by `job(action="poll")`.
+pub fn paginate_tail(all: &[&str], cursor: usize, limit: usize) -> Page {
+    let limit = limit.max(1);
+    let total = all.len();
+    let from_end = cursor.min(total);
+    // Exclusive upper bound of this page; the window is the `limit` lines ending here.
+    let end = total - from_end;
+    let mut picked: Vec<String> = Vec::new();
+    let mut bytes = 0usize;
+    let mut i = end;
+    // Walk backward from `end`, newest first, honoring the line + byte budgets.
+    while i > 0 && picked.len() < limit {
+        let line = clamp_line(all[i - 1]);
+        // Always take at least one line, then stop before exceeding the budget.
+        if !picked.is_empty() && bytes + line.len() + 1 > MAX_PAGE_BYTES {
+            break;
+        }
+        bytes += line.len() + 1; // +1 for the newline the agent sees between lines
+        picked.push(line);
+        i -= 1;
+    }
+    // `i` is the index of the oldest line NOT included — older output remains iff > 0.
+    picked.reverse(); // back to chronological order within the page
+    let returned = picked.len();
+    Page {
+        lines: picked,
+        next_cursor: cursor + returned,
+        total_lines: total,
+        has_more: i > 0,
     }
 }
 
@@ -219,6 +273,52 @@ mod tests {
         assert!(
             !page.has_more,
             "both lines fit once the huge one is clamped"
+        );
+    }
+
+    #[test]
+    fn paginate_tail_returns_newest_window_first_in_order() {
+        let owned: Vec<String> = (1..=10).map(|i| i.to_string()).collect();
+        let all: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+
+        // cursor 0 → newest 3 lines, still chronological within the page.
+        let p0 = paginate_tail(&all, 0, 3);
+        assert_eq!(p0.lines, vec!["8", "9", "10"], "newest window, in order");
+        assert_eq!(p0.next_cursor, 3, "advances backward by lines returned");
+        assert_eq!(p0.total_lines, 10);
+        assert!(p0.has_more, "older lines remain");
+
+        // cursor 3 → the previous (older) window.
+        let p1 = paginate_tail(&all, 3, 3);
+        assert_eq!(p1.lines, vec!["5", "6", "7"]);
+        assert_eq!(p1.next_cursor, 6);
+        assert!(p1.has_more);
+
+        // Walk to the oldest line: no more history past it.
+        let p3 = paginate_tail(&all, 9, 3);
+        assert_eq!(p3.lines, vec!["1"], "only the oldest line is left");
+        assert!(!p3.has_more, "nothing older remains");
+    }
+
+    #[test]
+    fn paginate_tail_caps_bytes_keeping_the_newest() {
+        // Each line ~1 KB; a page must stay under the byte budget and keep the
+        // NEWEST lines (trim the oldest end of the window).
+        let owned: Vec<String> = (0..1000).map(|i| format!("{i:01000}")).collect();
+        let all: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+        let page = paginate_tail(&all, 0, DEFAULT_PAGE);
+        let returned: usize = page.lines.iter().map(|l| l.len() + 1).sum();
+        assert!(
+            returned <= MAX_PAGE_BYTES,
+            "byte budget honored: {returned}"
+        );
+        assert!(page.has_more, "older lines remain");
+        // The very last (newest) line must be present and last in the page.
+        assert_eq!(page.lines.last().unwrap(), all.last().unwrap());
+        assert_eq!(
+            page.next_cursor,
+            page.lines.len(),
+            "next_cursor tracks lines returned so backward paging stays in sync"
         );
     }
 

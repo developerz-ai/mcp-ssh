@@ -17,7 +17,7 @@ mod log;
 mod reaper;
 
 pub use id::JobId;
-use log::{DEFAULT_PAGE, read_page};
+use log::{DEFAULT_PAGE, read_page, read_page_tail};
 pub use log::{JobLogError, Page, paginate};
 pub(crate) use reaper::kill_group;
 use reaper::{kill_job, spawn_reaper};
@@ -86,17 +86,12 @@ async fn persist_final(
     }
 }
 
-/// Render a saved output tail (already bounded at write time) as a single terminal
-/// page: there is no live log left to fetch, so `has_more` is false.
-fn page_from_tail(tail: &str) -> Page {
-    let lines: Vec<String> = tail.lines().map(str::to_string).collect();
-    let total = lines.len();
-    Page {
-        lines,
-        next_cursor: total,
-        total_lines: total,
-        has_more: false,
-    }
+/// Render a saved output tail (already bounded at write time) the same newest-first
+/// way the live log is polled, so a finished job whose log was reaped paginates
+/// consistently — cursor 0 is the newest saved lines, paging back through the tail.
+fn page_from_tail(tail: &str, cursor: usize, limit: usize) -> Page {
+    let lines: Vec<&str> = tail.lines().collect();
+    log::paginate_tail(&lines, cursor, limit)
 }
 
 /// Process group id to signal on kill. Wrapping the raw pid keeps this
@@ -417,7 +412,11 @@ impl JobStore {
             // above and this read. If the log is gone *and* the id is no longer
             // tracked, that's the stable "unknown job" result, not a read fault —
             // re-check membership so an eviction race doesn't surface as an error.
-            let page = match read_page(&job.log_path, cursor, limit.unwrap_or(DEFAULT_PAGE)).await {
+            // Newest-first: cursor 0 is the latest output, so polling a long-running
+            // job shows what's happening now without paging to the end.
+            let page = match read_page_tail(&job.log_path, cursor, limit.unwrap_or(DEFAULT_PAGE))
+                .await
+            {
                 Ok(page) => page,
                 Err(JobLogError::Read(error)) if error.kind() == std::io::ErrorKind::NotFound => {
                     if self.jobs.lock().await.contains_key(id) {
@@ -472,10 +471,11 @@ impl JobStore {
         };
         let state = state_from_columns(&status, code.map(|c| c as i32), error);
         let log_path = self.dir.join(format!("{id}.log"));
-        let page = match read_page(&log_path, cursor, limit.unwrap_or(DEFAULT_PAGE)).await {
+        let limit = limit.unwrap_or(DEFAULT_PAGE);
+        let page = match read_page_tail(&log_path, cursor, limit).await {
             Ok(page) => page,
             Err(JobLogError::Read(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                page_from_tail(tail.as_deref().unwrap_or(""))
+                page_from_tail(tail.as_deref().unwrap_or(""), cursor, limit)
             }
             Err(error) => return Err(error),
         };
@@ -671,15 +671,16 @@ mod tests {
         };
         assert!(page.has_more, "output exceeds one page");
         assert_eq!(page.lines.len(), DEFAULT_PAGE, "first page is capped");
-        // The id is live in the store: poll the continuation.
+        // The id is live in the store. Poll is newest-first, so cursor 0 returns the
+        // latest output — the final line `n` must be on that first page.
         let (_state, rest) = store
-            .poll(&id, page.next_cursor, None)
+            .poll(&id, 0, None)
             .await
             .unwrap()
             .expect("inline job stays in the store");
         assert!(
             rest.lines.iter().any(|l| l == &n.to_string()),
-            "the tail must be reachable via poll"
+            "the newest output (incl. the last line) must be reachable via poll"
         );
     }
 

@@ -69,7 +69,7 @@ Files ≤300 LOC. One responsibility per module (SRP). Split when a module grows
 
 ## Execution model
 
-`bash` runs a command. Finishes within `MCP_SSH_INLINE_TIMEOUT_SECS` (default 2) → output returns inline. Slower (or `bg=true`) → auto-backgrounds to a **job id**; live output streams to a per-job log file. `job(action="poll")` paginates that log (cursor/limit) so a chatty command never floods the agent's context — falling back to the bounded output tail saved in SQLite when the live log is gone (e.g. a finished job after a restart). This is the whole point: bounded output, no context blowups.
+`bash` runs a command. Finishes within `MCP_SSH_INLINE_TIMEOUT_SECS` (default 2) → output returns inline. Slower (or `bg=true`) → auto-backgrounds to a **job id**; live output streams to a per-job log file. `job(action="poll")` paginates that log **newest-first** (cursor 0 = latest output; page back with cursor) so a chatty command never floods the agent's context and monitoring a long job shows what's happening now — falling back to the bounded output tail saved in SQLite when the live log is gone (e.g. a finished job after a restart). This is the whole point: bounded output, no context blowups.
 
 **Hybrid persistence:** structured state lives in SQLite (`src/db.rs`) — OAuth tokens + job metadata + output tail, durable across restarts; the high-frequency, append-heavy live output stays a per-job log file on disk. SQLite only sees low-frequency writes (token issue/validate, job create/finish), so one serialized connection is ample. Jobs >24h old are reaped (startup + hourly).
 

@@ -100,7 +100,8 @@ pub struct JobArgs {
     pub action: JobAction,
     /// [poll, kill] job id.
     pub id: Option<String>,
-    /// [poll] line offset to start from (default 0).
+    /// [poll] how many of the newest lines to skip. 0 (default) returns the most
+    /// recent page; pass the previous response's next_cursor to page further back.
     pub cursor: Option<usize>,
     /// [poll] max lines to return (default 200).
     pub limit: Option<usize>,
@@ -189,13 +190,13 @@ impl Tools {
             {
                 Ok(RunResult::Inline { id, state, page }) => {
                     let mut out = render(&state, &page);
-                    // Output overflowed the first page: the job is still in the
-                    // store, so hand back its id to fetch the rest instead of
-                    // stranding the agent with a dead cursor.
+                    // Output overflowed this first (top-of-output) page: the job is
+                    // still in the store, so hand back its id. `job poll` is
+                    // newest-first, so point at the latest rather than a forward
+                    // cursor this page's reading order wouldn't match.
                     if page.has_more {
                         out.push_str(&format!(
-                            "\nfull output continues — fetch the rest with job(action=\"poll\", id=\"{id}\", cursor={}).",
-                            page.next_cursor
+                            "\noutput continues — see the latest with job(action=\"poll\", id=\"{id}\"), then page back with cursor."
                         ));
                     }
                     Ok(ok(out))
@@ -211,7 +212,7 @@ impl Tools {
     }
 
     #[tool(
-        description = "Manage background jobs created by `bash`. action=poll returns a paginated page (cursor/limit) of job `id`'s output + status — page through long logs without flooding context; action=list lists all jobs; action=kill kills job `id`."
+        description = "Manage background jobs created by `bash`. action=poll returns job `id`'s output + status newest-first: call it with no cursor to see the most recent output of a long-running job, then page *back* through history with cursor=next_cursor (each page is itself in chronological order). action=list lists all jobs; action=kill kills job `id`."
     )]
     async fn job(
         &self,
@@ -231,7 +232,16 @@ impl Tools {
                         .poll(&id, args.cursor.unwrap_or(0), args.limit)
                         .await
                     {
-                        Ok(Some((state, page))) => Ok(ok(render(&state, &page))),
+                        Ok(Some((state, page))) => {
+                            let mut out = render(&state, &page);
+                            if page.has_more {
+                                out.push_str(&format!(
+                                    "\nolder output remains — page back with job(action=\"poll\", id=\"{id}\", cursor={}).",
+                                    page.next_cursor
+                                ));
+                            }
+                            Ok(ok(out))
+                        }
                         Ok(None) => Ok(err(format!("no such job: {id}"))),
                         Err(e) => Ok(err(e.to_string())),
                     }
@@ -337,9 +347,12 @@ fn render(state: &JobState, page: &Page) -> String {
     s.push('\n');
     s.push_str(&page.lines.join("\n"));
     if page.has_more {
+        // Navigation hint (which cursor to pass next) is appended by the caller,
+        // since `bash` reads forward from the top and `job poll` reads newest-first.
         s.push_str(&format!(
-            "\n[lines ..{} of {}; next_cursor={}]",
-            page.next_cursor, page.total_lines, page.next_cursor
+            "\n[{} of {} lines shown]",
+            page.lines.len(),
+            page.total_lines
         ));
     }
     s

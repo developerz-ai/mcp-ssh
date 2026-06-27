@@ -28,7 +28,9 @@ pub async fn read(path: &str, cursor: usize, limit: usize) -> Result<String, Str
     let bytes = fs::read(path).await.map_err(|e| e.to_string())?;
     let owned = String::from_utf8_lossy(&bytes).into_owned();
     let lines: Vec<&str> = owned.lines().collect();
-    // Same byte/line ceilings and cursor semantics as `job(action="poll")`.
+    // Forward pagination from the top (cursor 0 = first line): a file is read
+    // start-to-end. (`job poll` instead reads newest-first — a live log's latest
+    // output matters most.) Same byte/line ceilings via `paginate`.
     let page = crate::jobs::paginate(&lines, cursor, limit);
     let body = page.lines.join("\n");
     if page.has_more {
