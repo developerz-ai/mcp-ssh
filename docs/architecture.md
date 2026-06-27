@@ -59,7 +59,7 @@ When a command starts (`JobStore::run`):
    - **Finished in time** → `RunResult::Inline` — status + first page of the log, returned now.
    - **Still running (or `bg`)** → `RunResult::Backgrounded { id }` — the agent gets a job id to poll.
 
-Jobs live in an in-memory map keyed by human-readable id (e.g., `job-23:30`); the log files persist on disk under the job dir. An **hourly reaper** drops any job whose age exceeds 24h — evicting it from the map and deleting its log file — so the map and the job dir stay bounded without manual cleanup. Job ids are a neutral `job` prefix + local `HH:MM` — deliberately free of command text so a secret on the command line can't leak into an id, log line, or filename; the full command stays available via `job(action="list")`.
+Jobs live in an in-memory map keyed by human-readable id (e.g., `job-23:30`); the log files persist on disk under the job dir. An **hourly reaper** drops any job whose age exceeds 24h — evicting it from the map and deleting its log file — so the map and the job dir stay bounded without manual cleanup. Job ids are a neutral `job` prefix + local `HH:MM` — deliberately free of command text so a secret on the command line can't leak into an id, log line, or filename. For the same reason `job(action="list")` exposes only non-sensitive metadata — the id and status — never the command text (which could carry a pasted secret).
 
 ```
 JobState = Running | Exited { code } | Failed { error }

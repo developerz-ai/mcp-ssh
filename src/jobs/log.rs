@@ -39,6 +39,10 @@ pub async fn read_page(
     cursor: usize,
     limit: usize,
 ) -> Result<Page, JobLogError> {
+    // A zero limit would yield an empty page whose `next_cursor == cursor` with
+    // `has_more` still true, so a client advancing on `next_cursor` would spin
+    // forever on the same window. Clamp to at least one line.
+    let limit = limit.max(1);
     // A failed read (missing/unreadable log) propagates as a typed error. Only
     // non-UTF-8 *content* is rendered lossily: a command that writes raw bytes
     // (compiled output, escape sequences) must not produce a silently-empty page.
@@ -83,6 +87,19 @@ mod tests {
             "binary log must not produce empty page"
         );
         assert!(page.lines[0].contains("line1"));
+    }
+
+    #[tokio::test]
+    async fn read_page_clamps_zero_limit_to_avoid_infinite_loop() {
+        // limit=0 must not produce an empty, non-advancing page: a client paging
+        // on next_cursor would otherwise loop forever on the same window.
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("multi.log");
+        tokio::fs::write(&log, b"a\nb\nc\n").await.unwrap();
+        let page = read_page(&log, 0, 0).await.unwrap();
+        assert_eq!(page.lines.len(), 1, "zero limit must clamp to one line");
+        assert!(page.next_cursor > 0, "cursor must advance past the start");
+        assert!(page.has_more, "more lines remain after the clamped page");
     }
 
     #[tokio::test]
