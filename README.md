@@ -86,7 +86,15 @@ mcp-ssh set-auth admin     # prompts for the password
 ```bash
 mcp-ssh serve              # run the server (this is the default)
 mcp-ssh set-auth <user>    # configure the username/password
+
+mcp-ssh jobs               # list running jobs (--all includes finished ones)
+mcp-ssh job kill <id>      # SIGTERM then SIGKILL a job's process group
+mcp-ssh sessions           # summarise OAuth logins (token counts + next expiry)
 ```
+
+`jobs`/`job kill`/`sessions` read the same SQLite state the server uses, so they
+work from any shell on the host (no auth needed); `sessions` never prints token
+values.
 
 ## ⚠️ Security
 
