@@ -26,7 +26,7 @@
 | Logging | tracing |
 | Auth | OAuth 2.1 (MCP spec, for Claude) + HTTP Basic (simple clients) |
 | TLS | reverse proxy — **not** in the binary |
-| CLI | `mcp-ssh serve`, `mcp-ssh set-auth <user>` |
+| CLI | `mcp-ssh serve`, `mcp-ssh set-auth <user>`, `mcp-ssh jobs [--all]`, `mcp-ssh job kill <id>`, `mcp-ssh sessions` |
 
 Deps pinned to latest stable at implementation time.
 
@@ -51,15 +51,17 @@ Keep this accurate — it's the navigation aid.
 
 | Module | Owns |
 |---|---|
-| `src/main.rs` | entry: CLI parse, config load, build axum router, serve |
-| `src/config.rs` | env + TOML file config; fails fast if auth creds missing |
+| `src/main.rs` | entry: CLI parse, config load, build axum router, serve; dispatches admin subcommands |
+| `src/cli.rs` | clap command definitions (`serve`/`set-auth`/`jobs`/`job kill`/`sessions`) |
+| `src/admin.rs` | local admin subcommands (`jobs`/`job kill`/`sessions`): read/act on the same SQLite directly — never builds a `JobStore` (that would start a reaper + reconcile and fail the live server's running rows). Never prints token values |
+| `src/config.rs` | env + TOML file config; fails fast if auth creds missing. `db_path()` resolves the DB path alone for the cred-free admin commands |
 | `src/db.rs` | SQLite durable-state layer (`rusqlite`, `bundled`): OAuth `access_tokens`/`refresh_tokens` + job metadata + output tail. DB at `/var/lib/mcp-ssh/mcp-ssh.db`, WAL, auto-created; one serialized connection driven via `spawn_blocking` |
 | `src/auth.rs` | HTTP Basic auth middleware |
 | `src/oauth/` | minimal OAuth 2.1 server: discovery metadata, dynamic client registration, authorize + token with PKCE, bearer validation; tokens persisted in SQLite (`src/db.rs`) so logins survive a restart |
 | `src/jobs/mod.rs` | job engine: run a command, return inline if fast (<2s) else a job id (or immediately when `bg`); live output streams to a per-job log file (polled paginated), metadata + output tail persisted to SQLite so history survives restarts |
 | `src/jobs/id.rs` | JobId newtype: human-readable ids — neutral `job` prefix + local `HH-MM-SS` (e.g., `job-23-30-07`); free of command text so secrets can't leak into an id, log line, or filename |
 | `src/jobs/log.rs` | job log pagination: read per-job log files by page (cursor + limit) |
-| `src/jobs/reaper.rs` | reaper (startup + hourly): drops jobs >24h old (DB rows + log files, killing any still-`Running` group first), trims finished jobs' logs to a trailing tail (5000 lines <3h old, 500 after), mtime-ages orphaned files from a previous run, marks jobs stuck `running` across a restart as failed; process-group kill helpers (TERM→KILL escalation), shared with `job(action="kill")` |
+| `src/jobs/reaper.rs` | reaper (startup + hourly): drops jobs >24h old (DB rows + log files, killing any still-`Running` group first), trims finished jobs' logs to a trailing tail (5000 lines <3h old, 500 after), mtime-ages orphaned files from a previous run, marks jobs stuck `running` across a restart as failed; process-group kill helpers (TERM→KILL escalation), shared with `job(action="kill")` and the `mcp-ssh job kill` CLI (`kill_group` by persisted pgid) |
 | `src/tools/mod.rs` | MCP tool surface (`#[tool_router]`/`#[tool]` from rmcp): 3 tools (`bash`/`job`/`file`) dispatching on `action`. Thin adapters over jobs + files |
 | `src/tools/files.rs` | file operations (`tokio::fs`; `ls`/`find`/`grep` shelled out) |
 

@@ -58,6 +58,48 @@ pub(super) async fn kill_job(job: &Job) -> bool {
     true
 }
 
+/// Kill a process group by raw pgid, for callers that hold no in-process `Job`
+/// (the `mcp-ssh job kill` CLI, which acts on the persisted pgid). `SIGTERM`,
+/// then `SIGKILL` if the group outlives a short grace. Returns whether the group
+/// is gone afterwards. Liveness is probed with `kill -0` rather than a completion
+/// flag — the group's real parent (the server, or init after a restart) reaps the
+/// exited process, so no zombie lingers to read as alive.
+pub(crate) async fn kill_group(pgid: u32) -> bool {
+    let pg = ProcessGroupId(pgid);
+    if !group_alive(pgid).await {
+        return true; // nothing to signal — already gone
+    }
+    let _ = signal_group(pg, "TERM").await;
+    let start = tokio::time::Instant::now();
+    while start.elapsed() < KILL_GRACE {
+        if !group_alive(pgid).await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    if group_alive(pgid).await {
+        let _ = signal_group(pg, "KILL").await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    !group_alive(pgid).await
+}
+
+/// True if process group `pgid` still has at least one member. `kill -0` delivers
+/// no signal, only checks deliverability; stdio is discarded so a "No such
+/// process" line never reaches the terminal.
+async fn group_alive(pgid: u32) -> bool {
+    tokio::process::Command::new("kill")
+        .arg("-0")
+        .arg("--")
+        .arg(format!("-{pgid}"))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 /// Send `signal` (`"TERM"`, `"KILL"`, …) to process group `pgid`. The negative
 /// pid targets the whole group so descendants die too, not just `sh`; `--` stops
 /// `kill` reading it as an option. Returns whether the signal was delivered.
@@ -354,6 +396,40 @@ mod tests {
     async fn lines_of(path: &Path) -> Vec<String> {
         let s = tokio::fs::read_to_string(path).await.unwrap();
         s.lines().map(str::to_string).collect()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_group_terminates_a_detached_group() {
+        use std::process::Stdio;
+        // Leader of its own group (pgid == pid), like a real job's shell.
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 300")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id().expect("child pid");
+        // Reap in the background so the signalled child leaves no zombie — mirrors
+        // the real parent (server/init) reaping it, which is what `group_alive`
+        // assumes.
+        let waiter = tokio::spawn(async move { child.wait().await });
+
+        assert!(
+            kill_group(pid).await,
+            "group should be gone after kill_group"
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(2), waiter).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_group_on_dead_pgid_reports_gone() {
+        // A pgid with no live members must read as already-gone, not hang.
+        assert!(kill_group(2_000_000_000).await);
     }
 
     #[tokio::test]

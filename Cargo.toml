@@ -1,6 +1,6 @@
 [package]
 name = "mcp-ssh"
-version = "1.2.2"
+version = "1.2.3"
 edition = "2024"
 rust-version = "1.85"
 description = "Remote shell + file access for AI agents over authenticated MCP-HTTP — an ssh replacement you talk to over /mcp"

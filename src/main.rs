@@ -1,4 +1,5 @@
 //! mcp-ssh — remote shell + file access for AI agents over authenticated MCP-HTTP.
+mod admin;
 mod app;
 mod auth;
 mod cli;
@@ -12,7 +13,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 
-use cli::{Cli, Command};
+use cli::{Cli, Command, JobCommand};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -29,6 +30,11 @@ async fn main() -> anyhow::Result<()> {
     {
         Command::Serve { port } => serve(port).await,
         Command::SetAuth { user } => set_auth(user),
+        Command::Jobs { all } => admin::jobs(all).await,
+        Command::Job {
+            action: JobCommand::Kill { id },
+        } => admin::kill(&id).await,
+        Command::Sessions => admin::sessions().await,
     }
 }
 

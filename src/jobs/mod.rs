@@ -19,6 +19,7 @@ mod reaper;
 pub use id::JobId;
 use log::{DEFAULT_PAGE, read_page};
 pub use log::{JobLogError, Page, paginate};
+pub(crate) use reaper::kill_group;
 use reaper::{kill_job, spawn_reaper};
 
 /// Lines of a finished job's output snapshotted into the DB. Bounds the row so the
@@ -330,12 +331,15 @@ impl JobStore {
         {
             let db = self.db.clone();
             let row_id = id.as_ref().to_string();
+            // Persist the pgid so `mcp-ssh job kill` can signal the group even when
+            // this process no longer tracks the job (e.g. after a restart).
+            let pgid_val = pgid.map(|p| p.0 as i64);
             if let Err(error) = db
                 .call(move |conn| {
                     conn.execute(
-                        "INSERT INTO jobs (id, title, status, code, error, started_unix, output_tail) \
-                         VALUES (?1, ?2, 'running', NULL, NULL, ?3, NULL)",
-                        rusqlite::params![row_id, title, started],
+                        "INSERT INTO jobs (id, title, status, code, error, started_unix, output_tail, pgid) \
+                         VALUES (?1, ?2, 'running', NULL, NULL, ?3, NULL, ?4)",
+                        rusqlite::params![row_id, title, started, pgid_val],
                     )
                 })
                 .await

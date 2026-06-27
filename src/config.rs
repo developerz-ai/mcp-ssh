@@ -146,6 +146,24 @@ impl Config {
     }
 }
 
+/// Resolve just the SQLite path: env `MCP_SSH_DB`, else the file's `db_path`, else
+/// the default. The admin subcommands (`jobs`/`job kill`/`sessions`) touch only the
+/// database, so they resolve it this way instead of `Config::load`, which requires
+/// auth credentials they don't need.
+pub fn db_path() -> PathBuf {
+    db_path_in(&ProcessEnv)
+}
+
+fn db_path_in(env: &dyn EnvSource) -> PathBuf {
+    let file = load_file(&config_path(env)).unwrap_or_default();
+    PathBuf::from(pick(
+        env,
+        "MCP_SSH_DB",
+        file.db_path,
+        "/var/lib/mcp-ssh/mcp-ssh.db",
+    ))
+}
+
 /// Write `user`/`pass` into the config file, preserving other fields. Chmod 600.
 pub fn set_auth(user: &str, pass: &str) -> Result<PathBuf, ConfigError> {
     set_auth_in(&ProcessEnv, user, pass)

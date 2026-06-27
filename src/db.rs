@@ -29,7 +29,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     code         INTEGER,         -- exit code when status = 'exited'
     error        TEXT,            -- message when status = 'failed'
     started_unix INTEGER NOT NULL,
-    output_tail  TEXT             -- bounded tail, saved when the job finishes
+    output_tail  TEXT,            -- bounded tail, saved when the job finishes
+    pgid         INTEGER          -- process group id, so `mcp-ssh job kill` can signal it
 );
 ";
 
@@ -49,6 +50,9 @@ impl Db {
         conn.pragma_update(None, "busy_timeout", 5000)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
+        // Forward-only migration for databases created before `jobs.pgid` existed
+        // (CREATE TABLE IF NOT EXISTS won't add a column to an existing table).
+        ensure_column(&conn, "jobs", "pgid", "INTEGER")?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -79,6 +83,24 @@ impl Db {
         .await
         .expect("db blocking task panicked")
     }
+}
+
+/// Add `column` to `table` if it isn't already present — a tiny idempotent
+/// migration. `table`/`column`/`decl` are compile-time constants (never user
+/// input), so interpolating them into the DDL is injection-safe.
+fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> rusqlite::Result<()> {
+    let present = {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let names = stmt.query_map([], |r| r.get::<_, String>(1))?;
+        names.filter_map(Result::ok).any(|name| name == column)
+    };
+    if !present {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 /// Seconds since the Unix epoch, the on-disk time unit for every expiry/timestamp.
@@ -117,5 +139,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(exp, 123);
+    }
+
+    #[test]
+    fn ensure_column_adds_missing_and_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (a INTEGER);").unwrap();
+
+        let has_b = |c: &Connection| -> bool {
+            let mut stmt = c.prepare("PRAGMA table_info(t)").unwrap();
+            let names = stmt.query_map([], |r| r.get::<_, String>(1)).unwrap();
+            names.filter_map(Result::ok).any(|n| n == "b")
+        };
+        assert!(!has_b(&conn), "column starts absent");
+        ensure_column(&conn, "t", "b", "INTEGER").unwrap();
+        assert!(has_b(&conn), "column added");
+        // Second call is a no-op, not a duplicate-column error.
+        ensure_column(&conn, "t", "b", "INTEGER").unwrap();
+        assert!(has_b(&conn));
     }
 }

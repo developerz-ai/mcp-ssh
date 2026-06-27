@@ -25,4 +25,26 @@ pub enum Command {
         /// Username.
         user: String,
     },
+    /// List jobs (running only by default; `--all` includes finished ones).
+    Jobs {
+        /// Include finished/failed jobs, not just the running ones.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Manage a background job.
+    Job {
+        #[command(subcommand)]
+        action: JobCommand,
+    },
+    /// Summarise OAuth sessions (durable access/refresh tokens).
+    Sessions,
+}
+
+#[derive(Subcommand)]
+pub enum JobCommand {
+    /// Kill a running job by id (SIGTERM, then SIGKILL after a short grace).
+    Kill {
+        /// Job id, as shown by `mcp-ssh jobs`.
+        id: String,
+    },
 }
