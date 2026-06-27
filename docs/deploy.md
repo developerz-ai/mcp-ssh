@@ -50,8 +50,12 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:1337/mcp   # �
 
 # 3. Mint a bearer from your username/password (runs the OAuth PKCE flow).
 #    `bin/mcp-token` ships in the source checkout, NOT the .deb — run it from a
-#    repo clone, or skip to a GUI client's browser OAuth (see Connect a client).
-TOKEN=$(bin/mcp-token)
+#    repo clone with MCP_SSH_USER/MCP_SSH_PASS in env or .env, or skip to a GUI
+#    client's browser OAuth (see Connect a client).
+read -rp 'MCP_SSH_USER: ' MCP_SSH_USER
+read -rsp 'MCP_SSH_PASS: ' MCP_SSH_PASS; echo
+TOKEN="$(MCP_SSH_USER="$MCP_SSH_USER" MCP_SSH_PASS="$MCP_SSH_PASS" bin/mcp-token)"
+unset MCP_SSH_PASS
 
 # 4. initialize a session — look for the `mcp-session-id:` response header
 curl -sS -D - -o /dev/null -X POST http://127.0.0.1:1337/mcp \
