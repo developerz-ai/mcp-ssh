@@ -42,11 +42,13 @@ pub async fn read(path: &str, cursor: usize, limit: usize) -> Result<String, Str
 }
 
 pub async fn write(path: &str, content: &str) -> Result<String, String> {
+    ensure_parent(path).await?;
     fs::write(path, content).await.map_err(|e| e.to_string())?;
     Ok(format!("wrote {} bytes to {path}", content.len()))
 }
 
 pub async fn append(path: &str, content: &str) -> Result<String, String> {
+    ensure_parent(path).await?;
     let mut f = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -73,8 +75,24 @@ pub async fn delete(path: &str) -> Result<String, String> {
 }
 
 pub async fn rename(src: &str, dest: &str) -> Result<String, String> {
+    ensure_parent(dest).await?;
     fs::rename(src, dest).await.map_err(|e| e.to_string())?;
     Ok(format!("moved {src} -> {dest}"))
+}
+
+/// Create the target's parent directories so writing a new file under a fresh
+/// path "just works" (like `mkdir -p` before a redirect), instead of failing with
+/// a bare `ENOENT` the agent then has to diagnose. A no-op when the parent already
+/// exists or the path has none (a bare filename in the cwd).
+async fn ensure_parent(path: &str) -> Result<(), String> {
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 pub async fn list(path: &str, recursive: bool) -> Result<String, String> {
@@ -146,6 +164,32 @@ mod tests {
 
         delete(b).await.unwrap();
         assert!(read(b, 0, 10).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn write_creates_missing_parent_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two levels that don't exist yet — write must `mkdir -p` them.
+        let nested = dir.path().join("a/b/c.txt");
+        let nested = nested.to_str().unwrap();
+        write(nested, "hi").await.unwrap();
+        assert_eq!(read(nested, 0, 10).await.unwrap(), "hi");
+
+        // append to a fresh path under a new dir works too.
+        let ap = dir.path().join("x/y/z.log");
+        let ap = ap.to_str().unwrap();
+        append(ap, "one\n").await.unwrap();
+        assert!(read(ap, 0, 10).await.unwrap().contains("one"));
+    }
+
+    #[tokio::test]
+    async fn read_on_directory_redirects_to_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = read(dir.path().to_str().unwrap(), 0, 10).await.unwrap_err();
+        assert!(
+            err.contains("is a directory") && err.contains("list"),
+            "dir read should redirect to list: {err}"
+        );
     }
 
     #[tokio::test]

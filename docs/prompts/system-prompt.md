@@ -64,6 +64,8 @@ All projects under one workspace root (e.g. `~/workspace/<repo>`). Confirm with
 (long-running ⇒ `bg=true`, then poll).
 
 ### Multi-session orchestrator (big goals, PRs, auto-merge)
+An orchestrator like claudetm: opens PRs, monitors CI, loops until green and comments resolved.
+For repo work, not arbitrary shell tasks.
 ```
 bash cmd="cd <repo> && <orchestrator> status"                          # pre-flight
 bash bg=true cmd="cd <repo> && <orchestrator> start '<one tight imperative goal>'"

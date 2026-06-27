@@ -36,6 +36,8 @@ commands auto-background to a job id.
 
 ## Optional: autonomous coding tools (only if installed on the host)
 **Not** part of mcp-ssh — external CLIs launched through `bash` (long-running ⇒ `bg=true` + poll).
+An orchestrator like claudetm: opens PRs, monitors CI, loops until green and comments resolved.
+For repo work, not arbitrary shell tasks.
 
 1. **Pre-flight** — check status before launching:
    ```

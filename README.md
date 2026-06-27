@@ -113,6 +113,7 @@ Treat it accordingly:
 
 | Doc | What's in it |
 |---|---|
+| [docs/connect-claude.md](docs/connect-claude.md) | Connect from Claude Desktop & mobile — custom-connector setup, OAuth login, troubleshooting |
 | [docs/usage.md](docs/usage.md) | Every tool with params + examples, the execution & pagination model, config & env vars |
 | [docs/architecture.md](docs/architecture.md) | Module map, auto-backgrounding execution, the auth middleware, the stack |
 | [docs/deploy.md](docs/deploy.md) | systemd, Caddy & nginx+certbot TLS, Docker, hardening |
