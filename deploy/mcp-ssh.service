@@ -19,7 +19,13 @@ RestartSec=5
 # Hardening. NOTE: this tool intentionally shells out to run arbitrary
 # commands as the service user, so sandboxing is necessarily loose -- these
 # only raise the floor, they do not contain a determined command.
-NoNewPrivileges=true
+#
+# NoNewPrivileges is OFF by design: the agent is meant to self-manage the host
+# (install its own updates, restart itself, manage services) via `sudo`, which
+# is setuid and blocked by NoNewPrivileges=true. The service user is granted
+# sudo by the installer. To lock the box down instead, set this back to true and
+# remove /etc/sudoers.d/mcp-ssh -- see docs/deploy.md.
+NoNewPrivileges=false
 ProtectSystem=full
 PrivateTmp=true
 

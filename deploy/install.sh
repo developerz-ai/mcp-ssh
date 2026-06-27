@@ -109,6 +109,17 @@ User=$RUN_USER
 Group=$RUN_GROUP
 EOF
 
+# 7b. Grant the run user passwordless sudo. By design the agent's `bash` tool is
+#     full-power: it self-manages the host (installs updates, restarts itself,
+#     manages services). The unit ships NoNewPrivileges=false so setuid sudo
+#     works. This makes the auth-gated MCP shell root-capable — lock it down
+#     (remove this file + set NoNewPrivileges=true) if that's not what you want.
+SUDOERS="/etc/sudoers.d/mcp-ssh"
+echo "==> Granting '$RUN_USER' passwordless sudo (agent self-management) …"
+printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$RUN_USER" >"$SUDOERS"
+chmod 440 "$SUDOERS"
+visudo -cf "$SUDOERS" >/dev/null || { rm -f "$SUDOERS"; die "invalid sudoers entry for '$RUN_USER'"; }
+
 # 8. Start it.
 echo "==> Enabling + starting the service …"
 systemctl daemon-reload
@@ -124,6 +135,9 @@ else
 fi
 
 cat <<EOF
+
+⚠️  The '$RUN_USER' shell has passwordless sudo — the agent can run anything as
+    root. To lock it down: remove $SUDOERS, set NoNewPrivileges=true, restart.
 
 Next steps:
   • Logs:    journalctl -u mcp-ssh -f

@@ -88,12 +88,17 @@ mcp-ssh set-auth <user>    # configure the username/password
 
 ## ⚠️ Security
 
-**This gives an agent full shell access as the service user.** Treat it accordingly:
+**This gives an agent full shell access — with `sudo` (root) by default.** The
+unit ships `NoNewPrivileges=false` and the installer grants the run user
+`NOPASSWD:ALL`, so the agent can self-manage the host (update + restart itself,
+manage services). Anyone who authenticates to `/mcp` can run anything as root.
+Treat it accordingly:
 
-- Run it as a **dedicated low-privilege user** — never root.
+- Run it as a **dedicated user** (the installer defaults to `mcp-ssh`), not your login account.
 - Always put it **behind TLS** (reverse proxy). Never expose `:1337` directly.
-- Use a **strong password**.
+- Use a **strong password** — it's the only thing between the internet and root.
 - Set `MCP_SSH_ALLOWED_HOSTS` to your public hostname — it's the DNS-rebinding guard.
+- Don't want root? [Lock it down](docs/deploy.md#self-management-the-agent-has-sudo-by-default) — remove the sudoers file + set `NoNewPrivileges=true`.
 
 ## 📦 Install
 

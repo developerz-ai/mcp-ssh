@@ -98,6 +98,31 @@ journalctl -u mcp-ssh -f          # follow logs
 
 > ⚠️ The service user **is** the agent's shell user. Whatever it can do, the agent can do. Give it the least privilege the job needs.
 
+### Self-management: the agent has `sudo` by default
+
+**By design, the agent's shell is full-power.** The shipped unit sets
+`NoNewPrivileges=false` and the installer grants the run user
+`NOPASSWD:ALL` in `/etc/sudoers.d/mcp-ssh`, so the agent can install its own
+updates, restart itself, and manage the host as root. That means **anyone who
+authenticates to `/mcp` can run anything as root** — keep the password strong and
+TLS in front.
+
+Verify it's active: `sudo -n true` succeeds inside the shell, and
+`grep NoNewPrivs /proc/$(systemctl show mcp-ssh -p MainPID --value)/status` reads `0`.
+
+**To lock it down** (no root for the agent):
+
+```bash
+sudo rm -f /etc/sudoers.d/mcp-ssh
+sudo install -d -m 755 /etc/systemd/system/mcp-ssh.service.d
+printf '[Service]\nNoNewPrivileges=true\n' \
+  | sudo tee /etc/systemd/system/mcp-ssh.service.d/20-lockdown.conf
+sudo systemctl daemon-reload && sudo systemctl restart mcp-ssh
+```
+
+Or scope the sudoers line to just the commands the agent needs instead of
+`NOPASSWD:ALL`.
+
 ## 🔒 TLS — option A: Caddy (recommended, auto-HTTPS)
 
 Caddy fetches and renews certificates automatically. Smallest possible config:
