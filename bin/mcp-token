@@ -37,12 +37,19 @@ verifier=$(openssl rand -base64 60 | tr -d '\n=+/' | cut -c1-64)
 challenge=$(printf '%s' "$verifier" | openssl dgst -binary -sha256 | openssl base64 | tr '+/' '-_' | tr -d '=\n')
 
 # /authorize — authenticate with HTTP Basic, receive an auth code on the redirect.
+# Build the Basic header ourselves and feed it via a curl config file on stdin
+# (-K -), never on argv, so the password can't surface in the process list. The
+# header value is pure base64, so no curl-config quoting/escaping is needed.
+basic=$(printf '%s:%s' "$MCP_SSH_USER" "$MCP_SSH_PASS" | openssl base64 -A)
 location=$(curl -fsS -o /dev/null -w '%{redirect_url}' -G "$BASE/authorize" \
-  -u "$MCP_SSH_USER:$MCP_SSH_PASS" \
+  -K - \
   --data-urlencode "response_type=code" \
   --data-urlencode "redirect_uri=$REDIRECT" \
   --data-urlencode "code_challenge=$challenge" \
-  --data-urlencode "code_challenge_method=S256")
+  --data-urlencode "code_challenge_method=S256" <<EOF
+header = "Authorization: Basic $basic"
+EOF
+)
 code=$(printf '%s' "$location" | sed -n 's/.*[?&]code=\([^&]*\).*/\1/p')
 [ -n "$code" ] || { echo "mcp-token: no auth code (bad credentials or server down?): $location" >&2; exit 1; }
 
