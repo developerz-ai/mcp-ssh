@@ -53,17 +53,32 @@ pub struct BashArgs {
 // so the call fails before dispatch. Bare variants render a flat `enum`, which
 // every client handles (same as `FileAction`). Per-action docs live in the
 // `bash`/`job` tool descriptions and the `action` field below.
-#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[derive(serde::Deserialize, schemars::JsonSchema, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum JobAction {
     Poll,
+    // Read-only and id-free, so it's the safe fallback when `action` is absent
+    // or a literal `null` — a known Claude Desktop bug for required enums.
+    #[default]
     List,
     Kill,
 }
 
+/// Claude Desktop sometimes sends a literal `null` for a required enum field
+/// instead of the value, so the call would fail deserialization before dispatch.
+/// Treat `null` — and an omitted key — as `T::default()` rather than erroring.
+fn null_as_default<'de, D, T>(de: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de> + Default,
+{
+    Ok(<Option<T> as serde::Deserialize>::deserialize(de)?.unwrap_or_default())
+}
+
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub struct JobArgs {
-    /// What to do: poll, list, or kill.
+    /// What to do: poll, list, or kill. Defaults to list.
+    #[serde(default, deserialize_with = "null_as_default")]
     pub action: JobAction,
     /// [poll, kill] job id.
     pub id: Option<String>,
@@ -357,6 +372,36 @@ mod tests {
                 "action enum must NOT be `oneOf` (Claude Desktop mishandles it): {schema}"
             );
         }
+    }
+
+    /// Claude Desktop sends `{"action": null}` (and sometimes omits it) for the
+    /// `job` tool. Both must deserialize to the read-only `list` default instead
+    /// of erroring before dispatch; an explicit value still wins.
+    #[test]
+    fn job_action_null_or_missing_defaults_to_list() {
+        let null: JobArgs = serde_json::from_value(serde_json::json!({ "action": null })).unwrap();
+        assert!(matches!(null.action, JobAction::List));
+
+        let missing: JobArgs = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(matches!(missing.action, JobAction::List));
+
+        let explicit: JobArgs =
+            serde_json::from_value(serde_json::json!({ "action": "poll" })).unwrap();
+        assert!(matches!(explicit.action, JobAction::Poll));
+
+        // MCP spec: the advertised inputSchema must match behavior. `action` now
+        // has a default, so it must NOT be listed `required` — clients (and the
+        // model) are then free to omit it.
+        let schema = serde_json::to_value(schemars::schema_for!(JobArgs)).unwrap();
+        let required = schema
+            .get("required")
+            .and_then(|r| r.as_array())
+            .map(|r| r.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        assert!(
+            !required.contains(&"action"),
+            "`action` must not be required once it has a default: {schema}"
+        );
     }
 
     fn tools() -> Tools {
