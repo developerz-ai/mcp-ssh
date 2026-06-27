@@ -52,8 +52,8 @@ A small, heavily-parametrized surface — **three resource-oriented tools**, com
 
 | Tool | Params | What it does |
 |---|---|---|
-| `bash` | `cmd`, `cwd?`, `timeout?`, `bg?` | Run a shell command. Returns output inline if it finishes within the inline window (default 2s), else a **job id** to monitor with `job`. `timeout` overrides the inline window; `bg=true` backgrounds immediately and returns the id without waiting. |
-| `job` | `action`, `id?`, `cursor?`, `limit?` | Manage jobs. `action="poll"` → status + **one page** of merged stdout+stderr (default 200 lines, with `next_cursor`/`has_more`); `action="list"` → all jobs + status; `action="kill"` → kill running job `id`. |
+| `bash` | `cmd`, `cwd?`, `timeout?`, `bg?`, `interactive?`, `title?` | Run a shell command. Returns output inline if it finishes within the inline window (default 2s), else a **job id** to monitor with `job`. `timeout` overrides the inline window; `bg=true` backgrounds immediately; `interactive=true` sources `~/.bashrc`; `title` labels the job id (`<title>-HH:MM:SS`). Output is byte/line-capped per page. |
+| `job` | `action`, `id?`, `cursor?`, `limit?` | Manage jobs. `action="poll"` → status + **one page** of merged stdout+stderr (default 200 lines, byte-capped, with `next_cursor`/`has_more`); `action="list"` → all jobs + status; `action="kill"` → kill running job `id`. |
 | `file` | `action`, `path?`, `content?`, `pattern?`, `recursive?`, `src?`, `dest?`, `cursor?`, `limit?` | File operations by `action`: `read` (paginated), `write`, `append`, `delete`, `list` (`recursive` for the tree), `grep` (`pattern`, `recursive` under a dir), `move` (`src`→`dest`). |
 
 Full reference with examples → **[docs/usage.md](docs/usage.md)**.
@@ -116,6 +116,8 @@ Treat it accordingly:
 | [docs/usage.md](docs/usage.md) | Every tool with params + examples, the execution & pagination model, config & env vars |
 | [docs/architecture.md](docs/architecture.md) | Module map, auto-backgrounding execution, the auth middleware, the stack |
 | [docs/deploy.md](docs/deploy.md) | systemd, Caddy & nginx+certbot TLS, Docker, hardening |
+| [docs/prompts/system-prompt.md](docs/prompts/system-prompt.md) | Ready-to-paste system prompt for driving the server from a chat LLM |
+| [docs/prompts/skill.md](docs/prompts/skill.md) | Claude Code skill for autonomous server-side work |
 | [`.coderabbit.yaml`](.coderabbit.yaml) | CodeRabbit AI review config; install the [GitHub App](https://github.com/apps/coderabbitai) on the repo |
 
 ## 🧬 Stack

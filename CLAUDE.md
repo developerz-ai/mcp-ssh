@@ -75,7 +75,7 @@ Current tools (three, constant):
 
 | Tool | Params | Does |
 |---|---|---|
-| `bash` | `cmd`, `cwd?`, `timeout?`, `bg?`, `interactive?` | run a command; inline if fast, else a job id (`bg` backgrounds at once; `interactive` sources `~/.bashrc` via `bash -ic` for aliases/version managers, default fast `sh -c`) |
+| `bash` | `cmd`, `cwd?`, `timeout?`, `bg?`, `interactive?`, `title?` | run a command; inline if fast, else a job id (`bg` backgrounds at once; `interactive` sources `~/.bashrc` via `bash -ic` for aliases/version managers, default fast `sh -c`; `title` labels the job id as `<title>-HH:MM:SS`) |
 | `job` | `action`, `id?`, `cursor?`, `limit?` | jobs by `action`: `poll` (paginated output), `list` (jobs + status), `kill` |
 | `file` | `action`, `path?`, `content?`, `pattern?`, `recursive?`, `src?`, `dest?`, `cursor?`, `limit?` | file ops by `action`: `read`/`write`/`append`/`delete`/`list`/`grep`/`move` |
 

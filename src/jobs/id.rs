@@ -1,10 +1,13 @@
-//! Human-readable job ids: a neutral `job` prefix plus the local `HH:MM` it
-//! started, e.g. `job-23:30` — easier to refer to in conversation than an opaque
-//! counter. The prefix is hard-coded, never derived from the command: a command
-//! can carry a secret in its leading tokens, and the id surfaces in replies,
-//! `job(list)`, reaper logs, and the log filename, so the constructor refuses to
-//! accept command text at all. A monotonic sequence suffix disambiguates jobs
-//! starting within the same minute.
+//! Human-readable job ids: an agent-supplied `title` (or the neutral `job`
+//! fallback) plus the local `HH:MM:SS` it started — e.g. `claudetm-doing-mvp-03:01:05`
+//! or `job-23:30:07`. The title lets the agent tell its own jobs apart at a glance
+//! (`job(list)` shows what each one is doing). It is NEVER derived from the command:
+//! command text can carry a secret in its leading tokens, and the id surfaces in
+//! replies, `job(list)`, reaper logs, and the log filename. The title comes from a
+//! dedicated `bash` param the agent writes deliberately, and is normalized to a
+//! single `[A-Za-z0-9_-]+` path component (so it can't inject shell/path
+//! metacharacters into the log filename or escape the job dir). A monotonic
+//! sequence suffix disambiguates jobs starting within the same second.
 
 use std::borrow::Borrow;
 use std::fmt;
@@ -12,29 +15,59 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::Local;
 
-/// A human-readable job identifier: `job-<HH:MM>` with an optional `-<seq>`
-/// collision suffix. A generated id matches `^job-\d{2}:\d{2}(-\d+)?$`;
-/// ids wrapped from client input for lookup are not revalidated.
+/// Cap the sanitized title so ids (and the `<id>.log` filename) stay bounded and
+/// readable no matter what the agent passes.
+const MAX_TITLE_LEN: usize = 32;
+
+/// A human-readable job identifier: `<label>-<HH:MM:SS>` with an optional `-<seq>`
+/// collision suffix, where `<label>` is a normalized title or `job`. A generated id
+/// matches `^[A-Za-z0-9_-]+-\d{2}:\d{2}:\d{2}(-\d+)?$`; ids wrapped from client
+/// input for lookup are not revalidated.
 #[derive(Debug, Clone, Hash, Eq, PartialEq, PartialOrd, Ord, serde::Serialize)]
 pub struct JobId(String);
 
 impl JobId {
-    /// Build an id from the hard-coded `job` prefix and the current local time.
-    /// The prefix is fixed here, never caller-supplied, so command text — which
-    /// can carry a secret in its leading tokens — can't leak into the id. `exists`
-    /// reports whether a candidate is already taken; only on a clash do we append
-    /// a `-<seq>` drawn from `seq`, so clean ids stay clean. The predicate keeps
-    /// this decoupled from however the caller tracks live ids.
-    pub fn generate(seq: &AtomicU64, exists: impl Fn(&str) -> bool) -> Self {
-        let base = format!("job-{}", Local::now().format("%H:%M"));
+    /// Build an id from an optional `title` and the current local time. The title
+    /// is normalized to one `[A-Za-z0-9_-]+` component (empty/garbage falls back to
+    /// the neutral `job` label), so neither command text nor path/shell
+    /// metacharacters can reach the id or its log filename. `exists` reports
+    /// whether a candidate is taken; only
+    /// on a clash do we append a `-<seq>` from `seq`, so clean ids stay clean.
+    pub fn generate(seq: &AtomicU64, title: Option<&str>, exists: impl Fn(&str) -> bool) -> Self {
+        let label = title
+            .and_then(normalize_title)
+            .unwrap_or_else(|| "job".to_string());
+        let base = format!("{label}-{}", Local::now().format("%H:%M:%S"));
         if !exists(&base) {
             return Self(base);
         }
-        // Same minute: a monotonic suffix keeps the id unique without sacrificing
-        // readability.
+        // Same second + same title: a monotonic suffix keeps the id unique without
+        // sacrificing readability.
         let n = seq.fetch_add(1, Ordering::Relaxed);
         Self(format!("{base}-{n}"))
     }
+}
+
+/// Keep the agent's title essentially as-is — just guard the one thing that
+/// matters: the id becomes the `<id>.log` filename, so the title must stay a
+/// single, bounded path component. Alphanumerics, `-` and `_` pass through
+/// unchanged; any other run (spaces, `/`, `.`, `:`) collapses to one `-` so it
+/// can't break the filename or escape the job dir. Trimmed and capped at
+/// `MAX_TITLE_LEN`; `None` when nothing usable survives (caller falls back to `job`).
+fn normalize_title(raw: &str) -> Option<String> {
+    let mut out = String::new();
+    for c in raw.chars() {
+        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+            out.push(c);
+        } else if !out.is_empty() && !out.ends_with('-') {
+            out.push('-');
+        }
+        if out.len() >= MAX_TITLE_LEN {
+            break;
+        }
+    }
+    let trimmed = out.trim_matches('-');
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 impl fmt::Display for JobId {
@@ -75,42 +108,91 @@ impl From<&str> for JobId {
 mod tests {
     use super::*;
 
-    /// Mirror the documented `^job-\d{2}:\d{2}(-\d+)?$` shape without pulling in a
-    /// regex dependency. The id has exactly one `:` (prefix and suffix never
-    /// contain one), so split on it to isolate the time.
-    fn valid_format(s: &str) -> bool {
+    /// Mirror the documented `^<label>-\d{2}:\d{2}:\d{2}(-\d+)?$` shape (label is
+    /// `[a-z0-9-_]+`) without a regex dependency. The two `:` only ever appear in
+    /// the `HH:MM:SS` time, so the first `-` before the time splits label from time.
+    fn valid_format(s: &str, expected_label: &str) -> bool {
         let two_digits = |x: &str| x.len() == 2 && x.bytes().all(|b| b.is_ascii_digit());
-        let Some((left, right)) = s.split_once(':') else {
+        // Time is the `HH:MM:SS` slice; split it off by its two colons.
+        let Some((before_ss, tail)) = s.rsplit_once(':') else {
             return false;
         };
-        let Some((prefix, hh)) = left.rsplit_once('-') else {
+        let Some((label_hh, mm)) = before_ss.rsplit_once(':') else {
             return false;
         };
-        let (mm, suffix_ok) = match right.split_once('-') {
-            Some((mm, sfx)) => (
-                mm,
+        let Some((label, hh)) = label_hh.rsplit_once('-') else {
+            return false;
+        };
+        let (ss, suffix_ok) = match tail.split_once('-') {
+            Some((ss, sfx)) => (
+                ss,
                 !sfx.is_empty() && sfx.bytes().all(|b| b.is_ascii_digit()),
             ),
-            None => (right, true),
+            None => (tail, true),
         };
-        two_digits(hh) && two_digits(mm) && suffix_ok && prefix == "job"
+        two_digits(hh) && two_digits(mm) && two_digits(ss) && suffix_ok && label == expected_label
     }
 
     #[test]
     fn generated_id_matches_documented_format() {
         let seq = AtomicU64::new(1);
-        let id = JobId::generate(&seq, |_| false);
-        assert!(valid_format(id.as_ref()), "bad format: {}", id.as_ref());
+        let id = JobId::generate(&seq, None, |_| false);
+        assert!(
+            valid_format(id.as_ref(), "job"),
+            "bad format: {}",
+            id.as_ref()
+        );
+    }
+
+    #[test]
+    fn title_becomes_the_label() {
+        let seq = AtomicU64::new(1);
+        let id = JobId::generate(&seq, Some("claudetm doing mvp"), |_| false);
+        let s = id.as_ref();
+        assert!(s.starts_with("claudetm-doing-mvp-"), "title not in id: {s}");
+        assert!(valid_format(s, "claudetm-doing-mvp"), "bad format: {s}");
+    }
+
+    #[test]
+    fn title_normalization_guards_the_filename() {
+        // Path separators / dots / colons collapse to single dashes so the id stays
+        // one bounded filename component; case and `-`/`_` are preserved.
+        let seq = AtomicU64::new(1);
+        let id = JobId::generate(&seq, Some("../../etc/Pa ss:wd"), |_| false);
+        let s = id.as_ref();
+        assert!(!s.contains('/'), "slash must not survive: {s}");
+        assert!(!s.contains(".."), "traversal must not survive: {s}");
+        assert!(
+            s.starts_with("etc-Pa-ss-wd-"),
+            "unexpected normalization: {s}"
+        );
+    }
+
+    #[test]
+    fn blank_or_symbolic_title_falls_back_to_job() {
+        let seq = AtomicU64::new(1);
+        for raw in ["", "   ", "/// ...", "!!!"] {
+            let id = JobId::generate(&seq, Some(raw), |_| false);
+            assert!(
+                id.as_ref().starts_with("job-"),
+                "empty title must fall back to `job`: {} ({raw:?})",
+                id.as_ref()
+            );
+        }
     }
 
     #[test]
     fn no_collision_leaves_id_clean_and_seq_untouched() {
         let seq = AtomicU64::new(1);
-        let id = JobId::generate(&seq, |_| false);
+        let id = JobId::generate(&seq, None, |_| false);
         let s = id.as_ref();
-        assert!(valid_format(s));
-        let (_, right) = s.split_once(':').expect("id carries a time");
-        assert!(!right.contains('-'), "unexpected collision suffix: {s}");
+        assert!(valid_format(s, "job"));
+        // No trailing `-<seq>`: the only `-` after the time would be a suffix.
+        let after_time = s.rsplit_once(':').unwrap().1;
+        assert!(
+            !after_time.contains('-'),
+            "unexpected collision suffix: {s}"
+        );
         assert_eq!(
             seq.load(Ordering::Relaxed),
             1,
@@ -122,9 +204,9 @@ mod tests {
     fn collision_appends_sequence_suffix() {
         let seq = AtomicU64::new(1);
         // `exists` always true => the base is "taken", forcing the suffix path.
-        let id = JobId::generate(&seq, |_| true);
+        let id = JobId::generate(&seq, None, |_| true);
         let s = id.as_ref();
-        assert!(valid_format(s));
+        assert!(valid_format(s, "job"));
         assert!(s.ends_with("-1"), "expected `-1` seq suffix, got {s}");
         assert_eq!(seq.load(Ordering::Relaxed), 2, "clash must advance seq");
     }
@@ -132,14 +214,14 @@ mod tests {
     #[test]
     fn display_and_as_ref_agree() {
         let seq = AtomicU64::new(1);
-        let id = JobId::generate(&seq, |_| false);
+        let id = JobId::generate(&seq, None, |_| false);
         assert_eq!(id.to_string(), id.as_ref());
     }
 
     #[test]
     fn serializes_as_a_plain_string() {
         let seq = AtomicU64::new(1);
-        let id = JobId::generate(&seq, |_| false);
+        let id = JobId::generate(&seq, None, |_| false);
         let json = serde_json::to_string(&id).expect("serialize");
         assert_eq!(json, format!("\"{}\"", id.as_ref()));
     }

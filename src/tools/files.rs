@@ -3,19 +3,38 @@
 //! reimplementing them.
 use tokio::{fs, io::AsyncWriteExt};
 
-/// Read a file, paginated by line so a huge file can't flood the agent context.
+/// Largest shell-listing (`ls`/`find`/`grep`) output returned to the agent. Unlike
+/// `read`, these aren't line-cursored, so a `find /` or `grep -r` on a huge tree
+/// would otherwise dump unbounded text into context. Truncate with a marker that
+/// tells the agent to narrow the path/pattern.
+const MAX_SHELL_OUTPUT_BYTES: usize = 64 * 1024;
+
+/// Read a file, paginated by line AND bounded by bytes (via the shared job-log
+/// paginator) so neither a huge file nor a single pathological line can flood the
+/// agent context.
 pub async fn read(path: &str, cursor: usize, limit: usize) -> Result<String, String> {
+    // A directory can't be read as text: surface a useful redirect to `list`
+    // instead of a raw "Is a directory" errno.
+    match fs::metadata(path).await {
+        Ok(meta) if meta.is_dir() => {
+            return Err(format!(
+                "{path} is a directory — use file(action=\"list\", path=\"{path}\") instead"
+            ));
+        }
+        Ok(_) => {}
+        Err(e) => return Err(e.to_string()),
+    }
     // Binary-safe: replace non-UTF-8 bytes with U+FFFD rather than hard-erroring.
     let bytes = fs::read(path).await.map_err(|e| e.to_string())?;
     let owned = String::from_utf8_lossy(&bytes).into_owned();
-    let content = owned.as_str();
-    let lines: Vec<&str> = content.lines().collect();
-    let total = lines.len();
-    let end = (cursor + limit).min(total);
-    let body = lines.get(cursor..end).unwrap_or(&[]).join("\n");
-    if end < total {
+    let lines: Vec<&str> = owned.lines().collect();
+    // Same byte/line ceilings and cursor semantics as `job(action="poll")`.
+    let page = crate::jobs::paginate(&lines, cursor, limit);
+    let body = page.lines.join("\n");
+    if page.has_more {
         Ok(format!(
-            "{body}\n[lines {cursor}..{end} of {total}; next_cursor={end}]"
+            "{body}\n[lines {cursor}..{} of {}; next_cursor={}]",
+            page.next_cursor, page.total_lines, page.next_cursor
         ))
     } else {
         Ok(body)
@@ -81,7 +100,25 @@ async fn sh(prog: &str, args: &[&str]) -> Result<String, String> {
     if !out.stderr.is_empty() {
         s.push_str(&String::from_utf8_lossy(&out.stderr));
     }
-    Ok(s)
+    Ok(cap_bytes(s, MAX_SHELL_OUTPUT_BYTES))
+}
+
+/// Bound a non-paginated listing to `max` bytes, cut on a UTF-8 boundary, with a
+/// marker telling the agent to narrow the path/pattern. A no-op under the cap.
+fn cap_bytes(mut s: String, max: usize) -> String {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let dropped = s.len() - end;
+    s.truncate(end);
+    s.push_str(&format!(
+        "\n[output truncated: +{dropped} bytes — narrow the path or pattern]"
+    ));
+    s
 }
 
 #[cfg(test)]

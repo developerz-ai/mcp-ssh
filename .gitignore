@@ -28,3 +28,6 @@ config.toml
 
 # Local runtime (dev job dir, server logs)
 .local/
+
+# Personal, untracked prompt/skill copies (generic versions live in docs/prompts/)
+/tmp/

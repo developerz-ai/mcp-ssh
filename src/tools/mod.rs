@@ -39,6 +39,10 @@ pub struct BashArgs {
     /// version managers (mise/nvm/rbenv) resolve. Default false (faster bare
     /// `sh -c`); set true when the command needs the user's shell setup.
     pub interactive: Option<bool>,
+    /// Short label for this job, e.g. "build-api" or "deploy check". It becomes
+    /// the job id prefix (`<title>-HH:MM:SS`) so you can tell your own jobs apart
+    /// in `job(action="list")`. Optional; omit and the id is `job-HH:MM:SS`.
+    pub title: Option<String>,
 }
 
 // ---- job ----
@@ -115,7 +119,7 @@ impl Tools {
     }
 
     #[tool(
-        description = "Run a shell command on the host (locally, as the service user). Returns output inline if it finishes within the inline window (default 2s); otherwise returns a job id — monitor it with the `job` tool. Pass bg=true to background immediately and get the id without waiting. Pass interactive=true to source the user's ~/.bashrc so aliases and version managers (mise/nvm/rbenv) resolve (default is the faster bare sh -c). Use it to launch long tasks (builds, deploys, `claude -p ...`) without blocking."
+        description = "Run a shell command on the host, locally as the service user. Fast commands return output inline; anything past the inline window (default 2s) returns a job id to monitor with `job`. bg=true backgrounds at once. timeout overrides the inline window. interactive=true sources ~/.bashrc (aliases, mise/nvm/rbenv); default is the faster bare sh -c. title labels the job id (`<title>-HH:MM:SS`) so you can tell your jobs apart. Output is byte- and line-capped per page so it never floods context."
     )]
     async fn bash(
         &self,
@@ -125,6 +129,7 @@ impl Tools {
             timeout,
             bg,
             interactive,
+            title,
         }): Parameters<BashArgs>,
         RequestId(request_id): RequestId,
     ) -> Result<CallToolResult, McpError> {
@@ -140,10 +145,23 @@ impl Tools {
                     timeout,
                     bg.unwrap_or(false),
                     interactive.unwrap_or(false),
+                    title,
                 )
                 .await
             {
-                Ok(RunResult::Inline { state, page }) => Ok(ok(render(&state, &page))),
+                Ok(RunResult::Inline { id, state, page }) => {
+                    let mut out = render(&state, &page);
+                    // Output overflowed the first page: the job is still in the
+                    // store, so hand back its id to fetch the rest instead of
+                    // stranding the agent with a dead cursor.
+                    if page.has_more {
+                        out.push_str(&format!(
+                            "\nfull output continues — fetch the rest with job(action=\"poll\", id=\"{id}\", cursor={}).",
+                            page.next_cursor
+                        ));
+                    }
+                    Ok(ok(out))
+                }
                 Ok(RunResult::Backgrounded { id }) => Ok(ok(format!(
                     "job {id} still running after the inline window. Monitor it with job(action=\"poll\", id=\"{id}\")."
                 ))),
@@ -376,6 +394,7 @@ mod tests {
                     timeout: None,
                     bg: None,
                     interactive: None,
+                    title: None,
                 }),
                 RequestId(NumberOrString::Number(42)),
             )

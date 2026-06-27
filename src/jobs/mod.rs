@@ -17,7 +17,7 @@ mod reaper;
 
 pub use id::JobId;
 use log::{DEFAULT_PAGE, read_page};
-pub use log::{JobLogError, Page};
+pub use log::{JobLogError, Page, paginate};
 use reaper::{kill_job, spawn_reaper};
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -47,8 +47,14 @@ struct Job {
 
 /// Result of starting a command.
 pub enum RunResult {
-    /// Finished within the inline window — output is ready now.
-    Inline { state: JobState, page: Page },
+    /// Finished within the inline window — output is ready now. Carries the `id`
+    /// too: the job is still in the store, so if the inline page is truncated the
+    /// agent can poll `id` for the rest instead of losing it.
+    Inline {
+        id: JobId,
+        state: JobState,
+        page: Page,
+    },
     /// Still running — poll this id.
     Backgrounded { id: JobId },
 }
@@ -149,19 +155,23 @@ impl JobStore {
         timeout_secs: Option<u64>,
         background: bool,
         interactive: bool,
+        title: Option<String>,
     ) -> std::io::Result<RunResult> {
         // Hold the jobs lock across id generation and insertion so the id is
-        // reserved atomically: two jobs launched in the same minute can't both
-        // see their `job-HH:MM` as free and clobber each other's entry. Nothing
-        // awaits while the guard is held (file create + spawn are synchronous),
-        // so the critical section stays short.
+        // reserved atomically: two jobs launched in the same second can't both
+        // see their `<label>-HH:MM:SS` as free and clobber each other's entry.
+        // Nothing awaits while the guard is held (file create + spawn are
+        // synchronous), so the critical section stays short.
         //
-        // The id uses a hard-coded `job` prefix, never `cmd`: a command can carry
-        // a secret in its leading tokens (`mysql -psecret`, `PGPASSWORD=…`), and
-        // the id ends up in `bash`'s reply, `job(list)`, reaper logs, and the log
-        // filename — so deriving it from `cmd` would leak that secret.
+        // The id's label is the agent-supplied `title` (or the neutral `job`
+        // fallback), never `cmd`: a command can carry a secret in its leading
+        // tokens (`mysql -psecret`, `PGPASSWORD=…`), and the id ends up in `bash`'s
+        // reply, `job(list)`, reaper logs, and the log filename — so deriving it
+        // from `cmd` would leak that secret. The title is normalized in `JobId`.
         let mut jobs = self.jobs.lock().await;
-        let id = JobId::generate(&self.seq, |candidate| jobs.contains_key(candidate));
+        let id = JobId::generate(&self.seq, title.as_deref(), |candidate| {
+            jobs.contains_key(candidate)
+        });
         let log_path = self.dir.join(format!("{id}.log"));
 
         // Create the log up front so a poll racing the spawn reads an empty page,
@@ -247,6 +257,7 @@ impl JobStore {
             finished => Ok(RunResult::Inline {
                 state: finished,
                 page: read_page(&log_path, 0, DEFAULT_PAGE).await?,
+                id,
             }),
         }
     }
@@ -348,10 +359,10 @@ mod tests {
         .unwrap();
 
         let r = store
-            .run("greet".into(), None, None, false, true)
+            .run("greet".into(), None, None, false, true, None)
             .await
             .unwrap();
-        let RunResult::Inline { state, page } = r else {
+        let RunResult::Inline { state, page, .. } = r else {
             panic!("fast command should be inline");
         };
         assert!(matches!(state, JobState::Exited { code: 0 }));
@@ -370,11 +381,11 @@ mod tests {
     #[tokio::test]
     async fn fast_command_returns_inline() {
         let r = store(Duration::from_secs(5))
-            .run("echo hello".into(), None, None, false, false)
+            .run("echo hello".into(), None, None, false, false, None)
             .await
             .unwrap();
         match r {
-            RunResult::Inline { state, page } => {
+            RunResult::Inline { state, page, .. } => {
                 assert!(matches!(state, JobState::Exited { code: 0 }));
                 assert!(page.lines.iter().any(|l| l.contains("hello")));
             }
@@ -383,10 +394,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn title_labels_the_job_id() {
+        let r = store(Duration::from_secs(5))
+            .run(
+                "echo hi".into(),
+                None,
+                None,
+                true,
+                false,
+                Some("deploy check".into()),
+            )
+            .await
+            .unwrap();
+        let RunResult::Backgrounded { id } = r else {
+            panic!("bg should background");
+        };
+        assert!(
+            id.as_ref().starts_with("deploy-check-"),
+            "title must prefix the id: {id}"
+        );
+    }
+
+    #[tokio::test]
+    async fn inline_overflow_surfaces_id_and_remains_pollable() {
+        // A fast command whose output exceeds one page must still hand back an id
+        // (in the Inline result) so the agent can poll the rest — not strand it.
+        let store = store(Duration::from_secs(5));
+        let n = DEFAULT_PAGE + 50;
+        let r = store
+            .run(format!("seq 1 {n}"), None, None, false, false, None)
+            .await
+            .unwrap();
+        let RunResult::Inline { id, page, .. } = r else {
+            panic!("seq is fast — should be inline");
+        };
+        assert!(page.has_more, "output exceeds one page");
+        assert_eq!(page.lines.len(), DEFAULT_PAGE, "first page is capped");
+        // The id is live in the store: poll the continuation.
+        let (_state, rest) = store
+            .poll(&id, page.next_cursor, None)
+            .await
+            .unwrap()
+            .expect("inline job stays in the store");
+        assert!(
+            rest.lines.iter().any(|l| l == &n.to_string()),
+            "the tail must be reachable via poll"
+        );
+    }
+
+    #[tokio::test]
     async fn bg_flag_backgrounds_a_fast_command() {
         // Even though `echo` is instant, bg=true must return an id without waiting.
         let r = store(Duration::from_secs(5))
-            .run("echo hi".into(), None, None, true, false)
+            .run("echo hi".into(), None, None, true, false, None)
             .await
             .unwrap();
         assert!(matches!(r, RunResult::Backgrounded { .. }));
@@ -402,6 +462,7 @@ mod tests {
                 None,
                 false,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -445,6 +506,7 @@ mod tests {
                 None,
                 true,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -491,7 +553,7 @@ mod tests {
         let store = store(Duration::from_secs(5));
         // Runs inline, so it has already exited by the time `run` returns.
         let r = store
-            .run("echo bye".into(), None, None, false, false)
+            .run("echo bye".into(), None, None, false, false, None)
             .await
             .unwrap();
         assert!(matches!(r, RunResult::Inline { .. }));
@@ -514,6 +576,7 @@ mod tests {
                 None,
                 true,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -547,6 +610,7 @@ mod tests {
                 None,
                 true,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -618,7 +682,7 @@ mod tests {
     async fn kill_terminates_child_process() {
         let store = store(Duration::from_millis(100));
         let r = store
-            .run("sleep 1000".into(), None, None, true, false)
+            .run("sleep 1000".into(), None, None, true, false, None)
             .await
             .unwrap();
         let RunResult::Backgrounded { id } = r else {
@@ -648,11 +712,11 @@ mod tests {
         let store = store(Duration::from_secs(5));
         // Two commands — one inline, one explicitly backgrounded — both tracked.
         store
-            .run("echo alpha".into(), None, None, false, false)
+            .run("echo alpha".into(), None, None, false, false, None)
             .await
             .unwrap();
         store
-            .run("echo beta".into(), None, None, true, false)
+            .run("echo beta".into(), None, None, true, false, None)
             .await
             .unwrap();
 
@@ -666,7 +730,7 @@ mod tests {
     async fn poll_paginates() {
         let store = store(Duration::from_secs(5));
         store
-            .run("seq 1 10".into(), None, None, false, false)
+            .run("seq 1 10".into(), None, None, false, false, None)
             .await
             .unwrap();
         // seq finishes inline; fetch its id from the listing to re-poll and
