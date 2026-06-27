@@ -11,7 +11,7 @@ use rmcp::{
 // `RequestId` above is rmcp's extractor for the per-call JSON-RPC request id.
 use tracing::Instrument;
 
-use crate::jobs::{JobState, JobStore, Page, RunResult};
+use crate::jobs::{JobId, JobState, JobStore, Page, RunResult};
 
 mod files;
 
@@ -151,6 +151,7 @@ impl Tools {
                     let Some(id) = args.id else {
                         return Ok(err("poll requires `id`"));
                     };
+                    let id = JobId::from(id);
                     match self
                         .jobs
                         .poll(&id, args.cursor.unwrap_or(0), args.limit)
@@ -168,6 +169,7 @@ impl Tools {
                     let Some(id) = args.id else {
                         return Ok(err("kill requires `id`"));
                     };
+                    let id = JobId::from(id);
                     if self.jobs.kill(&id).await {
                         Ok(ok(format!("killed {id}")))
                     } else {

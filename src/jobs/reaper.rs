@@ -7,7 +7,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use tokio::sync::{Mutex, watch};
 
-use super::{Job, JobState, ProcessGroupId};
+use super::{Job, JobId, JobState, ProcessGroupId};
 
 /// Jobs (and their logs) older than this are reaped hourly.
 const RETENTION: Duration = Duration::from_secs(24 * 3600);
@@ -68,7 +68,7 @@ async fn exited_within(mut done: watch::Receiver<bool>, grace: Duration) -> bool
 /// Hourly: drop jobs (and their log files) older than `RETENTION` so history
 /// doesn't grow without bound. ponytail: time-based only; a busy box could still
 /// hold ≤24h of jobs in memory — add a count cap if that ever bites.
-pub(super) fn spawn_reaper(jobs: Arc<Mutex<HashMap<String, Arc<Job>>>>) {
+pub(super) fn spawn_reaper(jobs: Arc<Mutex<HashMap<JobId, Arc<Job>>>>) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(3600));
         loop {
@@ -80,10 +80,10 @@ pub(super) fn spawn_reaper(jobs: Arc<Mutex<HashMap<String, Arc<Job>>>>) {
 
 /// One reaping pass: evict every job older than `retention`. A still-`Running`
 /// job is killed first, so eviction never orphans its process group.
-pub(super) async fn reap_once(jobs: &Mutex<HashMap<String, Arc<Job>>>, retention: Duration) {
+pub(super) async fn reap_once(jobs: &Mutex<HashMap<JobId, Arc<Job>>>, retention: Duration) {
     let now = tokio::time::Instant::now();
     let map = jobs.lock().await;
-    let stale: Vec<(String, Arc<Job>)> = map
+    let stale: Vec<(JobId, Arc<Job>)> = map
         .iter()
         .filter(|(_, j)| now.duration_since(j.started) > retention)
         .map(|(id, j)| (id.clone(), j.clone()))
@@ -93,7 +93,7 @@ pub(super) async fn reap_once(jobs: &Mutex<HashMap<String, Arc<Job>>>, retention
     // Kill first so a still-running group is never orphaned by eviction. Only
     // evict jobs that finished or whose group we actually signalled; a running
     // job whose kill failed stays tracked (pollable/killable) for a later pass.
-    let mut removable: Vec<(String, Arc<Job>)> = Vec::new();
+    let mut removable: Vec<(JobId, Arc<Job>)> = Vec::new();
     for (id, job) in &stale {
         if kill_job(job).await || !matches!(*job.state.lock().await, JobState::Running) {
             removable.push((id.clone(), job.clone()));

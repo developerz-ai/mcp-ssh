@@ -3,11 +3,7 @@
 //! than an opaque counter. A monotonic sequence suffix disambiguates the rare
 //! case of two identical-slug commands starting within the same minute.
 
-// Staged: `JobStore` constructs `JobId` in the follow-up change that wires it
-// through the engine; this module's tests exercise it now, so allow dead code
-// until then to keep `clippy -D warnings` green.
-#![allow(dead_code)]
-
+use std::borrow::Borrow;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -18,8 +14,9 @@ use chrono::Local;
 const MAX_SLUG: usize = 24;
 
 /// A human-readable job identifier: `<slug>-<HH:MM>` with an optional `-<seq>`
-/// collision suffix. Always matches `^[a-z0-9-]+-\d{2}:\d{2}(-\d+)?$`.
-#[derive(Debug, Clone, Hash, Eq, PartialEq, serde::Serialize)]
+/// collision suffix. A generated id matches `^[a-z0-9-]+-\d{2}:\d{2}(-\d+)?$`;
+/// ids wrapped from client input for lookup are not revalidated.
+#[derive(Debug, Clone, Hash, Eq, PartialEq, PartialOrd, Ord, serde::Serialize)]
 pub struct JobId(String);
 
 impl JobId {
@@ -48,6 +45,28 @@ impl fmt::Display for JobId {
 impl AsRef<str> for JobId {
     fn as_ref(&self) -> &str {
         &self.0
+    }
+}
+
+/// Lets a `HashMap<JobId, _>` be probed with a `&str` key — used when generating
+/// an id to test a candidate against the live ids.
+impl Borrow<str> for JobId {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Wrap a client-supplied id for lookup. Not validated — an unknown or malformed
+/// id simply matches no job; only `generate` mints well-formed ids.
+impl From<String> for JobId {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl From<&str> for JobId {
+    fn from(s: &str) -> Self {
+        Self(s.to_owned())
     }
 }
 

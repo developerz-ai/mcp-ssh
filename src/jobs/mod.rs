@@ -5,10 +5,7 @@ use std::{
     collections::HashMap,
     path::PathBuf,
     process::Stdio,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, atomic::AtomicU64},
     time::Duration,
 };
 
@@ -17,6 +14,7 @@ use tokio::sync::{Mutex, watch};
 mod id;
 mod reaper;
 
+pub use id::JobId;
 use reaper::{kill_job, spawn_reaper};
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -50,7 +48,7 @@ pub enum RunResult {
     /// Finished within the inline window — output is ready now.
     Inline { state: JobState, page: Page },
     /// Still running — poll this id.
-    Backgrounded { id: String },
+    Backgrounded { id: JobId },
 }
 
 /// One page of log lines plus a cursor to fetch the next page.
@@ -64,7 +62,7 @@ pub struct Page {
 
 #[derive(Debug, serde::Serialize)]
 pub struct JobSummary {
-    pub id: String,
+    pub id: JobId,
     pub cmd: String,
     pub state: JobState,
 }
@@ -74,7 +72,7 @@ pub struct JobStore {
     dir: PathBuf,
     inline_timeout: Duration,
     seq: Arc<AtomicU64>,
-    jobs: Arc<Mutex<HashMap<String, Arc<Job>>>>,
+    jobs: Arc<Mutex<HashMap<JobId, Arc<Job>>>>,
 }
 
 const DEFAULT_PAGE: usize = 200;
@@ -101,7 +99,13 @@ impl JobStore {
         timeout_secs: Option<u64>,
         background: bool,
     ) -> std::io::Result<RunResult> {
-        let id = format!("j{}", self.seq.fetch_add(1, Ordering::Relaxed));
+        // Hold the jobs lock across id generation and insertion so the id is
+        // reserved atomically: two identical commands launched in the same minute
+        // can't both see their `slug-HH:MM` as free and clobber each other's
+        // entry. Nothing awaits while the guard is held (file create + spawn are
+        // synchronous), so the critical section stays short.
+        let mut jobs = self.jobs.lock().await;
+        let id = JobId::generate(&cmd, &self.seq, |candidate| jobs.contains_key(candidate));
         let log_path = self.dir.join(format!("{id}.log"));
 
         // ponytail: stdout+stderr merged into one log (terminal-style). Split into
@@ -154,7 +158,8 @@ impl JobStore {
             done: rx.clone(),
             started: tokio::time::Instant::now(),
         });
-        self.jobs.lock().await.insert(id.clone(), job);
+        jobs.insert(id.clone(), job);
+        drop(jobs);
 
         // `bg: true` — don't wait, hand back the id straight away.
         if background {
@@ -181,7 +186,7 @@ impl JobStore {
     /// Status + one page of a job's log.
     pub async fn poll(
         &self,
-        id: &str,
+        id: &JobId,
         cursor: usize,
         limit: Option<usize>,
     ) -> Option<(JobState, Page)> {
@@ -193,7 +198,7 @@ impl JobStore {
 
     pub async fn list(&self) -> Vec<JobSummary> {
         // Snapshot while holding the map lock, then drop it before any .await.
-        let snapshot: Vec<(String, Arc<Job>)> = {
+        let snapshot: Vec<(JobId, Arc<Job>)> = {
             let jobs = self.jobs.lock().await;
             jobs.iter()
                 .map(|(id, job)| (id.clone(), Arc::clone(job)))
@@ -213,7 +218,7 @@ impl JobStore {
 
     /// Kill a running job by signalling its whole process group. Returns `false`
     /// when the id is unknown or the job already finished — nothing to signal.
-    pub async fn kill(&self, id: &str) -> bool {
+    pub async fn kill(&self, id: &JobId) -> bool {
         let Some(job) = self.jobs.lock().await.get(id).cloned() else {
             return false;
         };
@@ -354,7 +359,11 @@ mod tests {
 
     #[tokio::test]
     async fn kill_unknown_id_returns_false() {
-        assert!(!store(Duration::from_secs(5)).kill("nope").await);
+        assert!(
+            !store(Duration::from_secs(5))
+                .kill(&JobId::from("nope"))
+                .await
+        );
     }
 
     #[tokio::test]
@@ -366,7 +375,10 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(r, RunResult::Inline { .. }));
-        assert!(!store.kill("j1").await);
+        // Inline doesn't surface the id; fetch the finished job's id from the
+        // listing. Killing an already-exited job must return false.
+        let id = store.list().await.first().expect("job tracked").id.clone();
+        assert!(!store.kill(&id).await);
     }
 
     #[cfg(unix)]
@@ -462,13 +474,14 @@ mod tests {
             done: rx,
             started: tokio::time::Instant::now() - Duration::from_secs(1),
         });
-        store.jobs.lock().await.insert("jfake".into(), job);
+        let id = JobId::from("jfake");
+        store.jobs.lock().await.insert(id.clone(), job);
 
         // The backdated job is stale; kill fails => must not be evicted.
         reaper::reap_once(&store.jobs, Duration::ZERO).await;
 
         assert!(
-            store.poll("jfake", 0, None).await.is_some(),
+            store.poll(&id, 0, None).await.is_some(),
             "running job whose kill failed must stay tracked"
         );
         assert!(log_path.exists(), "its log must not be deleted");
@@ -529,15 +542,13 @@ mod tests {
     #[tokio::test]
     async fn poll_paginates() {
         let store = store(Duration::from_secs(5));
-        let r = store
+        store
             .run("seq 1 10".into(), None, None, false)
             .await
             .unwrap();
-        // seq finishes inline; re-poll the job id to exercise pagination.
-        let id = match r {
-            RunResult::Inline { .. } => "j1".to_string(),
-            RunResult::Backgrounded { id } => id,
-        };
+        // seq finishes inline; fetch its id from the listing to re-poll and
+        // exercise pagination.
+        let id = store.list().await.first().expect("job tracked").id.clone();
         let (_s, page) = store.poll(&id, 0, Some(3)).await.unwrap();
         assert_eq!(page.lines.len(), 3);
         assert_eq!(page.next_cursor, 3);
