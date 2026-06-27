@@ -1,7 +1,8 @@
-//! Auth for `/mcp`: accept either HTTP Basic (simple clients, curl) or a bearer
-//! token issued by the embedded OAuth server (Claude and other GUI clients).
-//! On failure, return a 401 that points clients at the OAuth metadata so they
-//! can start the flow.
+//! Auth for `/mcp`: bearer-only. A valid access token issued by the embedded
+//! OAuth server (Claude and other MCP clients) is required. HTTP Basic is no
+//! longer accepted here — it survives solely as the human login inside
+//! `/authorize` (see `check_basic`). On failure, return a 401 that points
+//! clients at the OAuth metadata so they can start the flow.
 use axum::{
     body::Body,
     extract::{Request, State},
@@ -44,13 +45,12 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
         .strip_prefix("Bearer ")
 }
 
-/// Middleware guarding `/mcp`. Basic creds or a valid bearer token let it through.
+/// Middleware guarding `/mcp`. Only a valid OAuth bearer token lets a request
+/// through; HTTP Basic is rejected here (it remains the human login for
+/// `/authorize`). Anything else gets the OAuth-pointing 401.
 pub async fn require_auth(State(st): State<AuthState>, req: Request, next: Next) -> Response {
     let headers = req.headers();
 
-    if check_basic(headers, &st.creds) {
-        return next.run(req).await;
-    }
     if let Some(token) = bearer(headers) {
         if st.store.validate(token).await {
             return next.run(req).await;
