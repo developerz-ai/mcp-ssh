@@ -191,11 +191,17 @@ impl JobStore {
     }
 
     pub async fn list(&self) -> Vec<JobSummary> {
-        let jobs = self.jobs.lock().await;
-        let mut out = Vec::with_capacity(jobs.len());
-        for (id, job) in jobs.iter() {
+        // Snapshot while holding the map lock, then drop it before any .await.
+        let snapshot: Vec<(String, Arc<Job>)> = {
+            let jobs = self.jobs.lock().await;
+            jobs.iter()
+                .map(|(id, job)| (id.clone(), Arc::clone(job)))
+                .collect()
+        };
+        let mut out = Vec::with_capacity(snapshot.len());
+        for (id, job) in snapshot {
             out.push(JobSummary {
-                id: id.clone(),
+                id,
                 cmd: job.cmd.clone(),
                 state: job.state.lock().await.clone(),
             });

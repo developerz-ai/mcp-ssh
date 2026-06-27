@@ -3,6 +3,7 @@
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -78,7 +79,7 @@ impl Config {
     fn from_env(env: &dyn EnvSource) -> Result<Self, ConfigError> {
         let file = load_file(&config_path(env))?;
 
-        let bind = pick(env, "MCP_SSH_BIND", file.bind, "127.0.0.1:1337")
+        let bind: SocketAddr = pick(env, "MCP_SSH_BIND", file.bind, "127.0.0.1:1337")
             .parse()
             .map_err(|e| ConfigError::Invalid("bind", format!("{e}")))?;
 
@@ -101,9 +102,21 @@ impl Config {
 
         let allowed_hosts = match env.get("MCP_SSH_ALLOWED_HOSTS") {
             Some(v) => split_hosts(&v),
-            None => file
-                .allowed_hosts
-                .unwrap_or_else(|| vec!["localhost".into(), "127.0.0.1".into()]),
+            None => match file.allowed_hosts {
+                Some(hosts) => hosts,
+                // Only the real fallback — neither env nor file set hosts — risks
+                // DNS rebinding, so warn here rather than for any explicit config.
+                None => {
+                    if !bind.ip().is_loopback() {
+                        warn!(
+                            "MCP_SSH_ALLOWED_HOSTS unset and bind is non-loopback ({}) — \
+                             DNS-rebinding attacks possible. Set MCP_SSH_ALLOWED_HOSTS explicitly.",
+                            bind.ip()
+                        );
+                    }
+                    vec!["localhost".into(), "127.0.0.1".into()]
+                }
+            },
         };
 
         let public_url = opt(env, "MCP_SSH_PUBLIC_URL", file.public_url);
@@ -199,6 +212,30 @@ mod tests {
         }
     }
 
+    /// A `MakeWriter` collecting subscriber output into a shared buffer so a test
+    /// can assert whether a given log line was (or was not) emitted.
+    #[derive(Clone, Default)]
+    struct BufWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for BufWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if let Ok(mut guard) = self.0.lock() {
+                guard.extend_from_slice(buf);
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufWriter {
+        type Writer = BufWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
     #[test]
     fn env_overrides_file() {
         let dir = tempdir().unwrap();
@@ -256,5 +293,79 @@ mod tests {
             let mode = std::fs::metadata(&cfg_path).unwrap().mode();
             assert_eq!(mode & 0o777, 0o600, "expected mode 0o600, got {mode:o}");
         }
+    }
+
+    #[test]
+    fn non_loopback_bind_without_allowed_hosts_env_loads() {
+        let dir = tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+
+        // Bind to non-loopback (0.0.0.0) without MCP_SSH_ALLOWED_HOSTS set.
+        // Should load successfully; warning issued at runtime.
+        let env = MapEnv::new(&[
+            ("MCP_SSH_CONFIG", cfg_path.to_str().unwrap()),
+            ("MCP_SSH_BIND", "0.0.0.0:8080"),
+            ("MCP_SSH_USER", "test"),
+            ("MCP_SSH_PASS", "test"),
+        ]);
+        let cfg = Config::from_env(&env).expect("should load with warning");
+        assert_eq!(cfg.bind.ip().to_string(), "0.0.0.0");
+        // Default allowed_hosts used (localhost/127.0.0.1).
+        assert_eq!(cfg.allowed_hosts, vec!["localhost", "127.0.0.1"]);
+    }
+
+    #[test]
+    fn loopback_bind_without_allowed_hosts_env_loads_silently() {
+        let dir = tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+
+        // Bind to loopback (127.0.0.1) without MCP_SSH_ALLOWED_HOSTS set.
+        // Should load without warning.
+        let env = MapEnv::new(&[
+            ("MCP_SSH_CONFIG", cfg_path.to_str().unwrap()),
+            ("MCP_SSH_BIND", "127.0.0.1:1337"),
+            ("MCP_SSH_USER", "test"),
+            ("MCP_SSH_PASS", "test"),
+        ]);
+        let cfg = Config::from_env(&env).expect("should load");
+        assert_eq!(cfg.bind.ip().to_string(), "127.0.0.1");
+        assert_eq!(cfg.allowed_hosts, vec!["localhost", "127.0.0.1"]);
+    }
+
+    #[test]
+    fn non_loopback_bind_with_explicit_file_hosts_loads_without_warning() {
+        let dir = tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+
+        // Explicit allowed_hosts in config.toml; non-loopback bind; env unset.
+        let file_cfg = FileConfig {
+            allowed_hosts: Some(vec!["mcp.example.com".into()]),
+            ..Default::default()
+        };
+        std::fs::write(&cfg_path, toml::to_string_pretty(&file_cfg).unwrap()).unwrap();
+
+        let env = MapEnv::new(&[
+            ("MCP_SSH_CONFIG", cfg_path.to_str().unwrap()),
+            ("MCP_SSH_BIND", "0.0.0.0:8080"),
+            ("MCP_SSH_USER", "test"),
+            ("MCP_SSH_PASS", "test"),
+        ]);
+
+        let buf = BufWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let cfg =
+            tracing::subscriber::with_default(subscriber, || Config::from_env(&env).expect("load"));
+
+        // Explicit file hosts win; the fallback (and its warning) is never reached.
+        assert_eq!(cfg.allowed_hosts, vec!["mcp.example.com"]);
+        let logs = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            !logs.contains("DNS-rebinding"),
+            "no DNS-rebinding warning expected with explicit file hosts: {logs}"
+        );
     }
 }

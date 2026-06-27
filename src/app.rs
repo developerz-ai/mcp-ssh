@@ -51,6 +51,10 @@ mod tests {
     }
 
     fn test_app() -> Router {
+        test_app_with(None)
+    }
+
+    fn test_app_with(public_url: Option<&str>) -> Router {
         let dir = tempfile::tempdir().unwrap().keep();
         let store = JobStore::new(dir, std::time::Duration::from_secs(2)).unwrap();
         let state = oauth::AuthState {
@@ -59,7 +63,7 @@ mod tests {
                 pass: "secret".into(),
             },
             store: Arc::new(oauth::Store::default()),
-            public_url: None,
+            public_url: public_url.map(Into::into),
         };
         build(state, store, vec!["localhost".into(), "127.0.0.1".into()])
     }
@@ -80,13 +84,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mcp_without_auth_returns_401_with_oauth_challenge() {
+    async fn mcp_without_auth_and_no_public_url_returns_bare_401() {
+        // `/mcp` auth runs before the allowed-hosts gate, so the Host here is
+        // attacker-controlled. With no configured public_url it must NOT be
+        // reflected into a challenge: a bare 401, no WWW-Authenticate.
         let res = test_app()
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/mcp")
-                    .header(header::HOST, "mcp.example.com")
+                    .header(header::HOST, "evil.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert!(!res.headers().contains_key(header::WWW_AUTHENTICATE));
+    }
+
+    #[tokio::test]
+    async fn mcp_without_auth_with_public_url_advertises_configured_challenge() {
+        // A configured public_url is trusted, so the challenge is advertised — and
+        // it uses that URL, never the (attacker-controlled) Host header.
+        let res = test_app_with(Some("https://mcp.example.com"))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header(header::HOST, "evil.example.com")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -96,11 +122,12 @@ mod tests {
         let challenge = res
             .headers()
             .get(header::WWW_AUTHENTICATE)
-            .unwrap()
+            .expect("challenge present when public_url is configured")
             .to_str()
             .unwrap();
         assert!(challenge.contains("Bearer"));
-        assert!(challenge.contains("oauth-protected-resource"));
+        assert!(challenge.contains("https://mcp.example.com/.well-known/oauth-protected-resource"));
+        assert!(!challenge.contains("evil.example.com"));
     }
 
     #[tokio::test]
