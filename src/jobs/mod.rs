@@ -14,6 +14,7 @@ use std::{
 
 use tokio::sync::{Mutex, watch};
 
+mod id;
 mod reaper;
 
 use reaper::{kill_job, spawn_reaper};
