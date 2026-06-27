@@ -12,9 +12,12 @@ use std::{
 use tokio::sync::{Mutex, watch};
 
 mod id;
+mod log;
 mod reaper;
 
 pub use id::JobId;
+pub use log::Page;
+use log::{DEFAULT_PAGE, read_page};
 use reaper::{kill_job, spawn_reaper};
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -51,15 +54,6 @@ pub enum RunResult {
     Backgrounded { id: JobId },
 }
 
-/// One page of log lines plus a cursor to fetch the next page.
-#[derive(Debug, serde::Serialize)]
-pub struct Page {
-    pub lines: Vec<String>,
-    pub next_cursor: usize,
-    pub total_lines: usize,
-    pub has_more: bool,
-}
-
 #[derive(Debug, serde::Serialize)]
 pub struct JobSummary {
     pub id: JobId,
@@ -74,8 +68,6 @@ pub struct JobStore {
     seq: Arc<AtomicU64>,
     jobs: Arc<Mutex<HashMap<JobId, Arc<Job>>>>,
 }
-
-const DEFAULT_PAGE: usize = 200;
 
 impl JobStore {
     pub fn new(dir: PathBuf, inline_timeout: Duration) -> std::io::Result<Self> {
@@ -223,30 +215,6 @@ impl JobStore {
             return false;
         };
         kill_job(&job).await
-    }
-}
-
-/// Read lines `[cursor, cursor+limit)` from a log file. Re-reads the whole file
-/// each call — fine for typical logs; seek by byte offset if they get huge.
-async fn read_page(path: &std::path::Path, cursor: usize, limit: usize) -> Page {
-    // Binary-safe: a command that writes non-UTF-8 bytes (e.g. compiled output,
-    // escape sequences) must not produce a silently-empty log page.
-    let bytes = tokio::fs::read(path).await.unwrap_or_default();
-    let content = String::from_utf8_lossy(&bytes);
-    let all: Vec<&str> = content.lines().collect();
-    let total = all.len();
-    let end = (cursor + limit).min(total);
-    let lines = all
-        .get(cursor..end)
-        .unwrap_or(&[])
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    Page {
-        lines,
-        next_cursor: end,
-        total_lines: total,
-        has_more: end < total,
     }
 }
 
@@ -554,23 +522,5 @@ mod tests {
         assert_eq!(page.next_cursor, 3);
         assert!(page.has_more);
         assert_eq!(page.total_lines, 10);
-    }
-
-    #[tokio::test]
-    async fn read_page_handles_binary_log_without_empty_output() {
-        // Simulate a command that writes non-UTF-8 bytes to its log.
-        let dir = tempfile::tempdir().unwrap();
-        let log = dir.path().join("bin.log");
-        // Valid UTF-8 prefix + invalid bytes + valid suffix.
-        tokio::fs::write(&log, b"line1\nline2\xff\xfeline3\n")
-            .await
-            .unwrap();
-        let page = read_page(&log, 0, 100).await;
-        // Must return lines, not an empty page.
-        assert!(
-            !page.lines.is_empty(),
-            "binary log must not produce empty page"
-        );
-        assert!(page.lines[0].contains("line1"));
     }
 }
