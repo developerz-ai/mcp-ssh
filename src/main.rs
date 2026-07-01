@@ -7,6 +7,7 @@ mod config;
 mod db;
 mod jobs;
 mod oauth;
+mod sentry;
 mod tools;
 
 use std::sync::Arc;
@@ -15,8 +16,14 @@ use clap::Parser;
 
 use cli::{Cli, Command, JobCommand};
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // Sentry MUST init before the tokio runtime: its reqwest transport spins up its
+    // own runtime, and the guard has to live for the whole program so in-flight
+    // events flush on exit. `let _sentry_guard` keeps the binding alive (a bare
+    // `let _ =` would drop it immediately and disable capture). Unset/malformed
+    // DSN → a disabled no-op client; the app runs regardless.
+    let _sentry_guard = sentry::init();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -24,6 +31,21 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    // Capture run() failures (config/load/bind/serve) to Sentry before they leave
+    // main — otherwise they propagate as an exit code and never reach error
+    // tracking. The guard is still bound; this just reports on the way out.
+    let result = runtime.block_on(run());
+    if let Err(ref error) = result {
+        let source: &dyn std::error::Error = error.as_ref();
+        sentry::capture_error(source);
+    }
+    result
+}
+
+async fn run() -> anyhow::Result<()> {
     match Cli::parse()
         .command
         .unwrap_or(Command::Serve { port: None })

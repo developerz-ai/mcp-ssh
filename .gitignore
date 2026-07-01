@@ -31,3 +31,7 @@ config.toml
 
 # Personal, untracked prompt/skill copies (generic versions live in docs/prompts/)
 /tmp/
+
+.claude-task-master/
+claudetm.log
+goal.txt
