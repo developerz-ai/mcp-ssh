@@ -7,6 +7,7 @@ mod config;
 mod db;
 mod jobs;
 mod oauth;
+mod sentry;
 mod tools;
 
 use std::sync::Arc;

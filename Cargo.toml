@@ -56,6 +56,10 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# error-tracking event scrubbing (credential redaction before send). Already a
+# transitive dep of `sentry`; declared so `src/sentry.rs` can name it directly.
+regex = "1"
+
 # error tracking → GlitchTip (Sentry-protocol). rustls transport, never
 # native-tls: `default-features = false` drops `native-tls` + `debug-images`
 # (both default). Re-enable only error-tracking integrations + reqwest/rustls.
