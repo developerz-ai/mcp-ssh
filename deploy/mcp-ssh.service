@@ -12,6 +12,8 @@ ExecStart=/usr/bin/mcp-ssh serve
 StateDirectory=mcp-ssh
 # Optional env overrides. Config credentials live at `/etc/mcp-ssh/config.toml`
 # (written by `mcp-ssh set-auth`); this file is for ephemeral knobs.
+# GlitchTip error tracking (SENTRY_DSN / SENTRY_ENVIRONMENT) is injected via
+# this env file; unset SENTRY_DSN ⇒ disabled no-op client.
 EnvironmentFile=-/etc/mcp-ssh/mcp-ssh.env
 Restart=on-failure
 RestartSec=5
