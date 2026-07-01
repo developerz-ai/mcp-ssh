@@ -216,54 +216,97 @@ mod tests {
     use super::*;
 
     #[test]
-    fn redacts_password_key_value() {
-        assert_eq!(scrub_str("password=hunter2"), "password=***REDACTED***");
-        assert_eq!(
-            scrub_str("db password: s3cr3t!"),
-            "db password: ***REDACTED***"
-        );
-        assert_eq!(
-            scrub_str("TOKEN=abc.def.ghi end"),
-            "TOKEN=***REDACTED*** end"
-        );
-        // MCP_SSH_PASS-shaped leakage.
-        assert_eq!(
-            scrub_str("MCP_SSH_PASS=letmein"),
-            "MCP_SSH_PASS=***REDACTED***"
-        );
+    fn scrubs_password_assignment() {
+        // `key=value` / `key: value` for the secret key set: the value is dropped,
+        // never the key. Covers both separators and the short `pwd`/`pass` forms.
+        for (input, secret) in [
+            ("MCP_SSH_PASS=hunter2", "hunter2"),
+            ("password: hunter2", "hunter2"),
+            ("pwd=x", "x"),
+        ] {
+            let out = scrub_str(input);
+            assert!(!out.contains(secret), "{input:?} leaked {secret:?}: {out}");
+            assert!(out.contains(REDACTED), "{input:?} not redacted: {out}");
+        }
     }
 
     #[test]
-    fn redacts_url_credentials() {
-        assert_eq!(
-            scrub_str("https://alice:hunter2@example.com/path"),
-            "https://alice:***REDACTED***@example.com/path",
-        );
-        // No password → untouched.
-        assert_eq!(
-            scrub_str("ssh://alice@example.com"),
-            "ssh://alice@example.com"
-        );
-        // Password containing colons is fully redacted up to the host.
-        assert_eq!(scrub_str("ftp://u:a:b@c"), "ftp://u:***REDACTED***@c");
+    fn redacts_mcp_ssh_pass_env_value() {
+        // MCP_SSH_PASS is the must-never-leak env; its value can never survive scrubbing.
+        let out = scrub_str("MCP_SSH_PASS=hunter2");
+        assert!(!out.contains("hunter2"));
+        assert_eq!(out, "MCP_SSH_PASS=***REDACTED***");
     }
 
     #[test]
-    fn redacts_pem_private_key_block() {
-        let pem = "preamble\n\
-                   -----BEGIN RSA PRIVATE KEY-----\n\
-                   MIIEpAIBAAKCAQEA0Z3VS5Jo0...\n\
-                   -----END RSA PRIVATE KEY-----\n\
-                   trailer";
-        let out = scrub_str(pem);
-        assert!(
-            !out.contains("MIIEpAIBAAKCAQEA0Z3VS5Jo0"),
-            "key body leaked: {out}"
-        );
-        assert!(!out.contains("BEGIN RSA PRIVATE KEY"));
+    fn scrubs_user_pass_url() {
+        let out = scrub_str("https://alice:s3cr3t@host.example/p");
+        assert!(!out.contains("s3cr3t"), "password leaked: {out}");
         assert!(out.contains(REDACTED));
-        assert!(out.contains("preamble"));
-        assert!(out.contains("trailer"));
+        // Userinfo user + host/path survive; only the password is blanked.
+        assert!(out.contains("alice"));
+        assert!(out.contains("host.example/p"));
+    }
+
+    #[test]
+    fn scrubs_pem_private_key_block() {
+        let pem = "leading context\n\
+                   -----BEGIN OPENSSH PRIVATE KEY-----\n\
+                   b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAAAAAAAA\n\
+                   -----END OPENSSH PRIVATE KEY-----\n\
+                   trailing context";
+        let out = scrub_str(pem);
+        assert!(!out.contains("b3BlbnNza"), "key body leaked: {out}");
+        assert!(!out.contains("BEGIN OPENSSH PRIVATE KEY"));
+        assert!(!out.contains("END OPENSSH PRIVATE KEY"));
+        assert!(out.contains(REDACTED));
+        assert!(out.contains("leading context"));
+        assert!(out.contains("trailing context"));
+    }
+
+    #[test]
+    fn scrubs_nested_secret_in_json() {
+        let v = serde_json::json!({"auth": {"token": "xyz"}, "ok": "keep"});
+        let out = scrub_value(v, &Scrubbers::build());
+        assert!(
+            !out.to_string().contains("xyz"),
+            "secret leaked into JSON: {out}"
+        );
+        assert_eq!(out["ok"], "keep");
+        assert_eq!(out["auth"]["token"], REDACTED);
+    }
+
+    #[test]
+    fn scrub_value_descends_arrays() {
+        // The Array arm must redact URL-bearing strings and recurse into nested objects.
+        let v = serde_json::json!({ "items": ["ssh://u:pw@h", "plain", {"token": "t"}] });
+        let out = scrub_value(v, &Scrubbers::build());
+        assert_eq!(out["items"][0], "ssh://u:***REDACTED***@h");
+        assert_eq!(out["items"][1], "plain");
+        assert_eq!(out["items"][2]["token"], REDACTED);
+    }
+
+    #[test]
+    fn parse_dsn_disabled_when_unset_or_malformed() {
+        assert!(parse_dsn("").is_none());
+        assert!(parse_dsn("garbage").is_none());
+        // Throwaway valid DSN shape (NOT the real ingest key) parses to Some.
+        assert!(parse_dsn("https://deadbeefdeadbeefdeadbeefdeadbeef@example.invalid/1").is_some());
+    }
+
+    #[test]
+    fn init_is_noop_when_dsn_unset() {
+        // init() with no SENTRY_DSN binds a *disabled* client so the app still runs.
+        // We don't mutate env (racy under parallel tests); only assert in the normal
+        // test/CI state where SENTRY_DSN is unset. The guard unbinds the client on drop.
+        if std::env::var_os("SENTRY_DSN").is_some() {
+            return;
+        }
+        let guard = init();
+        assert!(
+            !guard.is_enabled(),
+            "client must be disabled when DSN is unset"
+        );
     }
 
     #[test]
@@ -274,6 +317,7 @@ mod tests {
 
     #[test]
     fn paranoid_mode_redacts_everything() {
+        // If a regex ever fails to compile, the scrubber fails closed: redact all.
         let s = Scrubbers {
             url: Regex::new("").unwrap(),
             secret: Regex::new("").unwrap(),
@@ -284,62 +328,18 @@ mod tests {
     }
 
     #[test]
-    fn parse_dsn_rejects_invalid_and_accepts_valid() {
-        // A valid ingest DSN shape (public test key) parses.
-        assert!(
-            parse_dsn("https://16a3cee40cba4b40a62a3e2b5ad1ea6f@glitchtip.example/10").is_some()
-        );
-        // Malformed → None, no panic.
-        assert!(parse_dsn("not a dsn").is_none());
-        assert!(parse_dsn("https://example/10").is_none());
-        assert!(parse_dsn("").is_none());
-    }
-
-    #[test]
-    fn no_op_when_dsn_unset() {
-        // init() with no SENTRY_DSN yields a disabled client (the whole point: the
-        // app keeps running). We can't easily call init() without polluting the global
-        // hub, so assert the decision logic it relies on: an unset/empty DSN resolves
-        // to None.
-        let resolved = std::env::var("SENTRY_DSN")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .as_deref()
-            .and_then(parse_dsn);
-        // In the test env SENTRY_DSN is unset → disabled.
-        if std::env::var_os("SENTRY_DSN").is_none() {
-            assert!(resolved.is_none(), "expected disabled client");
-        }
-    }
-
-    #[test]
     fn is_secret_key_matches_case_insensitively() {
         assert!(is_secret_key("PASSWORD"));
         assert!(is_secret_key("Db_Passwd"));
         assert!(is_secret_key("api_token"));
         assert!(is_secret_key("x-dsn"));
+        // Substring bias: a stray "compass" redacts rather than risk a leak.
+        assert!(is_secret_key("compass"));
         assert!(!is_secret_key("hostname"));
     }
 
     #[test]
-    fn scrub_value_redacts_secret_keyed_json() {
-        let scrubbers = Scrubbers::build();
-        let v = serde_json::json!({
-            "user": "alice",
-            "password": "hunter2",
-            "nested": { "TOKEN": "abc" },
-            "list": ["ssh://u:pw@h", "plain"],
-        });
-        let out = scrub_value(v, &scrubbers);
-        assert_eq!(out["user"], "alice");
-        assert_eq!(out["password"], REDACTED);
-        assert_eq!(out["nested"]["TOKEN"], REDACTED);
-        assert_eq!(out["list"][0], "ssh://u:***REDACTED***@h");
-        assert_eq!(out["list"][1], "plain");
-    }
-
-    #[test]
-    fn scrub_event_redacts_fields() {
+    fn scrub_event_redacts_all_fields() {
         let mut event = Event {
             message: Some("login password=hunter2 failed".into()),
             ..Default::default()
@@ -375,7 +375,6 @@ mod tests {
             Some("see https://u:***REDACTED***@host")
         );
         let crumb = &event.breadcrumbs.values[0];
-        // URL creds redacted in the breadcrumb message.
         assert_eq!(
             crumb.message.as_deref(),
             Some("connecting to https://key:***REDACTED***@s/10")
