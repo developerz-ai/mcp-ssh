@@ -56,6 +56,17 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# error tracking → GlitchTip (Sentry-protocol). rustls transport, never
+# native-tls: `default-features = false` drops `native-tls` + `debug-images`
+# (both default). Re-enable only error-tracking integrations + reqwest/rustls.
+sentry = { version = "0.48", default-features = false, features = [
+    "reqwest",
+    "rustls",
+    "backtrace",
+    "contexts",
+    "panic",
+] }
+
 [dev-dependencies]
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
