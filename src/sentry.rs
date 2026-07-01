@@ -9,11 +9,6 @@
 //! Init is owned by `main` (it binds the guard for the program lifetime); this
 //! module never logs or returns secrets.
 
-// Nothing here is referenced until `main` binds the guard (next change: init must
-// run before the tokio runtime starts, so the wiring lands with that refactor).
-// Drop this allow once `init()` is called from `main`.
-#![allow(dead_code)]
-
 use std::sync::Arc;
 
 use regex::{Captures, Regex};
@@ -93,7 +88,8 @@ impl Scrubbers {
 /// Pure redaction of a single string — the testable unit. Rebuilds the patterns each
 /// call; cheap, and keeps the function self-contained. Runtime events instead reuse a
 /// single cached `Scrubbers` via `init`'s `Arc`.
-pub(crate) fn scrub_str(s: &str) -> String {
+#[cfg(test)]
+fn scrub_str(s: &str) -> String {
     Scrubbers::build().scrub(s)
 }
 
