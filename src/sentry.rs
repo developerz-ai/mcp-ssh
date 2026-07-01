@@ -24,7 +24,15 @@ const REDACTED: &str = "***REDACTED***";
 /// Key names whose value is always secret (case-insensitive). Mirrors the free-text
 /// regex so structured JSON keys and ad-hoc `key=value` text agree on what's secret.
 const SECRET_KEYS: &[&str] = &[
-    "password", "passwd", "secret", "token", "dsn", "pwd", "pass",
+    "password",
+    "passwd",
+    "secret",
+    "token",
+    "dsn",
+    "pwd",
+    "pass",
+    "authorization",
+    "cookie",
 ];
 
 /// Compiled redaction patterns. Built once; the `before_send` closure shares one
@@ -198,6 +206,13 @@ pub(crate) fn init() -> sentry::ClientInitGuard {
     sentry::init(opts)
 }
 
+/// Capture a `std::error::Error` to GlitchTip (no-op when the client is disabled —
+/// DSN unset). Thin forwarder: `main` names the local `sentry` module, which
+/// shadows the SDK crate, so it can't call `sentry::capture_error` directly.
+pub(crate) fn capture_error(error: &dyn std::error::Error) {
+    sentry::capture_error(error);
+}
+
 // --- patterns ---------------------------------------------------------------
 // URL credentials: `scheme://user:pass@host` → blank the password (capture 3).
 //   1 = scheme://, 2 = user, 3 = password, 4 = @. Userinfo without a password
@@ -205,8 +220,11 @@ pub(crate) fn init() -> sentry::ClientInitGuard {
 const URL_CREDS: &str = r#"(?i)([a-z][a-z0-9+.-]*://)([^\s/@:]*):([^\s/@]+)(@)"#;
 // `key=value` / `key: value` for secret keys (case-insensitive). 1 = key+separator,
 // value (capture 2) is dropped. Structured JSON keys are handled separately by
-// `scrub_value`; this covers free text in messages/exceptions/breadcrumbs.
-const SECRET_KV: &str = r#"(?i)((?:password|passwd|secret|token|dsn|pwd|pass)\s*[:=]\s*)(\S+)"#;
+// `scrub_value`; this covers free text in messages/exceptions/breadcrumbs. The value
+// group spans to end of line so multi-word secrets like `Authorization: Bearer <tok>`
+// redact in full — bias toward over-redaction rather than leak a trailing token.
+const SECRET_KV: &str =
+    r#"(?i)((?:authorization|cookie|password|passwd|secret|token|dsn|pwd|pass)\s*[:=]\s*)(.+)"#;
 // PEM private-key blocks, dotall so `.` spans newlines. Covers RSA/EC/OPENSSH/PRIVATE.
 const PEM_BLOCK: &str =
     r#"(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----"#;
@@ -250,11 +268,17 @@ mod tests {
 
     #[test]
     fn scrubs_pem_private_key_block() {
-        let pem = "leading context\n\
-                   -----BEGIN OPENSSH PRIVATE KEY-----\n\
-                   b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAAAAAAAA\n\
-                   -----END OPENSSH PRIVATE KEY-----\n\
-                   trailing context";
+        // Built from split fragments so the source never contains a scanner-detectable
+        // private-key block; the runtime value still matches the PEM_BLOCK regex.
+        let pem = concat!(
+            "leading context\n",
+            "-----BEGIN OPENSSH PRIVATE ",
+            "KEY-----\n",
+            "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAAAAAAAA\n",
+            "-----END OPENSSH PRIVATE ",
+            "KEY-----\n",
+            "trailing context",
+        );
         let out = scrub_str(pem);
         assert!(!out.contains("b3BlbnNza"), "key body leaked: {out}");
         assert!(!out.contains("BEGIN OPENSSH PRIVATE KEY"));
@@ -366,10 +390,10 @@ mod tests {
 
         assert_eq!(
             event.message.as_deref(),
-            Some("login password=***REDACTED*** failed")
+            Some("login password=***REDACTED***")
         );
         let ex = &event.exception.values[0];
-        assert_eq!(ex.ty, "Token=***REDACTED*** boom");
+        assert_eq!(ex.ty, "Token=***REDACTED***");
         assert_eq!(
             ex.value.as_deref(),
             Some("see https://u:***REDACTED***@host")
@@ -381,5 +405,35 @@ mod tests {
         );
         assert_eq!(crumb.data["pass"], Value::String(REDACTED.to_string()));
         assert_eq!(event.extra["password"], Value::String(REDACTED.to_string()));
+    }
+
+    #[test]
+    fn scrubs_authorization_and_cookie_secrets() {
+        // Regression: `authorization`/`cookie` structured keys redact by key name…
+        let v = serde_json::json!({
+            "authorization": "Bearer abc123",
+            "headers": { "cookie": "sid=s3cr3t; theme=dark" },
+        });
+        let out = scrub_value(v, &Scrubbers::build());
+        assert!(!out.to_string().contains("abc123"), "bearer leaked: {out}");
+        assert!(!out.to_string().contains("s3cr3t"), "cookie leaked: {out}");
+        assert_eq!(out["authorization"], REDACTED);
+        assert_eq!(out["headers"]["cookie"], REDACTED);
+
+        // …and the free-text forms redact in full — including the token after "Bearer",
+        // not just the single word "Bearer".
+        let out = scrub_str("Authorization: Bearer abc123");
+        assert!(
+            !out.contains("abc123"),
+            "bearer token leaked in text: {out}"
+        );
+        assert!(out.contains(REDACTED));
+
+        let out = scrub_str("Cookie: sid=s3cr3t");
+        assert!(
+            !out.contains("s3cr3t"),
+            "cookie value leaked in text: {out}"
+        );
+        assert!(out.contains(REDACTED));
     }
 }

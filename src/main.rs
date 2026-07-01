@@ -34,7 +34,15 @@ fn main() -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(run())
+    // Capture run() failures (config/load/bind/serve) to Sentry before they leave
+    // main — otherwise they propagate as an exit code and never reach error
+    // tracking. The guard is still bound; this just reports on the way out.
+    let result = runtime.block_on(run());
+    if let Err(ref error) = result {
+        let source: &dyn std::error::Error = error.as_ref();
+        sentry::capture_error(source);
+    }
+    result
 }
 
 async fn run() -> anyhow::Result<()> {
