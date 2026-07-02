@@ -53,7 +53,10 @@ pub(super) async fn kill_job(job: &Job) -> bool {
     }
     // Give the group a chance to exit on TERM; force it with KILL otherwise.
     if !exited_within(job.done.clone(), KILL_GRACE).await && !signal_group(pgid, "KILL").await {
-        return false;
+        // The group can die between the grace expiring and the KILL — its own
+        // TERM worked, the KILL just found nothing. Report by final state, not
+        // by KILL delivery, so that success isn't misread as "nothing to kill".
+        return !matches!(*job.state.lock().await, JobState::Running);
     }
     true
 }
@@ -255,15 +258,22 @@ async fn reap_orphans(db: &Db, dir: &Path, retention_secs: i64) {
             }
         };
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("log") {
-            continue;
-        }
-        // `<id>.log` -> `<id>`; ids never contain a `.`, so the stem is the id.
-        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        if known.contains(stem) {
-            continue;
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("log") => {
+                // `<id>.log` -> `<id>`; ids never contain a `.`, so the stem is
+                // the id.
+                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                if known.contains(stem) {
+                    continue;
+                }
+            }
+            // `<id>.log.trim` — a temp a crashed `trim_log` never renamed. Always
+            // an orphan (a completed trim renames it away); the mtime gate below
+            // protects one belonging to a trim in progress right now.
+            Some("trim") => {}
+            _ => continue,
         }
         // Orphan: drop it only once it's aged past retention by mtime, so a log
         // whose row hasn't been written yet (a brief race) isn't deleted early.
@@ -430,6 +440,45 @@ mod tests {
     async fn kill_group_on_dead_pgid_reports_gone() {
         // A pgid with no live members must read as already-gone, not hang.
         assert!(kill_group(2_000_000_000).await);
+    }
+
+    #[tokio::test]
+    async fn reap_orphans_removes_aged_trim_temps_and_keeps_known_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::memory();
+        db.call(|conn| {
+            conn.execute(
+                "INSERT INTO jobs (id, status, started_unix) VALUES ('known', 'exited', 0)",
+                [],
+            )
+        })
+        .await
+        .unwrap();
+
+        // A crashed trim's temp, an orphan log, and a known job's log.
+        let trim_tmp = dir.path().join("dead.log.trim");
+        let orphan = dir.path().join("orphan.log");
+        let known = dir.path().join("known.log");
+        for p in [&trim_tmp, &orphan, &known] {
+            tokio::fs::write(p, "x\n").await.unwrap();
+            // Age past any retention: mtime at the epoch.
+            let status = tokio::process::Command::new("touch")
+                .args(["-d", "@0"])
+                .arg(p)
+                .status()
+                .await
+                .unwrap();
+            assert!(status.success());
+        }
+
+        reap_orphans(&db, dir.path(), RETENTION_SECS).await;
+
+        assert!(
+            !trim_tmp.exists(),
+            "aged .log.trim temp must be swept — no reaper path deleted it before"
+        );
+        assert!(!orphan.exists(), "aged orphan log must be swept");
+        assert!(known.exists(), "a log with a matching row must be kept");
     }
 
     #[tokio::test]

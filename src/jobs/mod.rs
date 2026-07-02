@@ -202,29 +202,45 @@ impl JobStore {
         db: crate::db::Db,
     ) -> std::io::Result<Self> {
         std::fs::create_dir_all(&dir)?;
-        let jobs = Arc::new(Mutex::new(HashMap::new()));
+        let jobs: Arc<Mutex<HashMap<JobId, Arc<Job>>>> = Arc::new(Mutex::new(HashMap::new()));
 
         // Startup reconcile: a row left `running` by a previous process can't still
         // be running — that process (and its children) died with it. Flip those to
-        // `failed` so history is truthful. Scoped to `started_unix < boot`: only
-        // rows from before this process started qualify, so a job *this* process
-        // launches (started_unix >= boot) is never clobbered by the racing update.
-        // `new` is sync, so the reconcile is spawned; the reaper only touches rows
-        // older than its retention, so it won't race this for recent rows.
+        // `failed` so history is truthful. Scoped to `started_unix <= boot` minus
+        // the ids live in this process: `<` alone missed a dead job from a crash
+        // loop restarting within the same wall-clock second (it stayed `running`
+        // for up to 24h). The jobs lock is held across the update, and `run`
+        // inserts into the map (under that lock) before writing its row — so any
+        // row this process creates either has its id in the snapshot or appears
+        // only after the update ran. `new` is sync, so the reconcile is spawned.
         let boot = crate::db::now_unix();
         {
             let db = db.clone();
+            let jobs = jobs.clone();
             tokio::spawn(async move {
-                if let Err(error) = db
+                let live = jobs.lock().await;
+                let live_ids: Vec<String> = live.keys().map(|id| id.as_ref().to_string()).collect();
+                let result = db
                     .call(move |conn| {
-                        conn.execute(
+                        // `NOT IN ()` is a syntax error, and at boot the map is
+                        // always empty — only add the clause when there are ids.
+                        let exclude = if live_ids.is_empty() {
+                            String::new()
+                        } else {
+                            let placeholders = vec!["?"; live_ids.len()].join(",");
+                            format!(" AND id NOT IN ({placeholders})")
+                        };
+                        let sql = format!(
                             "UPDATE jobs SET status = 'failed', error = 'server restarted' \
-                             WHERE status = 'running' AND started_unix < ?1",
-                            [boot],
-                        )
+                             WHERE status = 'running' AND started_unix <= ?{exclude}"
+                        );
+                        let params = std::iter::once(rusqlite::types::Value::from(boot))
+                            .chain(live_ids.into_iter().map(rusqlite::types::Value::from));
+                        conn.execute(&sql, rusqlite::params_from_iter(params))
                     })
-                    .await
-                {
+                    .await;
+                drop(live);
+                if let Err(error) = result {
                     tracing::warn!(%error, "startup job reconcile failed");
                 }
             });
@@ -266,8 +282,13 @@ impl JobStore {
         // reply, `job(list)`, reaper logs, and the log filename — so deriving it
         // from `cmd` would leak that secret. The title is normalized in `JobId`.
         let mut jobs = self.jobs.lock().await;
+        // A candidate is taken if it's live in this process OR its log file
+        // survives from a previous one (rows and logs outlive restarts for 24h).
+        // Without the disk check, a post-restart job minting a retained id would
+        // truncate the old job's log, lose its own row to the PK conflict, and
+        // clobber the old row's final state from `persist_final`.
         let id = JobId::generate(&self.seq, title.as_deref(), |candidate| {
-            jobs.contains_key(candidate)
+            jobs.contains_key(candidate) || self.dir.join(format!("{candidate}.log")).exists()
         });
         let log_path = self.dir.join(format!("{id}.log"));
 
@@ -1116,6 +1137,84 @@ mod tests {
             "a stale running row must reconcile to failed"
         );
         drop(store); // keep the store (its reaper task) alive across the wait
+    }
+
+    #[tokio::test]
+    async fn startup_reconcile_catches_same_second_stale_row() {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let db = Db::memory();
+        // A crash loop can restart within the same wall-clock second, leaving a
+        // row whose `started_unix` equals the new process's boot second. It's
+        // just as dead as an older row and must reconcile to failed.
+        let started = crate::db::now_unix();
+        db.call(move |conn| {
+            conn.execute(
+                "INSERT INTO jobs (id, status, started_unix) VALUES ('ghost-same-sec', 'running', ?1)",
+                [started],
+            )
+        })
+        .await
+        .unwrap();
+
+        let store = JobStore::new(dir, Duration::from_secs(5), Shell::sh(), db.clone()).unwrap();
+        let id = JobId::from("ghost-same-sec");
+        let (status, _code, _tail) = await_row(&db, &id).await;
+        assert_eq!(
+            status, "failed",
+            "a same-second stale running row must reconcile to failed"
+        );
+        drop(store);
+    }
+
+    #[tokio::test]
+    async fn restart_never_reuses_a_retained_job_id() {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let db = Db::memory();
+        let store =
+            JobStore::new(dir.clone(), Duration::from_secs(5), Shell::sh(), db.clone()).unwrap();
+        let r = store
+            .run(
+                "echo first".into(),
+                None,
+                None,
+                false,
+                false,
+                Some("t".into()),
+            )
+            .await
+            .unwrap();
+        let RunResult::Inline { id: first, .. } = r else {
+            panic!("fast command should be inline");
+        };
+        await_row(&db, &first).await;
+
+        // Restart: empty in-memory map, but the old job's log + row survive. A
+        // new job with the same title (often the same second) must NOT mint the
+        // retained id — that would truncate the old log and clobber its row.
+        let store2 =
+            JobStore::new(dir.clone(), Duration::from_secs(5), Shell::sh(), db.clone()).unwrap();
+        let r = store2
+            .run(
+                "echo second".into(),
+                None,
+                None,
+                false,
+                false,
+                Some("t".into()),
+            )
+            .await
+            .unwrap();
+        let second = match r {
+            RunResult::Inline { id, .. } | RunResult::Backgrounded { id } => id,
+        };
+        assert_ne!(first, second, "retained id must never be reused");
+        let old_log = tokio::fs::read_to_string(dir.join(format!("{first}.log")))
+            .await
+            .unwrap();
+        assert!(
+            old_log.contains("first"),
+            "old job's log must survive the new launch: {old_log:?}"
+        );
     }
 
     #[tokio::test]
