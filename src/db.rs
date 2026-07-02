@@ -70,6 +70,12 @@ impl Db {
 
     /// Run `f` against the connection on the blocking pool. The guard lives only
     /// inside the closure (a separate thread), so it never crosses an `.await`.
+    ///
+    /// Never panics: this sits on the request path (every bearer validation and
+    /// job write), where a panic would poison the mutex and turn ALL later calls
+    /// into panics until restart. A poisoned lock is recovered (the connection
+    /// itself is fine — only the closure panicked mid-hold), and a panicking
+    /// closure comes back as an error to its caller alone.
     pub async fn call<F, T>(&self, f: F) -> rusqlite::Result<T>
     where
         F: FnOnce(&Connection) -> rusqlite::Result<T> + Send + 'static,
@@ -77,11 +83,18 @@ impl Db {
     {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
-            let guard = conn.lock().expect("db connection mutex poisoned");
+            let guard = conn
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             f(&guard)
         })
         .await
-        .expect("db blocking task panicked")
+        .unwrap_or_else(|join_error| {
+            Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+                Some(format!("db task panicked: {join_error}")),
+            ))
+        })
     }
 }
 
@@ -139,6 +152,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(exp, 123);
+    }
+
+    #[tokio::test]
+    async fn panicking_closure_is_an_error_and_the_connection_survives() {
+        // A panic inside a db closure must come back as Err to its caller only —
+        // not panic the request path, and not poison the connection for every
+        // later call (which previously turned one bug into a full outage).
+        let db = Db::memory();
+        let r = db
+            .call(|_conn| -> rusqlite::Result<()> { panic!("boom") })
+            .await;
+        assert!(r.is_err(), "panicking closure must surface as an error");
+
+        let one: i64 = db
+            .call(|conn| conn.query_row("SELECT 1", [], |row| row.get(0)))
+            .await
+            .expect("connection must remain usable after a closure panic");
+        assert_eq!(one, 1);
     }
 
     #[test]

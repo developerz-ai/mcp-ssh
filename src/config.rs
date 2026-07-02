@@ -112,23 +112,28 @@ impl Config {
             "/var/lib/mcp-ssh/mcp-ssh.db",
         ));
 
-        let allowed_hosts = match env.get("MCP_SSH_ALLOWED_HOSTS") {
-            Some(v) => split_hosts(&v),
-            None => match file.allowed_hosts {
-                Some(hosts) => hosts,
-                // Only the real fallback — neither env nor file set hosts — risks
-                // DNS rebinding, so warn here rather than for any explicit config.
-                None => {
-                    if !bind.ip().is_loopback() {
-                        warn!(
-                            "MCP_SSH_ALLOWED_HOSTS unset and bind is non-loopback ({}) — \
-                             DNS-rebinding attacks possible. Set MCP_SSH_ALLOWED_HOSTS explicitly.",
-                            bind.ip()
-                        );
-                    }
-                    vec!["localhost".into(), "127.0.0.1".into()]
+        let explicit_hosts = match env.get("MCP_SSH_ALLOWED_HOSTS") {
+            Some(v) => Some(split_hosts(&v)),
+            None => file
+                .allowed_hosts
+                .map(|hosts| normalize_hosts(hosts.into_iter())),
+        };
+        let allowed_hosts = match explicit_hosts {
+            Some(hosts) if !hosts.is_empty() => hosts,
+            // Unset, OR set but empty after trimming (`MCP_SSH_ALLOWED_HOSTS=`,
+            // `allowed_hosts = []`). Empty is treated exactly like unset because
+            // rmcp reads an empty allowlist as allow-ALL hosts — the guard would
+            // be silently OFF, worse than the default.
+            _ => {
+                if !bind.ip().is_loopback() {
+                    warn!(
+                        "MCP_SSH_ALLOWED_HOSTS unset or empty and bind is non-loopback ({}) — \
+                         DNS-rebinding attacks possible. Set MCP_SSH_ALLOWED_HOSTS explicitly.",
+                        bind.ip()
+                    );
                 }
-            },
+                vec!["localhost".into(), "127.0.0.1".into()]
+            }
         };
 
         let public_url = opt(env, "MCP_SSH_PUBLIC_URL", file.public_url);
@@ -149,19 +154,21 @@ impl Config {
 /// Resolve just the SQLite path: env `MCP_SSH_DB`, else the file's `db_path`, else
 /// the default. The admin subcommands (`jobs`/`job kill`/`sessions`) touch only the
 /// database, so they resolve it this way instead of `Config::load`, which requires
-/// auth credentials they don't need.
-pub fn db_path() -> PathBuf {
+/// auth credentials they don't need. A config file that exists but can't be read
+/// or parsed is an error, not a silent fall-through to the default path — that
+/// made the admin CLI inspect (or kill in!) a different database than the server.
+pub fn db_path() -> Result<PathBuf, ConfigError> {
     db_path_in(&ProcessEnv)
 }
 
-fn db_path_in(env: &dyn EnvSource) -> PathBuf {
-    let file = load_file(&config_path(env)).unwrap_or_default();
-    PathBuf::from(pick(
+fn db_path_in(env: &dyn EnvSource) -> Result<PathBuf, ConfigError> {
+    let file = load_file(&config_path(env))?;
+    Ok(PathBuf::from(pick(
         env,
         "MCP_SSH_DB",
         file.db_path,
         "/var/lib/mcp-ssh/mcp-ssh.db",
-    ))
+    )))
 }
 
 /// Write `user`/`pass` into the config file, preserving other fields. Chmod 600.
@@ -179,9 +186,28 @@ fn set_auth_in(env: &dyn EnvSource, user: &str, pass: &str) -> Result<PathBuf, C
         std::fs::create_dir_all(parent).map_err(|e| ConfigError::Io(parent.to_path_buf(), e))?;
     }
     let toml = toml::to_string_pretty(&file).map_err(|e| ConfigError::Parse(e.to_string()))?;
-    std::fs::write(&path, toml).map_err(|e| ConfigError::Io(path.clone(), e))?;
-    chmod_600(&path);
+    write_secret_file(&path, &toml).map_err(|e| ConfigError::Io(path.clone(), e))?;
+    // The 0600 in `write_secret_file` applies only when the file is created; a
+    // pre-existing file keeps its old mode, so tighten it — and a failure here
+    // must be loud, not a plaintext password left world-readable forever.
+    chmod_600(&path).map_err(|e| ConfigError::Io(path.clone(), e))?;
     Ok(path)
+}
+
+/// Write `contents` with the file created 0600 from the first byte. Plain
+/// `fs::write` created it umask-default (typically 0644) and only chmodded
+/// afterwards — a window where any local user could read the plaintext password.
+fn write_secret_file(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    f.write_all(contents.as_bytes())
 }
 
 fn load_file(path: &std::path::Path) -> Result<FileConfig, ConfigError> {
@@ -193,15 +219,23 @@ fn load_file(path: &std::path::Path) -> Result<FileConfig, ConfigError> {
 }
 
 #[cfg(unix)]
-fn chmod_600(path: &std::path::Path) {
+fn chmod_600(path: &std::path::Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
 }
 #[cfg(not(unix))]
-fn chmod_600(_path: &std::path::Path) {}
+fn chmod_600(_path: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
+}
 
 fn split_hosts(v: &str) -> Vec<String> {
-    v.split(',')
+    normalize_hosts(v.split(',').map(str::to_string))
+}
+
+/// Trim and drop empty entries so `""` or `" , "` can't smuggle an empty list
+/// (or empty strings) into the allowlist.
+fn normalize_hosts(hosts: impl Iterator<Item = String>) -> Vec<String> {
+    hosts
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect()
@@ -324,6 +358,86 @@ mod tests {
             let mode = std::fs::metadata(&cfg_path).unwrap().mode();
             assert_eq!(mode & 0o777, 0o600, "expected mode 0o600, got {mode:o}");
         }
+    }
+
+    #[test]
+    fn empty_allowed_hosts_falls_back_to_loopback_default() {
+        // rmcp treats an empty allowlist as allow-ALL hosts, so set-but-empty
+        // (`MCP_SSH_ALLOWED_HOSTS=`, whitespace/commas, or `allowed_hosts = []`
+        // in the file) must behave exactly like unset — loopback default, never
+        // an empty vec.
+        let dir = tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        for empty in ["", " , "] {
+            let env = MapEnv::new(&[
+                ("MCP_SSH_CONFIG", cfg_path.to_str().unwrap()),
+                ("MCP_SSH_ALLOWED_HOSTS", empty),
+                ("MCP_SSH_USER", "test"),
+                ("MCP_SSH_PASS", "test"),
+            ]);
+            let cfg = Config::from_env(&env).expect("load");
+            assert_eq!(
+                cfg.allowed_hosts,
+                vec!["localhost", "127.0.0.1"],
+                "env {empty:?} must not disable the host guard"
+            );
+        }
+
+        // Same for an explicit empty list in the file.
+        std::fs::write(&cfg_path, "allowed_hosts = []\n").unwrap();
+        let env = MapEnv::new(&[
+            ("MCP_SSH_CONFIG", cfg_path.to_str().unwrap()),
+            ("MCP_SSH_USER", "test"),
+            ("MCP_SSH_PASS", "test"),
+        ]);
+        let cfg = Config::from_env(&env).expect("load");
+        assert_eq!(cfg.allowed_hosts, vec!["localhost", "127.0.0.1"]);
+    }
+
+    #[test]
+    fn db_path_propagates_a_broken_config_file() {
+        // A config file that exists but doesn't parse must be an error — the old
+        // unwrap_or_default() sent admin commands to the DEFAULT db path while
+        // the server (whose Config::load errors loudly) used the configured one.
+        let dir = tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        std::fs::write(&cfg_path, "this is { not toml").unwrap();
+        let env = MapEnv::new(&[("MCP_SSH_CONFIG", cfg_path.to_str().unwrap())]);
+        assert!(
+            matches!(db_path_in(&env), Err(ConfigError::Parse(_))),
+            "broken config must not silently resolve to the default db path"
+        );
+
+        // A missing file is still fine (defaults apply).
+        let env = MapEnv::new(&[(
+            "MCP_SSH_CONFIG",
+            dir.path().join("absent.toml").to_str().unwrap(),
+        )]);
+        assert_eq!(
+            db_path_in(&env).unwrap(),
+            PathBuf::from("/var/lib/mcp-ssh/mcp-ssh.db")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn set_auth_tightens_a_preexisting_loose_config_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        std::fs::write(&cfg_path, "").unwrap();
+        std::fs::set_permissions(&cfg_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let env = MapEnv::new(&[("MCP_SSH_CONFIG", cfg_path.to_str().unwrap())]);
+        set_auth_in(&env, "bob", "s3cr3t").expect("set_auth");
+
+        use std::os::unix::fs::MetadataExt;
+        let mode = std::fs::metadata(&cfg_path).unwrap().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "a pre-existing world-readable file must be tightened"
+        );
     }
 
     #[test]
