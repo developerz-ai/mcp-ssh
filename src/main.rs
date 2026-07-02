@@ -74,11 +74,10 @@ fn set_auth(user: String) -> anyhow::Result<()> {
 async fn serve(port: Option<u16>) -> anyhow::Result<()> {
     let mut cfg = config::Config::load()?;
     // `--port` (or MCP_SSH_PORT) overrides just the port of the bind address.
-    if let Some(p) = port.or_else(|| {
-        std::env::var("MCP_SSH_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-    }) {
+    if let Some(p) = match port {
+        Some(p) => Some(p),
+        None => env_port(std::env::var("MCP_SSH_PORT").ok())?,
+    } {
         cfg.bind.set_port(p);
     }
     // The single SQLite database (OAuth tokens + job metadata) under the systemd
@@ -112,6 +111,20 @@ async fn serve(port: Option<u16>) -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
+}
+
+/// Parse the `MCP_SSH_PORT` value. Unset/empty → no override; anything else must
+/// be a valid port. Silently ignoring `8080x` or `70000` (the old `.ok()` chain)
+/// left the server listening on the config/default port while the operator
+/// believed they'd moved it — fail fast instead, like an invalid `MCP_SSH_BIND`.
+fn env_port(raw: Option<String>) -> anyhow::Result<Option<u16>> {
+    match raw.as_deref() {
+        None | Some("") => Ok(None),
+        Some(v) => v
+            .parse::<u16>()
+            .map(Some)
+            .map_err(|e| anyhow::anyhow!("invalid MCP_SSH_PORT {v:?}: {e}")),
+    }
 }
 
 /// Resolves on Ctrl-C or (on Unix) SIGTERM, letting axum drain in-flight
@@ -158,6 +171,17 @@ mod tests {
     use tokio::time::timeout;
 
     use super::*;
+
+    #[test]
+    fn env_port_rejects_garbage_and_passes_valid_values() {
+        assert_eq!(env_port(None).unwrap(), None, "unset → no override");
+        assert_eq!(env_port(Some("".into())).unwrap(), None, "empty → unset");
+        assert_eq!(env_port(Some("8080".into())).unwrap(), Some(8080));
+        // A typo'd or out-of-range port must fail fast, not silently bind the
+        // default port.
+        assert!(env_port(Some("8080x".into())).is_err());
+        assert!(env_port(Some("70000".into())).is_err());
+    }
 
     // SIGTERM (what systemd sends on stop) must resolve `shutdown_signal` so
     // axum begins draining instead of the process being killed outright.
