@@ -36,6 +36,9 @@ impl JobId {
     /// metacharacters can reach the id or its log filename. `exists` reports
     /// whether a candidate is taken; only
     /// on a clash do we append a `-<seq>` from `seq`, so clean ids stay clean.
+    /// Suffixed candidates are re-checked too: the sequence restarts at 1 each
+    /// boot, so `<base>-1` may itself survive from a previous run (the id
+    /// namespace — DB rows and log files — outlives the process).
     pub fn generate(seq: &AtomicU64, title: Option<&str>, exists: impl Fn(&str) -> bool) -> Self {
         let label = title
             .and_then(normalize_title)
@@ -45,9 +48,15 @@ impl JobId {
             return Self(base);
         }
         // Same second + same title: a monotonic suffix keeps the id unique without
-        // sacrificing readability.
-        let n = seq.fetch_add(1, Ordering::Relaxed);
-        Self(format!("{base}-{n}"))
+        // sacrificing readability. The suffix space is unbounded and taken ids are
+        // finite, so this terminates.
+        loop {
+            let n = seq.fetch_add(1, Ordering::Relaxed);
+            let candidate = format!("{base}-{n}");
+            if !exists(&candidate) {
+                return Self(candidate);
+            }
+        }
     }
 }
 
@@ -200,12 +209,27 @@ mod tests {
     #[test]
     fn collision_appends_sequence_suffix() {
         let seq = AtomicU64::new(1);
-        // `exists` always true => the base is "taken", forcing the suffix path.
-        let id = JobId::generate(&seq, None, |_| true);
+        // `exists` true only for the bare base => one suffix step is enough.
+        let id = JobId::generate(&seq, None, |c| !c.ends_with("-1"));
         let s = id.as_ref();
         assert!(valid_format(s, "job"));
         assert!(s.ends_with("-1"), "expected `-1` seq suffix, got {s}");
         assert_eq!(seq.load(Ordering::Relaxed), 2, "clash must advance seq");
+    }
+
+    #[test]
+    fn taken_suffix_advances_to_the_next_free_one() {
+        // The seq restarts at 1 each boot, so `<base>-1` can itself survive from
+        // a previous run. generate must skip every taken suffix, not assume the
+        // first one is free.
+        let seq = AtomicU64::new(1);
+        let id = JobId::generate(&seq, None, |c| !c.ends_with("-3"));
+        let s = id.as_ref();
+        assert!(valid_format(s, "job"));
+        assert!(
+            s.ends_with("-3"),
+            "expected the first free suffix `-3`: {s}"
+        );
     }
 
     #[test]
