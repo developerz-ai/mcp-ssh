@@ -53,12 +53,18 @@ impl Store {
     /// Issue an authorization code bound to the PKCE challenge + redirect_uri.
     pub async fn new_code(&self, challenge: String, redirect_uri: String) -> String {
         let code = random_token();
-        self.codes.lock().await.insert(
+        let now = Instant::now();
+        let mut codes = self.codes.lock().await;
+        // Sweep expired entries here — codes abandoned without a redeem (any
+        // failed/dropped login) were otherwise never removed and the map grew
+        // without bound for the process lifetime.
+        codes.retain(|_, entry| entry.expires > now);
+        codes.insert(
             code.clone(),
             CodeEntry {
                 challenge,
                 redirect_uri,
-                expires: Instant::now() + CODE_TTL,
+                expires: now + CODE_TTL,
             },
         );
         code
@@ -218,6 +224,30 @@ mod tests {
     async fn mint(store: &Store) -> Tokens {
         let code = store.new_code(CHALLENGE.into(), "http://cb".into()).await;
         store.redeem(&code, VERIFIER, "http://cb").await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn expired_codes_are_swept_on_the_next_issue() {
+        let store = store();
+        // Plant an already-expired entry directly; a lazily-checked map would
+        // keep it forever if it's never redeemed.
+        store.codes.lock().await.insert(
+            "stale".into(),
+            CodeEntry {
+                challenge: CHALLENGE.into(),
+                redirect_uri: "http://cb".into(),
+                expires: Instant::now() - Duration::from_secs(1),
+            },
+        );
+
+        let fresh = store.new_code(CHALLENGE.into(), "http://cb".into()).await;
+
+        let codes = store.codes.lock().await;
+        assert!(
+            !codes.contains_key("stale"),
+            "expired code must be swept, not retained until redeem"
+        );
+        assert!(codes.contains_key(&fresh), "fresh code must be kept");
     }
 
     #[test]

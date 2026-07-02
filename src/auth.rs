@@ -31,9 +31,18 @@ pub fn check_basic(headers: &HeaderMap, creds: &Credentials) -> bool {
         .and_then(|h| h.to_str().ok())
         .and_then(|h| h.strip_prefix("Basic "))
         .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
-        .map(|d| String::from_utf8_lossy(&d).into_owned())
-        .as_deref()
-        == Some(expected.as_str())
+        .is_some_and(|d| constant_time_eq(&d, expected.as_bytes()))
+}
+
+/// Compare a candidate secret against the expected value without leaking how much
+/// of it matched. This guards the password an attacker can iterate against
+/// (`/authorize` mints root-equivalent bearer tokens), so a plain `==` — which
+/// short-circuits on length and on the first differing byte — is a timing oracle.
+/// Comparing SHA-256 digests makes the timing independent of where the inputs
+/// differ, and the attacker controls neither digest's bytes.
+fn constant_time_eq(candidate: &[u8], expected: &[u8]) -> bool {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(candidate) == Sha256::digest(expected)
 }
 
 /// Extract a `Bearer <token>` value, if present.

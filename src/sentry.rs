@@ -216,8 +216,12 @@ pub(crate) fn capture_error(error: &dyn std::error::Error) {
 // --- patterns ---------------------------------------------------------------
 // URL credentials: `scheme://user:pass@host` → blank the password (capture 3).
 //   1 = scheme://, 2 = user, 3 = password, 4 = @. Userinfo without a password
-//   (no `:`) doesn't match, so `ssh://host` is left untouched.
-const URL_CREDS: &str = r#"(?i)([a-z][a-z0-9+.-]*://)([^\s/@:]*):([^\s/@]+)(@)"#;
+//   (no `:`) doesn't match, so `ssh://host` is left untouched. The password is
+//   `[^\s]+` — greedy, so it backtracks to the LAST `@` in the token: secrets
+//   containing `/` (base64) or `@` are fully blanked. A `@` later in the
+//   host/path over-redacts up to it, which is the documented bias — the old
+//   `[^\s/@]+` instead leaked such passwords entirely (no match) or partially.
+const URL_CREDS: &str = r#"(?i)([a-z][a-z0-9+.-]*://)([^\s/@:]*):([^\s]+)(@)"#;
 // `key=value` / `key: value` for secret keys (case-insensitive). 1 = key+separator,
 // value (capture 2) is dropped. Structured JSON keys are handled separately by
 // `scrub_value`; this covers free text in messages/exceptions/breadcrumbs. The value
@@ -264,6 +268,25 @@ mod tests {
         // Userinfo user + host/path survive; only the password is blanked.
         assert!(out.contains("alice"));
         assert!(out.contains("host.example/p"));
+    }
+
+    #[test]
+    fn scrubs_url_passwords_containing_slash_or_at() {
+        // Base64-ish secrets routinely contain `/`; the old pattern skipped these
+        // entirely and the whole password leaked.
+        let out = scrub_str("https://user:abc/def@host.example");
+        assert!(!out.contains("abc/def"), "slash password leaked: {out}");
+        assert!(out.contains(REDACTED));
+        assert!(out.contains("host.example"), "host survives: {out}");
+
+        // A password containing `@` previously leaked its tail (`ss` here).
+        let out = scrub_str("https://u:p@ss@host.example");
+        assert!(!out.contains("p@ss"), "at-sign password leaked: {out}");
+        assert!(
+            !out.contains("ss@host"),
+            "password tail must not leak: {out}"
+        );
+        assert!(out.contains("host.example"), "host survives: {out}");
     }
 
     #[test]
