@@ -10,7 +10,7 @@ use crate::db::{Db, now_unix};
 /// Open the database the running server uses. Idempotent — applies the same schema
 /// and pragmas, safe to run alongside the daemon (SQLite WAL allows it).
 fn open_db() -> anyhow::Result<Db> {
-    Db::open(&crate::config::db_path())
+    Db::open(&crate::config::db_path()?)
 }
 
 // ---- jobs ----
@@ -125,7 +125,14 @@ async fn kill_job(db: &Db, id: &str) -> anyhow::Result<String> {
         ));
     };
 
-    let killed = crate::jobs::kill_group(pgid as u32).await;
+    // A pgid outside u32 is a corrupt row; a raw `as` cast would wrap it into a
+    // real (wrong) process group and signal that instead.
+    let Ok(pgid) = u32::try_from(pgid) else {
+        return Ok(format!(
+            "job {id} has a corrupt pgid ({pgid}) — refusing to signal"
+        ));
+    };
+    let killed = crate::jobs::kill_group(pgid).await;
     // Record the kill only if the row is still `running`: when the server owns the
     // job, its waiter may already have written the real exit as the group died.
     let lookup = id.to_string();
@@ -165,7 +172,7 @@ pub async fn sessions() -> anyhow::Result<()> {
     print!(
         "{}",
         render_sessions(
-            &crate::config::db_path().display().to_string(),
+            &crate::config::db_path()?.display().to_string(),
             &access,
             &refresh,
             now
