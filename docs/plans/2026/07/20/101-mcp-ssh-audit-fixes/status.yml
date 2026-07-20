@@ -1,0 +1,30 @@
+plan: 101-mcp-ssh-audit-fixes
+title: mcp-ssh — Audit Fixes
+status: not_started        # not_started | in_progress | blocked | complete | superseded
+created_by: sebi
+worked_by: ""              # executor fills with their git user.name
+owner: sebi
+percent: 0
+current_focus: ""          # next: 01-file-op-bounds.md (HIGH DoS)
+slices:
+  - file: 01-file-op-bounds.md
+    status: not_started
+    percent: 0
+  - file: 02-detached-jobs.md
+    status: not_started
+    percent: 0
+  - file: 03-token-gc-and-db.md
+    status: not_started
+    percent: 0
+  - file: 04-auth-hardening.md
+    status: not_started
+    percent: 0
+  - file: 05-architecture-refactor.md
+    status: not_started
+    percent: 0
+  - file: 06-tests-and-ops.md
+    status: not_started
+    percent: 0
+evidence: []
+notes: "From a 5-agent deep-dive audit. Priority order: 01-03 are user-impacting bugs (OOM/hang, jobs lying, unbounded DB growth); 04 is defense-in-depth (has open decisions); 05 is the architecture refactor — run LAST and rebase onto fixed code; 06 covers untested destructive paths + ops drift. Open decisions in 04 (redirect_uri binding, non-loopback fail-fast) and 06 (/healthz) need owner sign-off."
+last_updated: 2026-07-20
