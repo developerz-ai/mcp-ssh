@@ -71,6 +71,66 @@ async fn oversized_no_newline_line_is_capped_not_slurped() {
 }
 
 #[tokio::test]
+async fn first_page_of_large_file_reports_lower_bound_not_a_full_scan() {
+    // Reading page 1 must not walk the whole file just to print an exact total: on a
+    // multi-GB log that would defeat the line cursor. Proof by count — the footer
+    // reports the page-sized lower bound (`≥ n`), never the file's true line count.
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("big.txt");
+    let mut body = String::new();
+    for i in 0..5000 {
+        body.push_str(&format!("line-{i:05}\n"));
+    }
+    tokio::fs::write(&p, &body).await.unwrap();
+
+    let out = read(p.to_str().unwrap(), 0, 10).await.unwrap();
+    assert!(
+        out.contains("line-00000") && out.contains("line-00009"),
+        "page 1 must hold the first window: {out}"
+    );
+    assert!(
+        !out.contains("line-00010"),
+        "page must stop at the window edge: {out}"
+    );
+    assert!(
+        out.contains("of ≥10") && out.contains("next_cursor=10"),
+        "early stop must report a lower-bound total: {out}"
+    );
+    assert!(
+        !out.contains("of 5000"),
+        "an exact total would mean the scan walked to EOF: {out}"
+    );
+}
+
+#[tokio::test]
+async fn later_pages_advance_and_the_final_page_ends_cleanly() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("multi.txt");
+    tokio::fs::write(&p, b"a\nb\nc\nd\ne\n").await.unwrap();
+    let p = p.to_str().unwrap();
+
+    // A middle page advances the cursor and still reports a lower bound (we stopped
+    // once the two-line window filled, before learning the true total).
+    let mid = read(p, 1, 2).await.unwrap();
+    assert!(
+        mid.contains('b') && mid.contains('c') && !mid.contains('d'),
+        "middle page holds its window: {mid}"
+    );
+    assert!(
+        mid.contains("of ≥3") && mid.contains("next_cursor=3"),
+        "middle page advances on a lower-bound total: {mid}"
+    );
+
+    // The last lines fit in the window, so the scan reaches EOF: exact end, no footer.
+    let last = read(p, 3, 10).await.unwrap();
+    assert_eq!(last, "d\ne", "final page is exact and carries no cursor");
+
+    // Reading past the end is an empty page, never a bogus cursor.
+    let past = read(p, 99, 10).await.unwrap();
+    assert_eq!(past, "", "past-EOF read is empty with no footer");
+}
+
+#[tokio::test]
 async fn grep_finds_match() {
     let dir = tempfile::tempdir().unwrap();
     let c = dir.path().join("c.txt");

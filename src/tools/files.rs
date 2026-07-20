@@ -61,9 +61,20 @@ pub async fn read(path: &str, cursor: usize, limit: usize) -> Result<String, Str
     // stop accumulating a pathological no-newline line instead of read_until slurping
     // the whole file into one buffer.
     let mut line: Vec<u8> = Vec::new();
+    // Whether the scan reached EOF. If it did, `total` is the file's exact line
+    // count; if we stopped early (window full), `total` is only a lower bound.
+    let mut reached_eof = false;
     loop {
+        // Early stop: the window is full, so the page is complete. Counting the rest
+        // of the file just to print an exact total would walk a multi-GB log to answer
+        // page 1 — exactly what a line cursor exists to avoid. Leave `total` a lower
+        // bound and stop.
+        if window.len() >= limit {
+            break;
+        }
         let chunk = reader.fill_buf().await.map_err(|e| e.to_string())?;
         if chunk.is_empty() {
+            reached_eof = true;
             // EOF: emit a final line that had no terminating newline.
             if !line.is_empty() {
                 if total >= cursor && window.len() < limit {
@@ -102,13 +113,21 @@ pub async fn read(path: &str, cursor: usize, limit: usize) -> Result<String, Str
     let page = crate::jobs::paginate(&refs, 0, limit);
     let body = page.lines.join("\n");
     let next = cursor.min(total) + page.lines.len();
-    if next < total {
-        Ok(format!(
-            "{body}\n[lines {cursor}..{next} of {total}; next_cursor={next}]"
-        ))
-    } else {
-        Ok(body)
+    // More remains either way: with an exact total (EOF reached) part still lies
+    // ahead; or we stopped early, so a tail past the window is unknown-but-present.
+    let more_remains = !reached_eof || next < total;
+    if !more_remains {
+        return Ok(body);
     }
+    // Early stop leaves `total` a lower bound — report it as `≥ n`, not a false exact.
+    let total_desc = if reached_eof {
+        total.to_string()
+    } else {
+        format!("≥{total}")
+    };
+    Ok(format!(
+        "{body}\n[lines {cursor}..{next} of {total_desc}; next_cursor={next}]"
+    ))
 }
 
 /// Append `bytes` to the in-flight line without letting it grow past
