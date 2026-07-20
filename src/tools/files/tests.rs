@@ -1,4 +1,5 @@
 use super::*;
+use std::time::Duration;
 
 #[tokio::test]
 async fn write_read_paginate_append_move_delete() {
@@ -214,6 +215,55 @@ async fn grep_recursive_finds_match_in_subdirs() {
     assert!(
         out.contains("beta"),
         "recursive grep should find pattern in subdir: {out}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_output_is_capped_and_infinite_producer_killed() {
+    // `yes` streams "y\n" forever. A correct runner reads to the cap, kills it,
+    // and returns in milliseconds; a runner that buffered the whole stream would
+    // spin on it — so the outer timeout is the proof of streaming, and the bounded
+    // length proves the peak buffer tracks the cap, not the (unbounded) stream.
+    let result = tokio::time::timeout(Duration::from_secs(10), sh("yes", &[]))
+        .await
+        .expect("runner must terminate an infinite producer (streamed cap)")
+        .expect("a capped listing is still Ok");
+    assert!(
+        result.contains("truncated"),
+        "capped output must carry a truncation marker: {:?}",
+        result.get(result.len().saturating_sub(120)..)
+    );
+    assert!(
+        result.len() <= MAX_SHELL_OUTPUT_BYTES + 200,
+        "peak buffer must track the cap, got {} bytes",
+        result.len()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_run_times_out_and_reaps_child() {
+    // A command that outlives the deadline must error promptly, not wait out the
+    // full sleep. `run_bounded` SIGKILLs and awaits the child, so it's reaped — no
+    // orphan outlives this call.
+    let start = std::time::Instant::now();
+    let err = run_bounded(
+        "sleep",
+        &["30"],
+        Duration::from_millis(200),
+        MAX_SHELL_OUTPUT_BYTES,
+    )
+    .await
+    .expect_err("a command exceeding the deadline must error");
+    let elapsed = start.elapsed();
+    assert!(
+        matches!(err, ShError::Timeout { .. }),
+        "must surface as a timeout: {err}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the deadline must fire promptly, not wait out the child: {elapsed:?}"
     );
 }
 
