@@ -185,6 +185,40 @@ async fn list_recursive_finds_nested_files() {
 }
 
 #[tokio::test]
+async fn list_recursive_is_depth_bounded() {
+    // A tree deeper than `MAX_FIND_DEPTH`: entries past the bound must not appear,
+    // so a pathologically deep tree can't drive `find` into an unbounded descent.
+    let dir = tempfile::tempdir().unwrap();
+
+    // Nest `path/d/d/.../d` several levels beyond the depth bound.
+    let mut deep = dir.path().to_path_buf();
+    for _ in 0..(MAX_FIND_DEPTH as usize + 5) {
+        deep = deep.join("d");
+    }
+    tokio::fs::create_dir_all(&deep).await.unwrap();
+    let buried = deep.join("buried.txt");
+    write(buried.to_str().unwrap(), "x").await.unwrap();
+
+    // A shallow file within the bound must still be listed.
+    let shallow = dir.path().join("shallow.txt");
+    write(shallow.to_str().unwrap(), "y").await.unwrap();
+
+    let out = list(dir.path().to_str().unwrap(), true).await.unwrap();
+    assert!(
+        !out.contains("truncated"),
+        "exclusion must be the depth bound, not the byte cap: {out}"
+    );
+    assert!(
+        out.contains("shallow.txt"),
+        "within-bound file must be listed: {out}"
+    );
+    assert!(
+        !out.contains("buried.txt"),
+        "file past maxdepth must not be listed: {out}"
+    );
+}
+
+#[tokio::test]
 async fn delete_directory_removes_entire_tree() {
     let dir = tempfile::tempdir().unwrap();
     let sub = dir.path().join("to_delete");

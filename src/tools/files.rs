@@ -18,6 +18,13 @@ const MAX_SHELL_OUTPUT_BYTES: usize = 64 * 1024;
 /// child and returns a timeout error.
 const MAX_SHELL_RUN_SECS: u64 = 30;
 
+/// Deepest a recursive `list` (`find`) descends below its starting point. The
+/// streamed byte cap already bounds the *output*, but a pathologically deep tree
+/// (or a bind-mount / hardlink cycle) could still drive `find` far down before it
+/// emits cap-worth of text; `-maxdepth` bounds the walk itself. 20 clears any real
+/// source tree while keeping a runaway descent finite.
+const MAX_FIND_DEPTH: u32 = 20;
+
 /// Largest single line accumulated while streaming a `read`. `read_until` would
 /// buffer a whole line before any trimming, so a no-newline multi-GB file could OOM
 /// the service. We keep at most this many bytes per line and drop the rest to the
@@ -185,7 +192,12 @@ pub async fn list(path: &str, recursive: bool) -> Result<String, String> {
         } else {
             path.to_string()
         };
-        sh("find", &[&path]).await.map_err(|e| e.to_string())
+        // `-maxdepth` (after the starting point, before any test → no find warning)
+        // caps how far the walk descends, so a deep tree can't recurse without bound.
+        let depth = MAX_FIND_DEPTH.to_string();
+        sh("find", &[&path, "-maxdepth", &depth])
+            .await
+            .map_err(|e| e.to_string())
     } else {
         sh("ls", &["-la", "--", path])
             .await
