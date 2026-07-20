@@ -1,4 +1,8 @@
-# 🔌 mcp-ssh
+<p align="center">
+  <img src="docs/assets/logo.png" alt="mcp-ssh" width="200">
+</p>
+
+<h1 align="center">mcp-ssh</h1>
 
 > **ssh, but you talk to it over `/mcp` from any MCP client.**
 > A single Rust binary that gives an AI agent a remote shell + file access to **one host — the box it runs on.** No SSH client, no multi-server fan-out, no gateway. It runs commands **locally**, as the service user, and speaks MCP over HTTP.
