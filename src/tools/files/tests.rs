@@ -373,3 +373,95 @@ async fn binary_file_reads_as_lossy_utf8_not_error() {
     assert!(content.contains("hello"), "ASCII prefix should survive");
     assert!(content.contains("world"), "ASCII suffix should survive");
 }
+
+#[tokio::test]
+async fn move_onto_an_existing_dest_errs_and_leaves_both_files_intact() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src.txt");
+    let dst = dir.path().join("dst.txt");
+    let (src, dst) = (src.to_str().unwrap(), dst.to_str().unwrap());
+    write(src, "SRC").await.unwrap();
+    write(dst, "DST").await.unwrap();
+
+    let err = rename(src, dst).await.unwrap_err();
+    assert!(
+        err.contains("exists"),
+        "a clobbering move must error, not overwrite: {err}"
+    );
+    // Move is all-or-nothing: neither file is touched.
+    assert_eq!(read(src, 0, 10).await.unwrap(), "SRC", "source stays put");
+    assert_eq!(
+        read(dst, 0, 10).await.unwrap(),
+        "DST",
+        "destination is untouched"
+    );
+}
+
+#[tokio::test]
+async fn move_onto_a_free_path_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src.txt");
+    let dst = dir.path().join("free.txt");
+    let (src, dst) = (src.to_str().unwrap(), dst.to_str().unwrap());
+    write(src, "hello").await.unwrap();
+
+    rename(src, dst).await.unwrap();
+    assert!(
+        read(src, 0, 10).await.is_err(),
+        "source is gone after a move"
+    );
+    assert_eq!(
+        read(dst, 0, 10).await.unwrap(),
+        "hello",
+        "content lands at the free destination"
+    );
+}
+
+#[test]
+fn append_capped_marks_an_over_long_line_exactly_once() {
+    // Overflow the per-line cap, then feed more: the line seals with a single marker
+    // and the later bytes are dropped, never appended after it.
+    let mut line = Vec::new();
+    append_capped(&mut line, &vec![b'a'; MAX_READ_LINE_BYTES + 5_000]);
+    append_capped(&mut line, b"tail");
+
+    let s = String::from_utf8(line).expect("ASCII head + a valid-UTF-8 marker");
+    assert!(s.starts_with("aaa"), "the line's head survives");
+    assert!(
+        s.ends_with(LINE_TRUNCATED),
+        "an over-long line carries the truncation marker: …{}",
+        &s[s.len().saturating_sub(24)..]
+    );
+    assert_eq!(
+        s.matches(LINE_TRUNCATED).count(),
+        1,
+        "the marker is stamped exactly once"
+    );
+    assert!(
+        !s.contains("tail"),
+        "bytes past the seal are dropped, never appended after the marker"
+    );
+    assert!(
+        s.len() <= MAX_READ_LINE_BYTES + LINE_TRUNCATED.len(),
+        "the buffer stays bounded by the cap plus the marker"
+    );
+}
+
+#[test]
+fn append_capped_trims_a_split_multibyte_char_before_the_marker() {
+    // The cap falls in the middle of a 3-byte char (€ = E2 82 AC): the straddling
+    // char is dropped so the marker isn't preceded by a broken code point.
+    let mut bytes = vec![b'a'; MAX_READ_LINE_BYTES - 1];
+    bytes.extend_from_slice("€".as_bytes());
+    bytes.extend_from_slice(b"zzzz");
+
+    let mut line = Vec::new();
+    append_capped(&mut line, &bytes);
+
+    let s = String::from_utf8(line).expect("head trimmed to a boundary → clean UTF-8");
+    assert!(
+        s.ends_with(LINE_TRUNCATED) && !s.contains('€'),
+        "the split char is dropped, the marker stamped cleanly: …{}",
+        &s[s.len().saturating_sub(24)..]
+    );
+}

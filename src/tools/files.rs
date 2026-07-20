@@ -31,6 +31,13 @@ const MAX_FIND_DEPTH: u32 = 20;
 /// next newline — the agent still sees the line's head, memory stays bounded.
 const MAX_READ_LINE_BYTES: usize = 64 * 1024;
 
+/// Stamped on a `read` line the moment it overflows `MAX_READ_LINE_BYTES`, so a
+/// dropped tail is visible rather than silently truncated — mirroring the `…[+N
+/// bytes]` tag `paginate` adds when it clamps a line for display. `…` is U+2026 (a
+/// 3-byte char), so the whole marker is valid UTF-8 that the lossy decode passes
+/// through unchanged.
+const LINE_TRUNCATED: &str = "…[truncated]";
+
 /// Read a file, paginated by line AND bounded by bytes (via the shared job-log
 /// paginator) so neither a huge file nor a single pathological line can flood the
 /// agent context.
@@ -130,16 +137,37 @@ pub async fn read(path: &str, cursor: usize, limit: usize) -> Result<String, Str
     ))
 }
 
-/// Append `bytes` to the in-flight line without letting it grow past
-/// `MAX_READ_LINE_BYTES`. Overflow bytes are dropped (the line is already longer
-/// than any page will show), so one pathological no-newline line can't grow the
-/// buffer without bound.
+/// Append `bytes` to the in-flight line, holding it at `MAX_READ_LINE_BYTES` so one
+/// pathological no-newline line can't grow the buffer without bound. On the first
+/// overflow the head that fits is kept — trimmed to a UTF-8 char boundary so the
+/// marker isn't preceded by a split code point — a `LINE_TRUNCATED` marker is
+/// stamped, and the line is *sealed*: those marker bytes push its length past the
+/// cap, so `len() > MAX_READ_LINE_BYTES` reads as "already sealed" and every later
+/// call is a no-op. The marker is written exactly once; overflow bytes are dropped.
 fn append_capped(line: &mut Vec<u8>, bytes: &[u8]) {
-    let room = MAX_READ_LINE_BYTES.saturating_sub(line.len());
-    if room == 0 {
+    if line.len() > MAX_READ_LINE_BYTES {
+        return; // sealed: the marker is already stamped, past the cap
+    }
+    let room = MAX_READ_LINE_BYTES - line.len();
+    if bytes.len() <= room {
+        line.extend_from_slice(bytes);
         return;
     }
-    line.extend_from_slice(&bytes[..room.min(bytes.len())]);
+    let keep = floor_char_boundary(bytes, room);
+    line.extend_from_slice(&bytes[..keep]);
+    line.extend_from_slice(LINE_TRUNCATED.as_bytes());
+}
+
+/// Largest index `≤ max` in `bytes` that starts a UTF-8 code point — i.e. is not a
+/// continuation byte (`0b10xx_xxxx`). A code point is at most 4 bytes, so this walks
+/// back at most three, keeping a multi-byte char from being split right before the
+/// truncation marker. Works on arbitrary bytes (a binary `read`) and never panics.
+fn floor_char_boundary(bytes: &[u8], max: usize) -> usize {
+    let mut i = max.min(bytes.len());
+    while i > 0 && i < bytes.len() && (bytes[i] & 0xC0) == 0x80 {
+        i -= 1;
+    }
+    i
 }
 
 pub async fn write(path: &str, content: &str) -> Result<String, String> {
@@ -182,6 +210,14 @@ pub async fn delete(path: &str) -> Result<String, String> {
 }
 
 pub async fn rename(src: &str, dest: &str) -> Result<String, String> {
+    // No silent clobber: `fs::rename` overwrites an existing `dest`, destroying data.
+    // symlink_metadata (don't follow) so a symlink already at `dest` also counts as
+    // occupying the path — we must not follow it and overwrite its target.
+    if fs::symlink_metadata(dest).await.is_ok() {
+        return Err(format!(
+            "destination exists: {dest} — delete it or choose another path (move won't overwrite)"
+        ));
+    }
     ensure_parent(dest).await?;
     fs::rename(src, dest).await.map_err(|e| e.to_string())?;
     Ok(format!("moved {src} -> {dest}"))
