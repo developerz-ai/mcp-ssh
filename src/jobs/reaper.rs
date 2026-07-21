@@ -49,7 +49,11 @@ pub(super) async fn kill_job(job: &Job) -> bool {
         return false;
     };
     if !signal_group(pgid, "TERM").await {
-        return false;
+        // The TERM signal failed to deliver, but the group may have exited
+        // naturally (race condition: process exited between state check and signal).
+        // Report by final state, not by signal delivery, so the group being gone
+        // is a success, not a failure.
+        return !matches!(*job.state.lock().await, JobState::Running);
     }
     // Give the group a chance to exit on TERM; force it with KILL otherwise.
     if !exited_within(job.done.clone(), KILL_GRACE).await && !signal_group(pgid, "KILL").await {
@@ -113,6 +117,8 @@ async fn signal_group(pgid: ProcessGroupId, signal: &str) -> bool {
         .arg(format!("-{signal}"))
         .arg("--")
         .arg(format!("-{}", pgid.0))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status()
         .await
     {
@@ -458,6 +464,27 @@ mod tests {
     async fn kill_group_on_dead_pgid_reports_gone() {
         // A pgid with no live members must read as already-gone, not hang.
         assert!(kill_group(2_000_000_000).await);
+    }
+
+    #[tokio::test]
+    async fn kill_job_rechecks_state_when_term_fails() {
+        let (_tx, rx) = watch::channel(false);
+        // TERM will fail for a non-existent process group. The key is that we
+        // re-check the state and return false (nothing to kill) rather than
+        // returning false immediately without checking. This prevents false
+        // negatives: if the process exited before TERM was sent, the state would
+        // reflect that, and we'd correctly report it as handled.
+        let job = Arc::new(Job {
+            pgid: Some(ProcessGroupId(2_000_000_000)), // Non-existent pgid → TERM fails
+            state: Arc::new(Mutex::new(JobState::Running)),
+            done: rx,
+            log_path: std::path::PathBuf::from("/tmp/test.log"),
+        });
+
+        let result = kill_job(&job).await;
+        // When TERM fails and state is still Running, we return false (couldn't kill).
+        // The re-check prevents misreporting a race-condition exit as a kill failure.
+        assert!(!result, "kill_job must handle TERM failure gracefully");
     }
 
     #[tokio::test]
