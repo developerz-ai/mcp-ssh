@@ -125,15 +125,15 @@ async fn kill_job(db: &Db, id: &str) -> anyhow::Result<String> {
         ));
     };
 
-    // A pgid outside u32 is a corrupt row; a raw `as` cast would wrap it into a
-    // real (wrong) process group and signal that instead. Zero is corrupt the same
-    // way, and worse: `kill -- -0` signals *this* process's own group.
-    let Some(pgid) = u32::try_from(pgid).ok().filter(|p| *p != 0) else {
+    // Corrupt rows are refused, not signalled: outside `u32` a raw `as` cast would
+    // wrap onto a real (wrong) group, and `0` is worse — `kill -- -0` signals *this*
+    // process's own group. `ProcessGroupId` is the single gate for both.
+    let Some(group) = crate::jobs::ProcessGroupId::from_persisted(pgid) else {
         return Ok(format!(
             "job {id} has a corrupt pgid ({pgid}) — refusing to signal"
         ));
     };
-    let killed = crate::jobs::kill_group(pgid).await;
+    let killed = crate::jobs::kill_group(group).await;
     // Record the kill only if the row is still `running`: when the server owns the
     // job, its waiter may already have written the real exit as the group died.
     let lookup = id.to_string();
@@ -149,7 +149,10 @@ async fn kill_job(db: &Db, id: &str) -> anyhow::Result<String> {
     Ok(if killed {
         format!("killed {id}")
     } else {
-        format!("signalled {id} (pgid {pgid}); the group may already be gone")
+        format!(
+            "signalled {id} (pgid {}); the group may already be gone",
+            group.get()
+        )
     })
 }
 
@@ -479,7 +482,7 @@ mod tests {
     #[cfg(unix)]
     async fn read_pid(path: &std::path::Path) -> u32 {
         for _ in 0..100 {
-            if let Ok(text) = std::fs::read_to_string(path)
+            if let Ok(text) = tokio::fs::read_to_string(path).await
                 && let Ok(pid) = text.trim().parse()
             {
                 return pid;

@@ -3,6 +3,7 @@
 //! can paginate it without holding everything in memory.
 use std::{
     collections::{HashMap, HashSet},
+    num::NonZeroU32,
     path::PathBuf,
     process::Stdio,
     sync::{Arc, atomic::AtomicU64},
@@ -95,9 +96,32 @@ fn page_from_tail(tail: &str, cursor: usize, limit: usize) -> Page {
 }
 
 /// Process group id to signal on kill. Wrapping the raw pid keeps this
-/// lifecycle/security boundary from being confused with any other `u32`.
+/// lifecycle/security boundary from being confused with any other `u32`, and the
+/// `NonZeroU32` makes the one value that must never reach `kill` unrepresentable:
+/// `kill -- -0` signals the *caller's* own group, i.e. the server itself. Every
+/// path into a signal goes through this type, so no guard can be forgotten at a
+/// call site.
 #[derive(Debug, Clone, Copy)]
-struct ProcessGroupId(u32);
+pub(crate) struct ProcessGroupId(NonZeroU32);
+
+impl ProcessGroupId {
+    /// The group led by a live child (it leads its own, so pgid == pid). `None`
+    /// for 0, which is no pid the OS hands out but is "my own group" to `kill`.
+    fn new(pid: u32) -> Option<Self> {
+        NonZeroU32::new(pid).map(Self)
+    }
+
+    /// The group behind a persisted `jobs.pgid`. `None` for anything a real job
+    /// could never have written — outside `u32` (a raw `as` cast would wrap it
+    /// onto a real, wrong group) or zero — so a corrupt row can't be signalled.
+    pub(crate) fn from_persisted(pgid: i64) -> Option<Self> {
+        u32::try_from(pgid).ok().and_then(Self::new)
+    }
+
+    pub(crate) fn get(self) -> u32 {
+        self.0.get()
+    }
+}
 
 struct Job {
     log_path: PathBuf,
@@ -244,9 +268,9 @@ async fn reconcile_stale_running(
 
     let mut dead: Vec<String> = Vec::new();
     for (id, pgid) in candidates {
-        match pgid.and_then(|p| u32::try_from(p).ok()) {
+        match pgid.and_then(ProcessGroupId::from_persisted) {
             Some(pgid) if group_alive(pgid).await => {
-                tracing::info!(id = %id, pgid, "job outlived the previous process — still running");
+                tracing::info!(id = %id, pgid = pgid.get(), "job outlived the previous process — still running");
             }
             _ => dead.push(id),
         }
@@ -369,7 +393,7 @@ impl JobStore {
         command.process_group(0);
 
         let mut child = command.spawn()?;
-        let pgid = child.id().map(ProcessGroupId);
+        let pgid = child.id().and_then(ProcessGroupId::new);
         let (tx, rx) = watch::channel(false);
         let state = Arc::new(Mutex::new(JobState::Running));
 
@@ -394,7 +418,7 @@ impl JobStore {
             let row_id = id.as_ref().to_string();
             // Persist the pgid so `mcp-ssh job kill` can signal the group even when
             // this process no longer tracks the job (e.g. after a restart).
-            let pgid_val = pgid.map(|p| p.0 as i64);
+            let pgid_val = pgid.map(|p| i64::from(p.get()));
             if let Err(error) = db
                 .call(move |conn| {
                     conn.execute(
@@ -661,9 +685,10 @@ impl JobStore {
         if status != "running" {
             return false;
         }
-        // A pgid outside u32 is a corrupt row; a raw `as` cast would wrap it onto a
-        // real (wrong) process group and signal that instead.
-        let Some(group) = pgid.and_then(|p| u32::try_from(p).ok()) else {
+        // Only a pgid a real job could have written is signalable — see
+        // `ProcessGroupId::from_persisted`. A corrupt row (out of `u32`, or the
+        // server's own group as `0`) is refused, not signalled.
+        let Some(group) = pgid.and_then(ProcessGroupId::from_persisted) else {
             tracing::warn!(id = %id, ?pgid, "job has no usable process group — cannot kill");
             return false;
         };
@@ -1113,6 +1138,41 @@ mod tests {
             Some("running"),
             "an unsignalable job must not be recorded as killed"
         );
+    }
+
+    /// A corrupt persisted pgid must never be signalled. `0` is the dangerous
+    /// value: `kill -- -0` targets the *caller's* group, so a server acting on it
+    /// would terminate itself and every client with it. This test is its own
+    /// canary — signalling group 0 kills the test runner rather than failing an
+    /// assertion. `-1` covers the out-of-`u32` rows a raw `as` cast would wrap.
+    #[tokio::test]
+    async fn kill_of_a_persisted_job_with_a_corrupt_pgid_signals_nothing() {
+        let store = store(Duration::from_secs(5));
+        // Past this store's boot second, so the startup reconcile leaves the rows
+        // alone — this is about `kill`.
+        let started = crate::db::now_unix() + 3600;
+        for (id, pgid) in [("zero", 0_i64), ("negative", -1)] {
+            store
+                .db
+                .call(move |conn| {
+                    conn.execute(
+                        "INSERT INTO jobs (id, status, started_unix, pgid) VALUES (?1, 'running', ?2, ?3)",
+                        rusqlite::params![id, started, pgid],
+                    )
+                })
+                .await
+                .unwrap();
+
+            assert!(
+                !store.kill(&JobId::from(id)).await,
+                "pgid {pgid} must be refused, not signalled"
+            );
+            assert_eq!(
+                row_status(&store.db, id).await.as_deref(),
+                Some("running"),
+                "a refused kill must leave the row untouched"
+            );
+        }
     }
 
     #[tokio::test]
