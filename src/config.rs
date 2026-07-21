@@ -1,9 +1,12 @@
 //! Config: a TOML file overlaid by env vars. Auth creds usually come from the
 //! file (`mcp-ssh set-auth`); everything has a sane default except the creds.
-use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use std::{
+    net::{IpAddr, SocketAddr},
+    path::PathBuf,
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
-use tracing::warn;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -40,6 +43,11 @@ pub struct FileConfig {
 pub enum ConfigError {
     #[error("no auth credentials: run `mcp-ssh set-auth <user>` or set MCP_SSH_USER/MCP_SSH_PASS")]
     NoCredentials,
+    #[error(
+        "bind {0} is not loopback but MCP_SSH_ALLOWED_HOSTS is unset or empty: set it to the \
+         public hostname(s), or bind to loopback behind the TLS reverse proxy"
+    )]
+    AllowedHostsRequired(IpAddr),
     #[error("invalid {0}: {1}")]
     Invalid(&'static str, String),
     #[error("config io error at {0}: {1}")]
@@ -125,12 +133,13 @@ impl Config {
             // rmcp reads an empty allowlist as allow-ALL hosts — the guard would
             // be silently OFF, worse than the default.
             _ => {
+                // Off-loopback the default allowlist is no guard at all: a remote
+                // attacker satisfies `["localhost","127.0.0.1"]` just by sending
+                // `Host: 127.0.0.1`. Warning and serving anyway left the DNS-rebinding
+                // hole open, so refuse to start — explicit hosts are mandatory for a
+                // bind reachable from off the box. Loopback keeps the safe default.
                 if !bind.ip().is_loopback() {
-                    warn!(
-                        "MCP_SSH_ALLOWED_HOSTS unset or empty and bind is non-loopback ({}) — \
-                         DNS-rebinding attacks possible. Set MCP_SSH_ALLOWED_HOSTS explicitly.",
-                        bind.ip()
-                    );
+                    return Err(ConfigError::AllowedHostsRequired(bind.ip()));
                 }
                 vec!["localhost".into(), "127.0.0.1".into()]
             }
@@ -277,30 +286,6 @@ mod tests {
         }
     }
 
-    /// A `MakeWriter` collecting subscriber output into a shared buffer so a test
-    /// can assert whether a given log line was (or was not) emitted.
-    #[derive(Clone, Default)]
-    struct BufWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for BufWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            if let Ok(mut guard) = self.0.lock() {
-                guard.extend_from_slice(buf);
-            }
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufWriter {
-        type Writer = BufWriter;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
     #[test]
     fn env_overrides_file() {
         let dir = tempdir().unwrap();
@@ -441,22 +426,52 @@ mod tests {
     }
 
     #[test]
-    fn non_loopback_bind_without_allowed_hosts_env_loads() {
+    fn non_loopback_bind_without_allowed_hosts_is_rejected() {
+        // The default allowlist is worthless off-loopback — a remote attacker just
+        // sends `Host: 127.0.0.1`. Refuse to serve rather than warn. Set-but-empty
+        // counts as unset (see `empty_allowed_hosts_falls_back_to_loopback_default`).
         let dir = tempdir().unwrap();
-        let cfg_path = dir.path().join("config.toml");
+        let cfg_path = dir.path().join("absent.toml");
+        for (bind, hosts) in [
+            ("0.0.0.0:8080", None),
+            ("[::]:8080", None),
+            ("192.0.2.10:8080", None),
+            ("0.0.0.0:8080", Some("")),
+            ("0.0.0.0:8080", Some(" , ")),
+        ] {
+            let mut vars = vec![
+                ("MCP_SSH_CONFIG", cfg_path.to_str().unwrap()),
+                ("MCP_SSH_BIND", bind),
+                ("MCP_SSH_USER", "test"),
+                ("MCP_SSH_PASS", "test"),
+            ];
+            if let Some(hosts) = hosts {
+                vars.push(("MCP_SSH_ALLOWED_HOSTS", hosts));
+            }
+            let err = Config::from_env(&MapEnv::new(&vars))
+                .expect_err("non-loopback bind without explicit hosts must not serve");
+            assert!(
+                matches!(err, ConfigError::AllowedHostsRequired(_)),
+                "bind {bind}, hosts {hosts:?}: expected AllowedHostsRequired, got {err}"
+            );
+        }
 
-        // Bind to non-loopback (0.0.0.0) without MCP_SSH_ALLOWED_HOSTS set.
-        // Should load successfully; warning issued at runtime.
+        // Same for an explicit empty list in the config file.
+        let cfg_path = dir.path().join("config.toml");
+        std::fs::write(&cfg_path, "allowed_hosts = []\n").unwrap();
         let env = MapEnv::new(&[
             ("MCP_SSH_CONFIG", cfg_path.to_str().unwrap()),
             ("MCP_SSH_BIND", "0.0.0.0:8080"),
             ("MCP_SSH_USER", "test"),
             ("MCP_SSH_PASS", "test"),
         ]);
-        let cfg = Config::from_env(&env).expect("should load with warning");
-        assert_eq!(cfg.bind.ip().to_string(), "0.0.0.0");
-        // Default allowed_hosts used (localhost/127.0.0.1).
-        assert_eq!(cfg.allowed_hosts, vec!["localhost", "127.0.0.1"]);
+        assert!(
+            matches!(
+                Config::from_env(&env),
+                Err(ConfigError::AllowedHostsRequired(_))
+            ),
+            "an empty file allowlist must not serve off-loopback either"
+        );
     }
 
     #[test]
@@ -464,21 +479,23 @@ mod tests {
         let dir = tempdir().unwrap();
         let cfg_path = dir.path().join("config.toml");
 
-        // Bind to loopback (127.0.0.1) without MCP_SSH_ALLOWED_HOSTS set.
-        // Should load without warning.
-        let env = MapEnv::new(&[
-            ("MCP_SSH_CONFIG", cfg_path.to_str().unwrap()),
-            ("MCP_SSH_BIND", "127.0.0.1:1337"),
-            ("MCP_SSH_USER", "test"),
-            ("MCP_SSH_PASS", "test"),
-        ]);
-        let cfg = Config::from_env(&env).expect("should load");
-        assert_eq!(cfg.bind.ip().to_string(), "127.0.0.1");
-        assert_eq!(cfg.allowed_hosts, vec!["localhost", "127.0.0.1"]);
+        // Bind to loopback (v4 and v6) without MCP_SSH_ALLOWED_HOSTS set: the safe
+        // default still applies, no error — only off-loopback binds must be explicit.
+        for bind in ["127.0.0.1:1337", "[::1]:1337"] {
+            let env = MapEnv::new(&[
+                ("MCP_SSH_CONFIG", cfg_path.to_str().unwrap()),
+                ("MCP_SSH_BIND", bind),
+                ("MCP_SSH_USER", "test"),
+                ("MCP_SSH_PASS", "test"),
+            ]);
+            let cfg = Config::from_env(&env).expect("loopback should load");
+            assert!(cfg.bind.ip().is_loopback());
+            assert_eq!(cfg.allowed_hosts, vec!["localhost", "127.0.0.1"]);
+        }
     }
 
     #[test]
-    fn non_loopback_bind_with_explicit_file_hosts_loads_without_warning() {
+    fn non_loopback_bind_with_explicit_hosts_loads() {
         let dir = tempdir().unwrap();
         let cfg_path = dir.path().join("config.toml");
 
@@ -495,22 +512,21 @@ mod tests {
             ("MCP_SSH_USER", "test"),
             ("MCP_SSH_PASS", "test"),
         ]);
-
-        let buf = BufWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buf.clone())
-            .with_ansi(false)
-            .with_max_level(tracing::Level::WARN)
-            .finish();
-        let cfg =
-            tracing::subscriber::with_default(subscriber, || Config::from_env(&env).expect("load"));
-
-        // Explicit file hosts win; the fallback (and its warning) is never reached.
+        let cfg = Config::from_env(&env).expect("explicit file hosts should load");
         assert_eq!(cfg.allowed_hosts, vec!["mcp.example.com"]);
-        let logs = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
-        assert!(
-            !logs.contains("DNS-rebinding"),
-            "no DNS-rebinding warning expected with explicit file hosts: {logs}"
-        );
+
+        // Same via the env var, on a config file that has no hosts at all.
+        let env = MapEnv::new(&[
+            (
+                "MCP_SSH_CONFIG",
+                dir.path().join("absent.toml").to_str().unwrap(),
+            ),
+            ("MCP_SSH_BIND", "0.0.0.0:8080"),
+            ("MCP_SSH_ALLOWED_HOSTS", "mcp.example.com"),
+            ("MCP_SSH_USER", "test"),
+            ("MCP_SSH_PASS", "test"),
+        ]);
+        let cfg = Config::from_env(&env).expect("explicit env hosts should load");
+        assert_eq!(cfg.allowed_hosts, vec!["mcp.example.com"]);
     }
 }

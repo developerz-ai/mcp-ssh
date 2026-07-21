@@ -116,6 +116,17 @@ discovery metadata (`/.well-known/oauth-authorization-server`), dynamic client r
 `/token`. All MCP clients — Claude, Cursor, or any spec-compliant GUI — drive this flow
 automatically; the user logs in once with the username/password set via `mcp-ssh set-auth`.
 
+Registration is not a formality: `/register` persists the `client_id` → `redirect_uri` binding,
+and `/authorize` issues a code only to a URI that exact `client_id` registered. An `/authorize`
+link that pairs a real client's `client_id` with someone else's `redirect_uri` therefore gets a
+`400`, not a code.
+
+This is defense in depth, not a complete anti-phishing control. Dynamic client registration is
+unauthenticated by design — it bootstraps auth — so an attacker can register their own
+`client_id` for their own callback and lure a victim to a *self-consistent* `/authorize` link.
+The Basic login prompt is the only thing between that lure and an auth code: an unexpected
+prompt should be treated as hostile.
+
 Credentials are a single username/password, set once with `mcp-ssh set-auth <user>` and read
 from config/env at boot. Missing credentials = the server refuses to start.
 

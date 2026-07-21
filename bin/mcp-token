@@ -37,6 +37,15 @@ done
 verifier=$(openssl rand -base64 60 | tr -d '\n=+/' | cut -c1-64)
 challenge=$(printf '%s' "$verifier" | openssl dgst -binary -sha256 | openssl base64 | tr '+/' '-_' | tr -d '=\n')
 
+# /register — Dynamic Client Registration (RFC 7591). /authorize binds the auth
+# code's destination to the redirect URIs a client registered, so mint a client_id
+# for $REDIRECT before starting the flow.
+client_id=$(curl -fsS -X POST "$BASE/register" \
+  -H 'Content-Type: application/json' \
+  -d "{\"redirect_uris\":[\"$REDIRECT\"]}" \
+  | sed -n 's/.*"client_id":"\([^"]*\)".*/\1/p')
+[ -n "$client_id" ] || { echo "mcp-token: client registration failed (server down?)" >&2; exit 1; }
+
 # /authorize — authenticate with HTTP Basic, receive an auth code on the redirect.
 # Build the Basic header ourselves and feed it via a curl config file on stdin
 # (-K -), never on argv, so the password can't surface in the process list. The
@@ -45,6 +54,7 @@ basic=$(printf '%s:%s' "$MCP_SSH_USER" "$MCP_SSH_PASS" | openssl base64 -A)
 location=$(curl -fsS -o /dev/null -w '%{redirect_url}' -G "$BASE/authorize" \
   -K - \
   --data-urlencode "response_type=code" \
+  --data-urlencode "client_id=$client_id" \
   --data-urlencode "redirect_uri=$REDIRECT" \
   --data-urlencode "code_challenge=$challenge" \
   --data-urlencode "code_challenge_method=S256" <<EOF

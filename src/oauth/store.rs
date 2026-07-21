@@ -4,6 +4,10 @@
 //! survive restarts. Tokens are opaque (not JWT): this server is the only
 //! validator — no signing keys, no JWKS. Many tokens coexist, so multiple clients
 //! authenticate concurrently.
+//!
+//! Registered clients are durable too: `/register` binds a `client_id` to the
+//! redirect URIs it may receive auth codes at, and `/authorize` enforces that
+//! binding, so a restart must not silently invalidate every client's login.
 use std::{collections::HashMap, time::Duration};
 
 use base64::Engine;
@@ -50,6 +54,56 @@ impl Store {
         }
     }
 
+    /// Register a client: mint an id and bind it to the redirect URIs that may
+    /// receive its auth codes. Duplicate URIs in one request collapse to one row.
+    /// Returns the new `client_id` — public data (see the `clients` DDL), so it is
+    /// safe to hand back, but it is still never logged.
+    pub async fn register_client(&self, redirect_uris: &[String]) -> Result<String, &'static str> {
+        let client_id = random_token();
+        // Owned copies: the closure runs on the blocking pool and must be 'static.
+        let rows: Vec<(String, String)> = redirect_uris
+            .iter()
+            .map(|uri| (client_id.clone(), uri.clone()))
+            .collect();
+        self.db
+            .call(move |conn| {
+                // One transaction so a client is never half-registered — it would
+                // then authorize at some of its URIs and be rejected at the rest.
+                // `unchecked_transaction` for the same reason as `issue`.
+                let tx = conn.unchecked_transaction()?;
+                for (id, uri) in &rows {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO clients (client_id, redirect_uri) VALUES (?1, ?2)",
+                        (id, uri),
+                    )?;
+                }
+                tx.commit()
+            })
+            .await
+            .map_err(|_| "server_error")?;
+        Ok(client_id)
+    }
+
+    /// True only if `client_id` is a registered client and `redirect_uri` is
+    /// *exactly* one of the URIs it registered. Fails closed: an unknown client,
+    /// an unregistered URI, or a DB error all deny.
+    pub async fn client_allows_redirect(&self, client_id: &str, redirect_uri: &str) -> bool {
+        let (client_id, redirect_uri) = (client_id.to_owned(), redirect_uri.to_owned());
+        self.db
+            .call(move |conn| {
+                use rusqlite::OptionalExtension;
+                conn.query_row(
+                    "SELECT 1 FROM clients WHERE client_id = ?1 AND redirect_uri = ?2",
+                    (client_id, redirect_uri),
+                    |_| Ok(()),
+                )
+                .optional()
+                .map(|row| row.is_some())
+            })
+            .await
+            .unwrap_or(false)
+    }
+
     /// Issue an authorization code bound to the PKCE challenge + redirect_uri.
     pub async fn new_code(&self, challenge: String, redirect_uri: String) -> String {
         let code = random_token();
@@ -86,6 +140,12 @@ impl Store {
         if entry.expires < Instant::now() {
             return Err("invalid_grant");
         }
+        // `/authorize` only issued this code after matching its URI against the
+        // client's registration, so re-checking it here carries the *URI* binding
+        // through to redemption (RFC 6749 §4.1.3). The client binding does not
+        // carry: no `client_id` is stored with the code, and the token request
+        // never sends one. Safe for a public PKCE client — a stolen code is
+        // useless without the verifier — but it is a half-step short of §4.1.3.
         if entry.redirect_uri != redirect_uri {
             return Err("invalid_grant");
         }
@@ -290,6 +350,50 @@ mod tests {
             "expired code must be swept, not retained until redeem"
         );
         assert!(codes.contains_key(&fresh), "fresh code must be kept");
+    }
+
+    #[tokio::test]
+    async fn a_client_is_bound_to_exactly_the_uris_it_registered() {
+        let store = store();
+        let uris = ["http://localhost/cb".to_string(), "https://app/cb".into()];
+        let client_id = store.register_client(&uris).await.unwrap();
+        let other = store
+            .register_client(&["https://other/cb".into()])
+            .await
+            .unwrap();
+        let unknown = "never-registered".to_string();
+
+        // The match is exact — not a prefix, not a host check, not a pool shared
+        // between clients — and an unregistered id is denied outright.
+        for (id, uri, allowed) in [
+            (&client_id, "http://localhost/cb", true),
+            (&client_id, "https://app/cb", true),
+            (&client_id, "https://app/cb/x", false),
+            (&client_id, "https://app", false),
+            (&client_id, "https://other/cb", false),
+            (&other, "https://app/cb", false),
+            (&unknown, "https://app/cb", false),
+        ] {
+            assert_eq!(
+                store.client_allows_redirect(id, uri).await,
+                allowed,
+                "redirect {uri} should be allowed={allowed}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn registering_the_same_uri_twice_is_one_binding() {
+        // A client listing a URI twice is not an error, and doesn't collide on the
+        // (client_id, redirect_uri) primary key.
+        let store = store();
+        let uri = "https://app/cb".to_string();
+        let client_id = store
+            .register_client(&[uri.clone(), uri.clone()])
+            .await
+            .unwrap();
+        assert!(store.client_allows_redirect(&client_id, &uri).await);
+        assert_eq!(row_count(&store.db, "clients").await, 1);
     }
 
     #[test]
