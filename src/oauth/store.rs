@@ -195,6 +195,41 @@ impl Store {
     }
 }
 
+/// Drop every access token whose expiry has passed. Returns how many rows went
+/// away — a count only, never a token value. Run periodically by the reaper:
+/// `validate` evicts a dead row only when that exact token is re-presented, and
+/// a rotated pair's superseded access token never is, so the table would gain a
+/// dead row per refresh and keep it forever.
+pub async fn sweep_expired_access(db: &crate::db::Db, now: i64) -> usize {
+    sweep_expired(db, "access_tokens", now).await
+}
+
+/// Drop every refresh token whose expiry has passed. Returns the deleted count.
+/// Same rationale as `sweep_expired_access`: `refresh` only deletes the token
+/// actually presented, so abandoned clients leave rows behind indefinitely.
+pub async fn sweep_expired_refresh(db: &crate::db::Db, now: i64) -> usize {
+    sweep_expired(db, "refresh_tokens", now).await
+}
+
+/// One bound bulk `DELETE`. `table` is a compile-time constant (never user
+/// input), so interpolating it into the SQL is injection-safe — same precedent
+/// as `db::ensure_column`. Nothing is selected, so no token string is ever read
+/// into the process, returned, or logged. A failed sweep reports zero and is
+/// logged: the reaper simply retries on the next pass.
+async fn sweep_expired(db: &crate::db::Db, table: &'static str, now: i64) -> usize {
+    let sql = format!("DELETE FROM {table} WHERE expires_unix <= ?1");
+    match db.call(move |conn| conn.execute(&sql, [now])).await {
+        Ok(deleted) => {
+            tracing::debug!(table, deleted, "swept expired tokens");
+            deleted
+        }
+        Err(error) => {
+            tracing::warn!(%error, table, "sweeping expired tokens failed");
+            0
+        }
+    }
+}
+
 pub fn random_token() -> String {
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill(&mut bytes[..]);
@@ -349,6 +384,77 @@ mod tests {
         assert!(
             store.refresh(&token).await.is_err(),
             "a refresh token past REFRESH_TTL must be rejected"
+        );
+    }
+
+    /// Rows in `table` — counted, never read, so no token value leaves the DB.
+    async fn row_count(db: &Db, table: &'static str) -> i64 {
+        db.call(move |conn| {
+            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn seed(db: &Db, table: &'static str, token: &str, expires: i64) {
+        let token = token.to_owned();
+        db.call(move |conn| {
+            conn.execute(
+                &format!("INSERT INTO {table} (token, expires_unix) VALUES (?1, ?2)"),
+                (token, expires),
+            )
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn sweep_deletes_expired_tokens_and_keeps_live_ones() {
+        let store = store();
+        // Fixed clock: expiries are compared against the `now` passed in, so the
+        // boundary case is deterministic rather than racing the wall clock.
+        const NOW: i64 = 1_000_000;
+        seed(&store.db, "access_tokens", "a-past", NOW - 1).await;
+        seed(&store.db, "access_tokens", "a-boundary", NOW).await; // expired: `validate` needs exp > now
+        seed(&store.db, "access_tokens", "a-live", NOW + 1).await;
+        seed(&store.db, "refresh_tokens", "r-past", NOW - 1).await;
+        seed(&store.db, "refresh_tokens", "r-live", NOW + 1).await;
+
+        // The sweep hands back a count — a token string is never returned.
+        assert_eq!(sweep_expired_access(&store.db, NOW).await, 2);
+        assert_eq!(sweep_expired_refresh(&store.db, NOW).await, 1);
+
+        assert_eq!(
+            row_count(&store.db, "access_tokens").await,
+            1,
+            "only the unexpired access row survives"
+        );
+        assert_eq!(
+            row_count(&store.db, "refresh_tokens").await,
+            1,
+            "only the unexpired refresh row survives"
+        );
+        // Nothing left to drop — a repeat pass is a no-op, not a re-delete.
+        assert_eq!(sweep_expired_access(&store.db, NOW).await, 0);
+        assert_eq!(sweep_expired_refresh(&store.db, NOW).await, 0);
+    }
+
+    #[tokio::test]
+    async fn sweep_leaves_a_freshly_issued_pair_usable() {
+        let store = store();
+        let tokens = mint(&store).await;
+
+        let now = now_unix();
+        assert_eq!(sweep_expired_access(&store.db, now).await, 0);
+        assert_eq!(sweep_expired_refresh(&store.db, now).await, 0);
+
+        assert!(
+            store.validate(&tokens.access).await,
+            "a live access token must survive the sweep"
+        );
+        assert!(
+            store.refresh(&tokens.refresh).await.is_ok(),
+            "a live refresh token must survive the sweep"
         );
     }
 
