@@ -2,7 +2,7 @@
 //! a job id the caller polls. Output streams to a per-job log file so polling
 //! can paginate it without holding everything in memory.
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     process::Stdio,
     sync::{Arc, atomic::AtomicU64},
@@ -332,31 +332,12 @@ impl JobStore {
         interactive: bool,
         title: Option<String>,
     ) -> std::io::Result<RunResult> {
-        // Hold the jobs lock across id generation and insertion so the id is
-        // reserved atomically: two jobs launched in the same second can't both
-        // see their `<label>-HH:MM:SS` as free and clobber each other's entry.
-        // Nothing awaits while the guard is held (file create + spawn are
-        // synchronous), so the critical section stays short.
-        //
         // The id's label is the agent-supplied `title` (or the neutral `job`
         // fallback), never `cmd`: a command can carry a secret in its leading
         // tokens (`mysql -psecret`, `PGPASSWORD=…`), and the id ends up in `bash`'s
         // reply, `job(list)`, reaper logs, and the log filename — so deriving it
         // from `cmd` would leak that secret. The title is normalized in `JobId`.
-        let mut jobs = self.jobs.lock().await;
-        // A candidate is taken if it's live in this process OR its log file
-        // survives from a previous one (rows and logs outlive restarts for 24h).
-        // Without the disk check, a post-restart job minting a retained id would
-        // truncate the old job's log, lose its own row to the PK conflict, and
-        // clobber the old row's final state from `persist_final`.
-        let id = JobId::generate(&self.seq, title.as_deref(), |candidate| {
-            jobs.contains_key(candidate) || self.dir.join(format!("{candidate}.log")).exists()
-        });
-        let log_path = self.dir.join(format!("{id}.log"));
-
-        // Create the log up front so a poll racing the spawn reads an empty page,
-        // not a NotFound — the command appends to it (see `wrapped`).
-        std::fs::File::create(&log_path)?;
+        let (id, log_path) = self.reserve_log(title.as_deref()).await?;
 
         // An interactive bash (production shell) prints two job-control warnings
         // to stderr at startup when there's no controlling TTY (always, under
@@ -398,13 +379,15 @@ impl JobStore {
             state: state.clone(),
             done: rx.clone(),
         });
-        jobs.insert(id.clone(), job);
-        drop(jobs);
+        // The lock guards this insert alone now — `reserve_log` claimed the id on
+        // disk, so no syscall runs under it. Still before the row INSERT below:
+        // `reconcile_stale_running` relies on that order.
+        self.jobs.lock().await.insert(id.clone(), job);
 
         // Persist durable metadata now the in-memory entry exists and the lock is
-        // released (the DB write must not block the id-reservation critical
-        // section). The row starts `running`; the waiter records the final state +
-        // a bounded output tail on exit.
+        // released (the DB write must not stall a concurrent launch). The row
+        // starts `running`; the waiter records the final state + a bounded output
+        // tail on exit.
         let started = crate::db::now_unix();
         {
             let db = self.db.clone();
@@ -472,6 +455,41 @@ impl JobStore {
                 page: read_page(&log_path, 0, DEFAULT_PAGE).await?,
                 id,
             }),
+        }
+    }
+
+    /// Mint a job id and create its log file, both off the `jobs` lock — that lock
+    /// is on every request path, and a stat/open is a blocking syscall.
+    ///
+    /// The `<id>.log` file *is* the reservation: `create_new` fails if the path
+    /// exists, so one atomic step fends off both claimants to an id — a concurrent
+    /// `run` minting the same `<label>-HH-MM-SS` this second, and a job from a
+    /// previous process whose log was retained (rows and logs outlive a restart for
+    /// 24h; reusing such an id would truncate the old job's log, lose the new row to
+    /// the PK conflict, and clobber the old row's final state from `persist_final`).
+    /// A candidate lost to either is fed back to `generate`, which then moves on to a
+    /// fresh `-<seq>` suffix — the suffix space is unbounded and taken ids are
+    /// finite, so this terminates.
+    ///
+    /// Creating the log up front also means a poll racing the spawn reads an empty
+    /// page, not a NotFound — the command appends to it (see `wrapped` in `run`).
+    async fn reserve_log(&self, title: Option<&str>) -> std::io::Result<(JobId, PathBuf)> {
+        let mut lost: HashSet<String> = HashSet::new();
+        loop {
+            let id = JobId::generate(&self.seq, title, |candidate| lost.contains(candidate));
+            let log_path = self.dir.join(format!("{id}.log"));
+            match tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&log_path)
+                .await
+            {
+                Ok(_) => return Ok((id, log_path)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    lost.insert(id.as_ref().to_string());
+                }
+                Err(error) => return Err(error),
+            }
         }
     }
 
@@ -844,6 +862,65 @@ mod tests {
             rest.lines.iter().any(|l| l == &n.to_string()),
             "the newest output (incl. the last line) must be reachable via poll"
         );
+    }
+
+    /// Job ids are no longer reserved under the `jobs` lock — the log file's
+    /// `create_new` is the reservation instead (a stat and an open are blocking
+    /// syscalls, and that lock sits on every request path). Concurrent launches
+    /// sharing a title land on the same `<title>-HH-MM-SS` base, which is exactly
+    /// the clash the lock used to cover: each must still get its own id, and each
+    /// log must hold only its own command's output.
+    #[tokio::test]
+    async fn concurrent_launches_never_share_an_id_or_a_log() {
+        const N: usize = 8;
+        let store = store(Duration::from_secs(5));
+        // Collected eagerly so all N are in flight before any is awaited.
+        let launches: Vec<_> = (0..N)
+            .map(|i| {
+                let store = store.clone();
+                tokio::spawn(async move {
+                    store
+                        .run(
+                            format!("echo marker-{i}"),
+                            None,
+                            None,
+                            true,
+                            false,
+                            Some("race".into()),
+                        )
+                        .await
+                })
+            })
+            .collect();
+
+        let mut ids = Vec::new();
+        for launch in launches {
+            let RunResult::Backgrounded { id } = launch.await.unwrap().unwrap() else {
+                panic!("bg should background");
+            };
+            ids.push(id);
+        }
+        let unique: std::collections::HashSet<&str> = ids.iter().map(|id| id.as_ref()).collect();
+        assert_eq!(unique.len(), N, "concurrent ids must be distinct: {ids:?}");
+
+        // A shared id would mean two commands appending to one log, so each log
+        // holding exactly its own marker is what proves the ids didn't collide.
+        for (i, id) in ids.iter().enumerate() {
+            let mut finished = None;
+            for _ in 0..50 {
+                let (state, page) = store.poll(id, 0, None).await.unwrap().unwrap();
+                if matches!(state, JobState::Exited { .. }) {
+                    finished = Some(page.lines);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert_eq!(
+                finished.expect("job never finished"),
+                vec![format!("marker-{i}")],
+                "log {id} must hold only its own output"
+            );
+        }
     }
 
     #[tokio::test]
