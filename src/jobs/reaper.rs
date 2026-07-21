@@ -171,12 +171,13 @@ pub(super) async fn compact_once(
 ) {
     let rows = match db
         .call(|conn| {
-            let mut stmt = conn.prepare("SELECT id, status, started_unix FROM jobs")?;
+            let mut stmt = conn.prepare("SELECT id, status, started_unix, pgid FROM jobs")?;
             let rows = stmt.query_map([], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, i64>(2)?,
+                    r.get::<_, Option<i64>>(3)?,
                 ))
             })?;
             rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -191,7 +192,7 @@ pub(super) async fn compact_once(
     };
 
     let now = now_unix();
-    for (id, status, started) in rows {
+    for (id, status, started, pgid) in rows {
         // Never rewrite a log still being appended. The in-memory map is the
         // authority on liveness in this process; for a row from a previous process
         // (not tracked here) trust the persisted status.
@@ -200,7 +201,7 @@ pub(super) async fn compact_once(
             Some(job) => matches!(*job.state.lock().await, JobState::Running),
             None => status == "running",
         };
-        if running {
+        if running || group_still_writing(pgid).await {
             continue;
         }
         let keep = if now - started >= aged_after_secs {
@@ -218,6 +219,22 @@ pub(super) async fn compact_once(
                 tracing::warn!(%error, path = %path.display(), "failed to trim job log");
             }
         }
+    }
+}
+
+/// True if a job's persisted process group still has a member, so its log may
+/// still be written to whatever the row's status says. A finished status is not
+/// proof the log is closed: the job's shell re-points stdout/stderr at the log
+/// file (`exec >>log 2>&1`, see `JobStore::run`), so a descendant left running
+/// holds that same append fd — and a group that reparented to init across a
+/// restart can front a row a reconcile flipped to `failed`. Trimming renames a
+/// fresh file over the path, unlinking the inode those writers hold, so every
+/// later line lands in a file nobody can read. A row with no usable pgid can't be
+/// probed; treat it as done, as before.
+async fn group_still_writing(pgid: Option<i64>) -> bool {
+    match pgid.and_then(|p| u32::try_from(p).ok()) {
+        Some(pgid) => group_alive(pgid).await,
+        None => false,
     }
 }
 
@@ -480,6 +497,64 @@ mod tests {
         );
         assert!(!orphan.exists(), "aged orphan log must be swept");
         assert!(known.exists(), "a log with a matching row must be kept");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn compact_once_skips_a_log_whose_group_is_still_alive() {
+        use std::process::Stdio;
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::memory();
+        let jobs = Mutex::new(HashMap::new());
+
+        // Leader of its own group (pgid == pid), like a real job's shell — and its
+        // descendants — still holding the log's append fd.
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 300")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = child.id().expect("child pid");
+        // Reap in the background so the signalled child leaves no zombie reading
+        // as alive — mirrors the real parent (server/init).
+        let waiter = tokio::spawn(async move { child.wait().await });
+
+        // The row a mis-reconcile leaves behind: finished per the DB, alive per the
+        // OS. Not tracked in the (empty) map, exactly like a previous process's job.
+        let started = now_unix();
+        db.call(move |conn| {
+            conn.execute(
+                "INSERT INTO jobs (id, status, started_unix, pgid) \
+                 VALUES ('live', 'failed', ?1, ?2)",
+                rusqlite::params![started, i64::from(pgid)],
+            )
+        })
+        .await
+        .unwrap();
+        let log = write_lines(dir.path(), "live.log", 1000).await;
+
+        // `aged_after_secs = 0` puts the row in the aged tier immediately, so the
+        // only thing that can save this log is the liveness gate.
+        compact_once(&jobs, &db, dir.path(), 0).await;
+        assert_eq!(
+            lines_of(&log).await.len(),
+            1000,
+            "a log whose process group is still alive must not be trimmed"
+        );
+
+        // Same row, same budget, group actually gone: now it trims — proving the
+        // assertion above is the gate, not an inert pass.
+        assert!(kill_group(pgid).await, "group should be gone after kill");
+        let _ = tokio::time::timeout(Duration::from_secs(2), waiter).await;
+        compact_once(&jobs, &db, dir.path(), 0).await;
+
+        let lines = lines_of(&log).await;
+        assert!(lines[0].starts_with(TRIM_MARKER), "marker first: {lines:?}");
+        assert_eq!(lines.len(), TRIM_AGED_LINES + 1, "marker + aged tail");
     }
 
     #[tokio::test]
