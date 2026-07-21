@@ -54,7 +54,7 @@ pub(super) async fn kill_job(job: &Job) -> bool {
         // state — the waiter task reaps the child before it records the exit, so
         // the state still reads `Running` for that window — and report a group
         // that is already gone as killed, not as a kill failure.
-        return !group_alive(pgid.0).await;
+        return !group_alive(pgid).await;
     }
     // Give the group a chance to exit on TERM; force it with KILL otherwise.
     if !exited_within(job.done.clone(), KILL_GRACE).await && !signal_group(pgid, "KILL").await {
@@ -72,12 +72,11 @@ pub(super) async fn kill_job(job: &Job) -> bool {
 /// is gone afterwards. Liveness is probed with `kill -0` rather than a completion
 /// flag — the group's real parent (the server, or init after a restart) reaps the
 /// exited process, so no zombie lingers to read as alive.
-pub(crate) async fn kill_group(pgid: u32) -> bool {
-    let pg = ProcessGroupId(pgid);
+pub(crate) async fn kill_group(pgid: ProcessGroupId) -> bool {
     if !group_alive(pgid).await {
         return true; // nothing to signal — already gone
     }
-    let _ = signal_group(pg, "TERM").await;
+    let _ = signal_group(pgid, "TERM").await;
     let start = tokio::time::Instant::now();
     while start.elapsed() < KILL_GRACE {
         if !group_alive(pgid).await {
@@ -86,7 +85,7 @@ pub(crate) async fn kill_group(pgid: u32) -> bool {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     if group_alive(pgid).await {
-        let _ = signal_group(pg, "KILL").await;
+        let _ = signal_group(pgid, "KILL").await;
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     !group_alive(pgid).await
@@ -96,11 +95,11 @@ pub(crate) async fn kill_group(pgid: u32) -> bool {
 /// no signal, only checks deliverability; stdio is discarded so a "No such
 /// process" line never reaches the terminal. Shared with the startup reconcile in
 /// `super`, which needs the same "did this group outlive the restart?" answer.
-pub(super) async fn group_alive(pgid: u32) -> bool {
+pub(super) async fn group_alive(pgid: ProcessGroupId) -> bool {
     tokio::process::Command::new("kill")
         .arg("-0")
         .arg("--")
-        .arg(format!("-{pgid}"))
+        .arg(format!("-{}", pgid.get()))
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -117,7 +116,7 @@ async fn signal_group(pgid: ProcessGroupId, signal: &str) -> bool {
     match tokio::process::Command::new("kill")
         .arg(format!("-{signal}"))
         .arg("--")
-        .arg(format!("-{}", pgid.0))
+        .arg(format!("-{}", pgid.get()))
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -125,7 +124,7 @@ async fn signal_group(pgid: ProcessGroupId, signal: &str) -> bool {
     {
         Ok(status) => status.success(),
         Err(error) => {
-            tracing::warn!(%error, pgid = pgid.0, signal, "failed to signal process group");
+            tracing::warn!(%error, pgid = pgid.get(), signal, "failed to signal process group");
             false
         }
     }
@@ -245,7 +244,7 @@ pub(super) async fn compact_once(
 /// later line lands in a file nobody can read. A row with no usable pgid can't be
 /// probed; treat it as done, as before.
 async fn group_still_writing(pgid: Option<i64>) -> bool {
-    match pgid.and_then(|p| u32::try_from(p).ok()) {
+    match pgid.and_then(ProcessGroupId::from_persisted) {
         Some(pgid) => group_alive(pgid).await,
         None => false,
     }
@@ -453,7 +452,7 @@ mod tests {
             .process_group(0)
             .spawn()
             .unwrap();
-        let pid = child.id().expect("child pid");
+        let pid = ProcessGroupId::new(child.id().expect("child pid")).expect("nonzero pid");
         // Reap in the background so the signalled child leaves no zombie — mirrors
         // the real parent (server/init) reaping it, which is what `group_alive`
         // assumes.
@@ -470,7 +469,22 @@ mod tests {
     #[tokio::test]
     async fn kill_group_on_dead_pgid_reports_gone() {
         // A pgid with no live members must read as already-gone, not hang.
-        assert!(kill_group(2_000_000_000).await);
+        let dead = ProcessGroupId::new(2_000_000_000).expect("nonzero pgid");
+        assert!(kill_group(dead).await);
+    }
+
+    /// The invariant the type carries: no corrupt persisted pgid can become a
+    /// signal target. `0` is the dangerous one — `kill -- -0` hits *this* process's
+    /// group, i.e. the server — so it must never survive into a `ProcessGroupId`.
+    #[test]
+    fn corrupt_persisted_pgids_never_become_a_signal_target() {
+        for corrupt in [0, -1, i64::from(u32::MAX) + 1] {
+            assert!(
+                ProcessGroupId::from_persisted(corrupt).is_none(),
+                "pgid {corrupt} must not be signalable"
+            );
+        }
+        assert!(ProcessGroupId::from_persisted(1234).is_some());
     }
 
     #[cfg(unix)]
@@ -490,14 +504,14 @@ mod tests {
             .process_group(0)
             .spawn()
             .unwrap();
-        let pgid = child.id().expect("child pid");
+        let pgid = ProcessGroupId::new(child.id().expect("child pid")).expect("nonzero pid");
         let waiter = tokio::spawn(async move { child.wait().await });
         assert!(kill_group(pgid).await, "group should be gone after kill");
         let _ = tokio::time::timeout(Duration::from_secs(2), waiter).await;
 
         let (_tx, rx) = watch::channel(false);
         let job = Arc::new(Job {
-            pgid: Some(ProcessGroupId(pgid)),
+            pgid: Some(pgid),
             state: Arc::new(Mutex::new(JobState::Running)),
             done: rx,
             log_path: PathBuf::from("unused.log"),
@@ -567,7 +581,7 @@ mod tests {
             .process_group(0)
             .spawn()
             .unwrap();
-        let pgid = child.id().expect("child pid");
+        let pgid = ProcessGroupId::new(child.id().expect("child pid")).expect("nonzero pid");
         // Reap in the background so the signalled child leaves no zombie reading
         // as alive — mirrors the real parent (server/init).
         let waiter = tokio::spawn(async move { child.wait().await });
@@ -579,7 +593,7 @@ mod tests {
             conn.execute(
                 "INSERT INTO jobs (id, status, started_unix, pgid) \
                  VALUES ('live', 'failed', ?1, ?2)",
-                rusqlite::params![started, i64::from(pgid)],
+                rusqlite::params![started, i64::from(pgid.get())],
             )
         })
         .await

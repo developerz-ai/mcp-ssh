@@ -125,14 +125,15 @@ async fn kill_job(db: &Db, id: &str) -> anyhow::Result<String> {
         ));
     };
 
-    // A pgid outside u32 is a corrupt row; a raw `as` cast would wrap it into a
-    // real (wrong) process group and signal that instead.
-    let Ok(pgid) = u32::try_from(pgid) else {
+    // Corrupt rows are refused, not signalled: outside `u32` a raw `as` cast would
+    // wrap onto a real (wrong) group, and `0` is worse — `kill -- -0` signals *this*
+    // process's own group. `ProcessGroupId` is the single gate for both.
+    let Some(group) = crate::jobs::ProcessGroupId::from_persisted(pgid) else {
         return Ok(format!(
             "job {id} has a corrupt pgid ({pgid}) — refusing to signal"
         ));
     };
-    let killed = crate::jobs::kill_group(pgid).await;
+    let killed = crate::jobs::kill_group(group).await;
     // Record the kill only if the row is still `running`: when the server owns the
     // job, its waiter may already have written the real exit as the group died.
     let lookup = id.to_string();
@@ -148,7 +149,10 @@ async fn kill_job(db: &Db, id: &str) -> anyhow::Result<String> {
     Ok(if killed {
         format!("killed {id}")
     } else {
-        format!("signalled {id} (pgid {pgid}); the group may already be gone")
+        format!(
+            "signalled {id} (pgid {}); the group may already be gone",
+            group.get()
+        )
     })
 }
 
@@ -379,6 +383,147 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status, "running");
+    }
+
+    /// True once `pid` is no longer signalable, polled up to `deadline`. A killed
+    /// process stays signalable until its parent reaps it, so a single probe right
+    /// after the kill would be a race; a bounded poll is the deterministic form.
+    #[cfg(unix)]
+    async fn gone_within(pid: u32, deadline: std::time::Duration) -> bool {
+        let start = tokio::time::Instant::now();
+        loop {
+            let alive = tokio::process::Command::new("kill")
+                .args(["-0", "--"])
+                .arg(pid.to_string())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .await
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !alive {
+                return true;
+            }
+            if start.elapsed() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_job_signals_a_real_process_group_and_updates_row() {
+        use std::process::Stdio;
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("descendant.pid");
+        // Leader of its own group (pgid == pid) with a background descendant in that
+        // same group — the shape of a real job's shell. The descendant is what makes
+        // this a *group* test: a pid-only signal would leave it running.
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "sleep 300 & echo $! > '{}'; wait",
+                pidfile.display()
+            ))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = i64::from(child.id().expect("child pid"));
+        // Reap in the background so the signalled child leaves no zombie — mirrors
+        // the real parent (server/init) reaping it.
+        let waiter = tokio::spawn(async move { child.wait().await });
+        let descendant = read_pid(&pidfile).await;
+
+        let db = Db::memory();
+        db.call(move |conn| {
+            conn.execute(
+                "INSERT INTO jobs (id, status, pgid, started_unix) VALUES ('real', 'running', ?1, 1)",
+                [pid],
+            )
+        })
+        .await
+        .unwrap();
+
+        let msg = kill_job(&db, "real").await.unwrap();
+        assert_eq!(msg, "killed real", "the whole group must be gone");
+        let exit = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("group leader should exit after kill_job")
+            .expect("wait task should not panic")
+            .expect("waiting on the leader should succeed");
+        assert!(
+            !exit.success(),
+            "leader exits from the signal, not normally"
+        );
+        assert!(
+            gone_within(descendant, std::time::Duration::from_secs(5)).await,
+            "descendant {descendant} outlived the group kill"
+        );
+
+        let status: String = db
+            .call(|conn| {
+                conn.query_row("SELECT status FROM jobs WHERE id = 'real'", [], |r| {
+                    r.get(0)
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            status, "failed",
+            "row transitions out of running once the group is signalled"
+        );
+    }
+
+    /// The pid the shell wrote for its background child, once the write lands.
+    #[cfg(unix)]
+    async fn read_pid(path: &std::path::Path) -> u32 {
+        for _ in 0..100 {
+            if let Ok(text) = tokio::fs::read_to_string(path).await
+                && let Ok(pid) = text.trim().parse()
+            {
+                return pid;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("shell never recorded its background child's pid");
+    }
+
+    #[tokio::test]
+    async fn kill_job_rejects_a_corrupt_pgid_without_signalling() {
+        let db = Db::memory();
+        // Neither value can come from a real job's process group: negative is outside
+        // u32, and `-0` is *this* process's own group. Both simulate a corrupt row
+        // (hand-edited DB, or a future bug writing garbage into the column).
+        for (id, pgid) in [("negative", -1), ("zero", 0)] {
+            db.call(move |conn| {
+                conn.execute(
+                    "INSERT INTO jobs (id, status, pgid, started_unix) VALUES (?1, 'running', ?2, 1)",
+                    rusqlite::params![id, pgid],
+                )
+            })
+            .await
+            .unwrap();
+
+            let msg = kill_job(&db, id).await.unwrap();
+            assert!(
+                msg.contains("corrupt pgid"),
+                "must refuse to signal pgid {pgid}: {msg}"
+            );
+            let lookup = id.to_string();
+            let status: String = db
+                .call(move |conn| {
+                    conn.query_row("SELECT status FROM jobs WHERE id = ?1", [lookup], |r| {
+                        r.get(0)
+                    })
+                })
+                .await
+                .unwrap();
+            assert_eq!(status, "running", "row untouched — no signal was sent");
+        }
     }
 
     #[tokio::test]

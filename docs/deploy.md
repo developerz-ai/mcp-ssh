@@ -42,7 +42,8 @@ The `.deb` installs the binary, a systemd unit, and `/etc/mcp-ssh/config.toml`.
 All checks hit the loopback bind (`127.0.0.1:1337`); swap in `https://your-host` once the proxy is up.
 
 ```bash
-# 1. OAuth discovery returns JSON ⇒ server is up
+# 1. liveness ⇒ server is up; discovery JSON ⇒ the OAuth login surface is up
+curl -fsS http://127.0.0.1:1337/healthz && echo # → ok
 curl -fsS http://127.0.0.1:1337/.well-known/oauth-authorization-server | jq .
 
 # 2. /mcp is bearer-only — no creds ⇒ 401

@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use axum::Router;
+use axum::routing::get;
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
@@ -23,7 +24,8 @@ pub fn build(auth_state: oauth::AuthState, store: JobStore, allowed_hosts: Vec<S
     let mcp = axum::Router::new().nest_service("/mcp", service).layer(
         axum::middleware::from_fn_with_state(auth_state.clone(), auth::require_auth),
     );
-    mcp.merge(oauth::router(auth_state))
+    let health = axum::Router::new().route("/healthz", get(|| async { "ok" }));
+    mcp.merge(oauth::router(auth_state)).merge(health)
 }
 
 #[cfg(test)]
