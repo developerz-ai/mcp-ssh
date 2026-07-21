@@ -1,27 +1,23 @@
-//! Reaper + kill signalling: evict aged-out jobs and terminate process groups.
-//!
-//! A job leads its own process group (so its pgid equals its pid; see
-//! `JobStore::run`), which lets a single signal to the negative pid reach the
-//! whole tree the command spawned, not just `sh` itself.
+//! Reaper: evict aged-out jobs and compact/sweep their logs.
 //!
 //! Job ages come from the DB `started_unix` (wall clock), so retention/trim tiers
 //! stay meaningful across restarts. The in-memory map is consulted only to kill a
-//! still-running group before evicting it.
+//! still-running group before evicting it. Process-group signalling itself lives
+//! in `super::signal`.
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use tokio::sync::{Mutex, watch};
+use tokio::sync::Mutex;
 
-use super::{Job, JobId, JobState, ProcessGroupId};
-use crate::db::{Db, now_unix};
+use super::signal::{group_alive, kill_job};
+use super::{Job, JobId, JobRepo, JobState, ProcessGroupId};
+use crate::db::now_unix;
 
 /// Jobs (and their logs) older than this are reaped hourly. Seconds, to compare
 /// against the DB's wall-clock `started_unix`.
 const RETENTION_SECS: i64 = 24 * 3600;
-/// Grace between `SIGTERM` and `SIGKILL` when killing a job's process group.
-const KILL_GRACE: Duration = Duration::from_secs(2);
 
 /// This server is meant to run for weeks. Job logs can't grow without bound, so
 /// the hourly pass compacts the logs of *finished* jobs to a trailing tail —
@@ -37,137 +33,38 @@ const TRIM_AGED_LINES: usize = 500;
 /// trimming is idempotent — re-running never erodes the kept tail line by line.
 const TRIM_MARKER: &str = "[mcp-ssh: earlier output trimmed";
 
-/// Signal a job's process group dead: `SIGTERM`, then `SIGKILL` if it outlasts a
-/// short grace. Returns `true` if the group is gone afterwards, `false` if there
-/// was nothing to kill (the store already recorded the exit, the OS withheld its
-/// pid) or the group outlived the signals.
-pub(super) async fn kill_job(job: &Job) -> bool {
-    if !matches!(*job.state.lock().await, JobState::Running) {
-        return false;
-    }
-    let Some(pgid) = job.pgid else {
-        return false;
-    };
-    if !signal_group(pgid, "TERM").await {
-        // `TERM` only fails once the group is gone, so the job exited between the
-        // state check and the signal. Probe the group rather than re-reading the
-        // state — the waiter task reaps the child before it records the exit, so
-        // the state still reads `Running` for that window — and report a group
-        // that is already gone as killed, not as a kill failure.
-        return !group_alive(pgid).await;
-    }
-    // Give the group a chance to exit on TERM; force it with KILL otherwise.
-    if !exited_within(job.done.clone(), KILL_GRACE).await && !signal_group(pgid, "KILL").await {
-        // The group can die between the grace expiring and the KILL — its own
-        // TERM worked, the KILL just found nothing. Report by final state, not
-        // by KILL delivery, so that success isn't misread as "nothing to kill".
-        return !matches!(*job.state.lock().await, JobState::Running);
-    }
-    true
-}
-
-/// Kill a process group by raw pgid, for callers that hold no in-process `Job`
-/// (the `mcp-ssh job kill` CLI, which acts on the persisted pgid). `SIGTERM`,
-/// then `SIGKILL` if the group outlives a short grace. Returns whether the group
-/// is gone afterwards. Liveness is probed with `kill -0` rather than a completion
-/// flag — the group's real parent (the server, or init after a restart) reaps the
-/// exited process, so no zombie lingers to read as alive.
-pub(crate) async fn kill_group(pgid: ProcessGroupId) -> bool {
-    if !group_alive(pgid).await {
-        return true; // nothing to signal — already gone
-    }
-    let _ = signal_group(pgid, "TERM").await;
-    let start = tokio::time::Instant::now();
-    while start.elapsed() < KILL_GRACE {
-        if !group_alive(pgid).await {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    if group_alive(pgid).await {
-        let _ = signal_group(pgid, "KILL").await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    !group_alive(pgid).await
-}
-
-/// True if process group `pgid` still has at least one member. `kill -0` delivers
-/// no signal, only checks deliverability; stdio is discarded so a "No such
-/// process" line never reaches the terminal. Shared with the startup reconcile in
-/// `super`, which needs the same "did this group outlive the restart?" answer.
-pub(super) async fn group_alive(pgid: ProcessGroupId) -> bool {
-    tokio::process::Command::new("kill")
-        .arg("-0")
-        .arg("--")
-        .arg(format!("-{}", pgid.get()))
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-/// Send `signal` (`"TERM"`, `"KILL"`, …) to process group `pgid`. The negative
-/// pid targets the whole group so descendants die too, not just `sh`; `--` stops
-/// `kill` reading it as an option. Returns whether the signal was delivered.
-/// ponytail: pid reuse is a non-issue here.
-async fn signal_group(pgid: ProcessGroupId, signal: &str) -> bool {
-    match tokio::process::Command::new("kill")
-        .arg(format!("-{signal}"))
-        .arg("--")
-        .arg(format!("-{}", pgid.get()))
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await
-    {
-        Ok(status) => status.success(),
-        Err(error) => {
-            tracing::warn!(%error, pgid = pgid.get(), signal, "failed to signal process group");
-            false
-        }
-    }
-}
-
-/// Wait up to `grace` for the job to exit, watching its completion flag rather
-/// than polling. Returns true if it exited in time, false if the grace elapsed.
-async fn exited_within(mut done: watch::Receiver<bool>, grace: Duration) -> bool {
-    // The waiter flips the flag to true exactly once, on exit. A receiver error
-    // means the sender dropped, which only happens after that same exit.
-    tokio::time::timeout(grace, done.wait_for(|&exited| exited))
-        .await
-        .is_ok()
-}
-
 /// Run a reaping pass once on startup, then hourly. ponytail: time-based only; a
 /// busy box could still hold ≤24h of jobs — add a count cap if that ever bites.
-pub(super) fn spawn_reaper(jobs: Arc<Mutex<HashMap<JobId, Arc<Job>>>>, db: Db, dir: PathBuf) {
+pub(super) fn spawn_reaper(
+    jobs: Arc<Mutex<HashMap<JobId, Arc<Job>>>>,
+    repo: JobRepo,
+    dir: PathBuf,
+) {
     tokio::spawn(async move {
         // Run immediately so a long-dead job's log is reclaimed promptly after a
         // restart, then settle into the hourly cadence.
-        reaper_pass(&jobs, &db, &dir).await;
+        reaper_pass(&jobs, &repo, &dir).await;
         let mut tick = tokio::time::interval(Duration::from_secs(3600));
         tick.tick().await; // the first tick fires immediately — already covered above
         loop {
             tick.tick().await;
-            reaper_pass(&jobs, &db, &dir).await;
+            reaper_pass(&jobs, &repo, &dir).await;
         }
     });
 }
 
 /// One full pass: purge aged-out jobs, compact the logs of finished survivors,
 /// sweep orphan log files left with no row, and drop expired OAuth tokens.
-async fn reaper_pass(jobs: &Mutex<HashMap<JobId, Arc<Job>>>, db: &Db, dir: &Path) {
-    reap_once(jobs, db, dir, RETENTION_SECS).await;
-    compact_once(jobs, db, dir, TRIM_AGED_AFTER_SECS).await;
-    reap_orphans(db, dir, RETENTION_SECS).await;
+async fn reaper_pass(jobs: &Mutex<HashMap<JobId, Arc<Job>>>, repo: &JobRepo, dir: &Path) {
+    reap_once(jobs, repo, dir, RETENTION_SECS).await;
+    compact_once(jobs, repo, dir, TRIM_AGED_AFTER_SECS).await;
+    reap_orphans(repo, dir, RETENTION_SECS).await;
     // Tokens share this DB and the same wall clock as the job reap, so they ride
     // the same pass rather than a second timer. Counts only — the sweep never
     // reads a token value.
     let now = now_unix();
-    crate::oauth::sweep_expired_access(db, now).await;
-    crate::oauth::sweep_expired_refresh(db, now).await;
+    crate::oauth::sweep_expired_access(repo.db(), now).await;
+    crate::oauth::sweep_expired_refresh(repo.db(), now).await;
 }
 
 /// Compact every *finished* job's log to a trailing tail: `TRIM_RECENT_LINES`
@@ -177,25 +74,11 @@ async fn reaper_pass(jobs: &Mutex<HashMap<JobId, Arc<Job>>>, db: &Db, dir: &Path
 /// already-trimmed log is left alone.
 pub(super) async fn compact_once(
     jobs: &Mutex<HashMap<JobId, Arc<Job>>>,
-    db: &Db,
+    repo: &JobRepo,
     dir: &Path,
     aged_after_secs: i64,
 ) {
-    let rows = match db
-        .call(|conn| {
-            let mut stmt = conn.prepare("SELECT id, status, started_unix, pgid FROM jobs")?;
-            let rows = stmt.query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, i64>(2)?,
-                    r.get::<_, Option<i64>>(3)?,
-                ))
-            })?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()
-        })
-        .await
-    {
+    let rows = match repo.compaction_rows().await {
         Ok(rows) => rows,
         Err(error) => {
             tracing::warn!(%error, "reaper: querying jobs to compact failed");
@@ -204,24 +87,23 @@ pub(super) async fn compact_once(
     };
 
     let now = now_unix();
-    for (id, status, started, pgid) in rows {
+    for row in rows {
         // Never rewrite a log still being appended. The in-memory map is the
         // authority on liveness in this process; for a row from a previous process
         // (not tracked here) trust the persisted status.
-        let jid = JobId::from(id.clone());
-        let running = match jobs.lock().await.get(&jid) {
+        let running = match jobs.lock().await.get(&row.id) {
             Some(job) => matches!(*job.state.lock().await, JobState::Running),
-            None => status == "running",
+            None => row.running,
         };
-        if running || group_still_writing(pgid).await {
+        if running || group_still_writing(row.pgid).await {
             continue;
         }
-        let keep = if now - started >= aged_after_secs {
+        let keep = if now - row.started_unix >= aged_after_secs {
             TRIM_AGED_LINES
         } else {
             TRIM_RECENT_LINES
         };
-        let path = dir.join(format!("{id}.log"));
+        let path = dir.join(format!("{}.log", row.id));
         match trim_log(&path, keep).await {
             Ok(()) => {}
             // A finished job whose log is already gone (reaped/never produced) is
@@ -254,15 +136,8 @@ async fn group_still_writing(pgid: Option<i64>) -> bool {
 /// dropped row) once they're older than `retention_secs` by mtime — so a poll
 /// racing a just-finished job still finds its log, but truly abandoned files don't
 /// accumulate.
-async fn reap_orphans(db: &Db, dir: &Path, retention_secs: i64) {
-    let known: HashSet<String> = match db
-        .call(|conn| {
-            let mut stmt = conn.prepare("SELECT id FROM jobs")?;
-            let ids = stmt.query_map([], |r| r.get::<_, String>(0))?;
-            ids.collect::<rusqlite::Result<HashSet<_>>>()
-        })
-        .await
-    {
+async fn reap_orphans(repo: &JobRepo, dir: &Path, retention_secs: i64) {
+    let known: HashSet<String> = match repo.all_ids().await {
         Ok(ids) => ids,
         Err(error) => {
             tracing::warn!(%error, "reaper: querying known job ids failed");
@@ -361,19 +236,12 @@ async fn trim_log(path: &Path, keep: usize) -> std::io::Result<()> {
 /// (pollable/killable, row + log intact) for a later pass.
 pub(super) async fn reap_once(
     jobs: &Mutex<HashMap<JobId, Arc<Job>>>,
-    db: &Db,
+    repo: &JobRepo,
     dir: &Path,
     retention_secs: i64,
 ) {
     let cutoff = now_unix() - retention_secs;
-    let stale = match db
-        .call(move |conn| {
-            let mut stmt = conn.prepare("SELECT id FROM jobs WHERE started_unix < ?1")?;
-            let ids = stmt.query_map([cutoff], |r| r.get::<_, String>(0))?;
-            ids.collect::<rusqlite::Result<Vec<_>>>()
-        })
-        .await
-    {
+    let stale = match repo.started_before(cutoff).await {
         Ok(ids) => ids,
         Err(error) => {
             tracing::warn!(%error, "reaper: querying stale jobs failed");
@@ -381,10 +249,9 @@ pub(super) async fn reap_once(
         }
     };
 
-    let mut evictable: Vec<String> = Vec::new();
+    let mut evictable: Vec<JobId> = Vec::new();
     for id in &stale {
-        let jid = JobId::from(id.clone());
-        let live = jobs.lock().await.get(&jid).cloned();
+        let live = jobs.lock().await.get(id).cloned();
         match live {
             Some(job) if matches!(*job.state.lock().await, JobState::Running) => {
                 // Kill before evict so a live group is never orphaned. If the kill
@@ -403,27 +270,19 @@ pub(super) async fn reap_once(
         return;
     }
 
-    let ids = evictable.clone();
-    if let Err(error) = db
-        .call(move |conn| {
-            for id in &ids {
-                conn.execute("DELETE FROM jobs WHERE id = ?1", [id.as_str()])?;
-            }
-            Ok(())
-        })
-        .await
-    {
+    if let Err(error) = repo.delete(evictable.clone()).await {
         tracing::warn!(%error, "reaper: deleting stale rows failed");
     }
 
     for id in &evictable {
-        jobs.lock().await.remove(&JobId::from(id.clone()));
+        jobs.lock().await.remove(id);
         let _ = tokio::fs::remove_file(dir.join(format!("{id}.log"))).await;
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::signal::kill_group;
     use super::*;
 
     async fn write_lines(dir: &std::path::Path, name: &str, n: usize) -> std::path::PathBuf {
@@ -438,103 +297,19 @@ mod tests {
         s.lines().map(str::to_string).collect()
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn kill_group_terminates_a_detached_group() {
-        use std::process::Stdio;
-        // Leader of its own group (pgid == pid), like a real job's shell.
-        let mut child = tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg("sleep 300")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .process_group(0)
-            .spawn()
-            .unwrap();
-        let pid = ProcessGroupId::new(child.id().expect("child pid")).expect("nonzero pid");
-        // Reap in the background so the signalled child leaves no zombie — mirrors
-        // the real parent (server/init) reaping it, which is what `group_alive`
-        // assumes.
-        let waiter = tokio::spawn(async move { child.wait().await });
-
-        assert!(
-            kill_group(pid).await,
-            "group should be gone after kill_group"
-        );
-        let _ = tokio::time::timeout(Duration::from_secs(2), waiter).await;
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn kill_group_on_dead_pgid_reports_gone() {
-        // A pgid with no live members must read as already-gone, not hang.
-        let dead = ProcessGroupId::new(2_000_000_000).expect("nonzero pgid");
-        assert!(kill_group(dead).await);
-    }
-
-    /// The invariant the type carries: no corrupt persisted pgid can become a
-    /// signal target. `0` is the dangerous one — `kill -- -0` hits *this* process's
-    /// group, i.e. the server — so it must never survive into a `ProcessGroupId`.
-    #[test]
-    fn corrupt_persisted_pgids_never_become_a_signal_target() {
-        for corrupt in [0, -1, i64::from(u32::MAX) + 1] {
-            assert!(
-                ProcessGroupId::from_persisted(corrupt).is_none(),
-                "pgid {corrupt} must not be signalable"
-            );
-        }
-        assert!(ProcessGroupId::from_persisted(1234).is_some());
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn kill_job_reports_a_group_gone_before_term_as_killed() {
-        use std::process::Stdio;
-        // The race `kill_job` guards: the group exits between the state check and
-        // the `TERM`. Reproduced deterministically by killing and reaping the group
-        // first, then killing a job whose state still reads `Running` — exactly the
-        // window between the waiter reaping the child and recording its exit.
-        let mut child = tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg("sleep 300")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .process_group(0)
-            .spawn()
-            .unwrap();
-        let pgid = ProcessGroupId::new(child.id().expect("child pid")).expect("nonzero pid");
-        let waiter = tokio::spawn(async move { child.wait().await });
-        assert!(kill_group(pgid).await, "group should be gone after kill");
-        let _ = tokio::time::timeout(Duration::from_secs(2), waiter).await;
-
-        let (_tx, rx) = watch::channel(false);
-        let job = Arc::new(Job {
-            pgid: Some(pgid),
-            state: Arc::new(Mutex::new(JobState::Running)),
-            done: rx,
-            log_path: PathBuf::from("unused.log"),
-        });
-
-        assert!(
-            kill_job(&job).await,
-            "a group already gone must report killed, not a kill failure"
-        );
-    }
-
     #[tokio::test]
     async fn reap_orphans_removes_aged_trim_temps_and_keeps_known_logs() {
         let dir = tempfile::tempdir().unwrap();
-        let db = crate::db::Db::memory();
-        db.call(|conn| {
-            conn.execute(
-                "INSERT INTO jobs (id, status, started_unix) VALUES ('known', 'exited', 0)",
-                [],
-            )
-        })
-        .await
-        .unwrap();
+        let repo = JobRepo::new(crate::db::Db::memory());
+        repo.db()
+            .call(|conn| {
+                conn.execute(
+                    "INSERT INTO jobs (id, status, started_unix) VALUES ('known', 'exited', 0)",
+                    [],
+                )
+            })
+            .await
+            .unwrap();
 
         // A crashed trim's temp, an orphan log, and a known job's log.
         let trim_tmp = dir.path().join("dead.log.trim");
@@ -552,7 +327,7 @@ mod tests {
             assert!(status.success());
         }
 
-        reap_orphans(&db, dir.path(), RETENTION_SECS).await;
+        reap_orphans(&repo, dir.path(), RETENTION_SECS).await;
 
         assert!(
             !trim_tmp.exists(),
@@ -567,7 +342,7 @@ mod tests {
     async fn compact_once_skips_a_log_whose_group_is_still_alive() {
         use std::process::Stdio;
         let dir = tempfile::tempdir().unwrap();
-        let db = crate::db::Db::memory();
+        let repo = JobRepo::new(crate::db::Db::memory());
         let jobs = Mutex::new(HashMap::new());
 
         // Leader of its own group (pgid == pid), like a real job's shell — and its
@@ -589,20 +364,21 @@ mod tests {
         // The row a mis-reconcile leaves behind: finished per the DB, alive per the
         // OS. Not tracked in the (empty) map, exactly like a previous process's job.
         let started = now_unix();
-        db.call(move |conn| {
-            conn.execute(
-                "INSERT INTO jobs (id, status, started_unix, pgid) \
-                 VALUES ('live', 'failed', ?1, ?2)",
-                rusqlite::params![started, i64::from(pgid.get())],
-            )
-        })
-        .await
-        .unwrap();
+        repo.db()
+            .call(move |conn| {
+                conn.execute(
+                    "INSERT INTO jobs (id, status, started_unix, pgid) \
+                     VALUES ('live', 'failed', ?1, ?2)",
+                    rusqlite::params![started, i64::from(pgid.get())],
+                )
+            })
+            .await
+            .unwrap();
         let log = write_lines(dir.path(), "live.log", 1000).await;
 
         // `aged_after_secs = 0` puts the row in the aged tier immediately, so the
         // only thing that can save this log is the liveness gate.
-        compact_once(&jobs, &db, dir.path(), 0).await;
+        compact_once(&jobs, &repo, dir.path(), 0).await;
         assert_eq!(
             lines_of(&log).await.len(),
             1000,
@@ -613,7 +389,7 @@ mod tests {
         // assertion above is the gate, not an inert pass.
         assert!(kill_group(pgid).await, "group should be gone after kill");
         let _ = tokio::time::timeout(Duration::from_secs(2), waiter).await;
-        compact_once(&jobs, &db, dir.path(), 0).await;
+        compact_once(&jobs, &repo, dir.path(), 0).await;
 
         let lines = lines_of(&log).await;
         assert!(lines[0].starts_with(TRIM_MARKER), "marker first: {lines:?}");
@@ -623,30 +399,32 @@ mod tests {
     #[tokio::test]
     async fn reaper_pass_sweeps_expired_oauth_tokens() {
         let dir = tempfile::tempdir().unwrap();
-        let db = crate::db::Db::memory();
+        let repo = JobRepo::new(crate::db::Db::memory());
         let jobs = Mutex::new(HashMap::new());
         // One dead and one live row per table: lazy eviction never touches either
         // unless the very same token is re-presented.
-        db.call(|conn| {
-            let (dead, live) = (now_unix() - 1, now_unix() + 3600);
-            for table in ["access_tokens", "refresh_tokens"] {
-                conn.execute(
-                    &format!("INSERT INTO {table} (token, expires_unix) VALUES ('dead', ?1)"),
-                    [dead],
-                )?;
-                conn.execute(
-                    &format!("INSERT INTO {table} (token, expires_unix) VALUES ('live', ?1)"),
-                    [live],
-                )?;
-            }
-            Ok(())
-        })
-        .await
-        .unwrap();
+        repo.db()
+            .call(|conn| {
+                let (dead, live) = (now_unix() - 1, now_unix() + 3600);
+                for table in ["access_tokens", "refresh_tokens"] {
+                    conn.execute(
+                        &format!("INSERT INTO {table} (token, expires_unix) VALUES ('dead', ?1)"),
+                        [dead],
+                    )?;
+                    conn.execute(
+                        &format!("INSERT INTO {table} (token, expires_unix) VALUES ('live', ?1)"),
+                        [live],
+                    )?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
 
-        reaper_pass(&jobs, &db, dir.path()).await;
+        reaper_pass(&jobs, &repo, dir.path()).await;
 
-        let (access, refresh): (i64, i64) = db
+        let (access, refresh): (i64, i64) = repo
+            .db()
             .call(|conn| {
                 conn.query_row(
                     "SELECT (SELECT COUNT(*) FROM access_tokens), \
