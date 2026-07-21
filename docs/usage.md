@@ -130,7 +130,7 @@ Config lives at `/etc/mcp-ssh/config.toml` (or override the path with `$MCP_SSH_
 | `MCP_SSH_PASS` | — | password (set via `mcp-ssh set-auth`) |
 | `MCP_SSH_INLINE_TIMEOUT_SECS` | `2` | inline window before `bash` backgrounds |
 | `MCP_SSH_JOB_DIR` | `/var/lib/mcp-ssh/logs/jobs` | where per-job log files live |
-| `MCP_SSH_ALLOWED_HOSTS` | `localhost,127.0.0.1` | hostnames accepted in the `Host` header (DNS-rebinding guard) — **set this to your public hostname** |
+| `MCP_SSH_ALLOWED_HOSTS` | `localhost,127.0.0.1` (loopback binds only) | hostnames accepted in the `Host` header (DNS-rebinding guard) — **set this to your public hostname**. **Required** for a non-loopback bind: the server refuses to start without it |
 
 ### Listen port
 

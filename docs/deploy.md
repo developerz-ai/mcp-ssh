@@ -210,7 +210,7 @@ File: `/etc/mcp-ssh/config.toml` (or override the path with `$MCP_SSH_CONFIG`). 
 | `MCP_SSH_USER` / `MCP_SSH_PASS` | — | credentials (prefer `mcp-ssh set-auth`) |
 | `MCP_SSH_INLINE_TIMEOUT_SECS` | `2` | inline window before `bash` backgrounds |
 | `MCP_SSH_JOB_DIR` | `/var/lib/mcp-ssh/logs/jobs` | per-job log files |
-| `MCP_SSH_ALLOWED_HOSTS` | `localhost,127.0.0.1` | hostnames accepted in `Host` — **set to your public hostname** |
+| `MCP_SSH_ALLOWED_HOSTS` | `localhost,127.0.0.1` (loopback binds only) | hostnames accepted in `Host` — **set to your public hostname**. **Required** when `MCP_SSH_BIND` is non-loopback (e.g. `0.0.0.0`): startup fails without it |
 | `SENTRY_DSN` | — | GlitchTip ingest DSN; injected via the systemd EnvironmentFile (`/etc/mcp-ssh/mcp-ssh.env`). Unset/empty ⇒ error tracking disabled |
 | `SENTRY_ENVIRONMENT` | `development` | GlitchTip environment tag; injected via the same env file |
 
