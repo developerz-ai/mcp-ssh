@@ -152,7 +152,7 @@ pub async fn token(State(st): State<AuthState>, Form(p): Form<TokenParams>) -> R
             })),
         )
             .into_response(),
-        Err(e) => bad_request(e),
+        Err(e) => bad_request(&e.to_string()),
     }
 }
 
@@ -171,7 +171,7 @@ pub async fn register(
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": e })),
+                Json(json!({ "error": e.to_string() })),
             )
                 .into_response();
         }
