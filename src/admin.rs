@@ -381,6 +381,86 @@ mod tests {
         assert_eq!(status, "running");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_job_signals_a_real_process_group_and_updates_row() {
+        use std::process::Stdio;
+        // Leader of its own group (pgid == pid), like a real job's shell.
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 300")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = i64::from(child.id().expect("child pid"));
+        // Reap in the background so the signalled child leaves no zombie — mirrors
+        // the real parent (server/init) reaping it.
+        let waiter = tokio::spawn(async move { child.wait().await });
+
+        let db = Db::memory();
+        db.call(move |conn| {
+            conn.execute(
+                "INSERT INTO jobs (id, status, pgid, started_unix) VALUES ('real', 'running', ?1, 1)",
+                [pid],
+            )
+        })
+        .await
+        .unwrap();
+
+        let msg = kill_job(&db, "real").await.unwrap();
+        assert!(
+            msg.contains("killed") || msg.contains("signalled"),
+            "should report the group was signalled: {msg}"
+        );
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), waiter).await;
+
+        let status: String = db
+            .call(|conn| {
+                conn.query_row("SELECT status FROM jobs WHERE id = 'real'", [], |r| {
+                    r.get(0)
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            status, "failed",
+            "row transitions out of running once the group is signalled"
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_job_rejects_a_corrupt_pgid_without_signalling() {
+        let db = Db::memory();
+        // Negative pgid can't come from a real process group; simulates a corrupt row
+        // (e.g. hand-edited DB, or a future bug writing garbage into the column).
+        db.call(|conn| {
+            conn.execute(
+                "INSERT INTO jobs (id, status, pgid, started_unix) VALUES ('corrupt', 'running', -1, 1)",
+                [],
+            )
+        })
+        .await
+        .unwrap();
+
+        let msg = kill_job(&db, "corrupt").await.unwrap();
+        assert!(
+            msg.contains("corrupt pgid"),
+            "must refuse to signal a pgid outside u32: {msg}"
+        );
+        let status: String = db
+            .call(|conn| {
+                conn.query_row("SELECT status FROM jobs WHERE id = 'corrupt'", [], |r| {
+                    r.get(0)
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(status, "running", "row untouched — no signal was sent");
+    }
+
     #[tokio::test]
     async fn render_sessions_counts_without_leaking_tokens() {
         let db = Db::memory();
