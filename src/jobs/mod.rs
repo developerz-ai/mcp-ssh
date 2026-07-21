@@ -962,12 +962,15 @@ mod tests {
         panic!("job never finished");
     }
 
-    /// `kill -0` probes liveness without delivering a signal.
+    /// `kill -0` probes liveness without delivering a signal. Stdio is discarded
+    /// so a "No such process" line never reaches the test output.
     #[cfg(unix)]
     async fn alive(pid: &str) -> bool {
         tokio::process::Command::new("kill")
             .arg("-0")
             .arg(pid)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status()
             .await
             .map(|s| s.success())

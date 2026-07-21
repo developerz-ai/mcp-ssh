@@ -38,9 +38,9 @@ const TRIM_AGED_LINES: usize = 500;
 const TRIM_MARKER: &str = "[mcp-ssh: earlier output trimmed";
 
 /// Signal a job's process group dead: `SIGTERM`, then `SIGKILL` if it outlasts a
-/// short grace. Returns `true` if it signalled a running job, `false` if there
-/// was nothing to kill (already finished, the OS withheld its pid) or the signal
-/// could not be delivered.
+/// short grace. Returns `true` if the group is gone afterwards, `false` if there
+/// was nothing to kill (the store already recorded the exit, the OS withheld its
+/// pid) or the group outlived the signals.
 pub(super) async fn kill_job(job: &Job) -> bool {
     if !matches!(*job.state.lock().await, JobState::Running) {
         return false;
@@ -49,11 +49,12 @@ pub(super) async fn kill_job(job: &Job) -> bool {
         return false;
     };
     if !signal_group(pgid, "TERM").await {
-        // The TERM signal failed to deliver, but the group may have exited
-        // naturally (race condition: process exited between state check and signal).
-        // Report by final state, not by signal delivery, so the group being gone
-        // is a success, not a failure.
-        return !matches!(*job.state.lock().await, JobState::Running);
+        // `TERM` only fails once the group is gone, so the job exited between the
+        // state check and the signal. Probe the group rather than re-reading the
+        // state — the waiter task reaps the child before it records the exit, so
+        // the state still reads `Running` for that window — and report a group
+        // that is already gone as killed, not as a kill failure.
+        return !group_alive(pgid.0).await;
     }
     // Give the group a chance to exit on TERM; force it with KILL otherwise.
     if !exited_within(job.done.clone(), KILL_GRACE).await && !signal_group(pgid, "KILL").await {
@@ -466,25 +467,40 @@ mod tests {
         assert!(kill_group(2_000_000_000).await);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
-    async fn kill_job_rechecks_state_when_term_fails() {
+    async fn kill_job_reports_a_group_gone_before_term_as_killed() {
+        use std::process::Stdio;
+        // The race `kill_job` guards: the group exits between the state check and
+        // the `TERM`. Reproduced deterministically by killing and reaping the group
+        // first, then killing a job whose state still reads `Running` — exactly the
+        // window between the waiter reaping the child and recording its exit.
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 300")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = child.id().expect("child pid");
+        let waiter = tokio::spawn(async move { child.wait().await });
+        assert!(kill_group(pgid).await, "group should be gone after kill");
+        let _ = tokio::time::timeout(Duration::from_secs(2), waiter).await;
+
         let (_tx, rx) = watch::channel(false);
-        // TERM will fail for a non-existent process group. The key is that we
-        // re-check the state and return false (nothing to kill) rather than
-        // returning false immediately without checking. This prevents false
-        // negatives: if the process exited before TERM was sent, the state would
-        // reflect that, and we'd correctly report it as handled.
         let job = Arc::new(Job {
-            pgid: Some(ProcessGroupId(2_000_000_000)), // Non-existent pgid → TERM fails
+            pgid: Some(ProcessGroupId(pgid)),
             state: Arc::new(Mutex::new(JobState::Running)),
             done: rx,
-            log_path: std::path::PathBuf::from("/tmp/test.log"),
+            log_path: PathBuf::from("unused.log"),
         });
 
-        let result = kill_job(&job).await;
-        // When TERM fails and state is still Running, we return false (couldn't kill).
-        // The re-check prevents misreporting a race-condition exit as a kill failure.
-        assert!(!result, "kill_job must handle TERM failure gracefully");
+        assert!(
+            kill_job(&job).await,
+            "a group already gone must report killed, not a kill failure"
+        );
     }
 
     #[tokio::test]
