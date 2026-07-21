@@ -16,7 +16,7 @@ mod metadata;
 mod store;
 
 pub use metadata::base_url;
-pub use store::Store;
+pub use store::{Store, sweep_expired_access, sweep_expired_refresh};
 
 /// Shared state for both the OAuth routes and the `/mcp` auth middleware.
 #[derive(Clone)]

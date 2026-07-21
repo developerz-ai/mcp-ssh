@@ -50,8 +50,11 @@ impl Db {
         conn.pragma_update(None, "busy_timeout", 5000)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
-        // Forward-only migration for databases created before `jobs.pgid` existed
-        // (CREATE TABLE IF NOT EXISTS won't add a column to an existing table).
+        // Forward-only migration for databases created before these `jobs` columns
+        // existed (CREATE TABLE IF NOT EXISTS won't add a column to an existing
+        // table). Each call is idempotent, so this is safe to run on every open.
+        ensure_column(&conn, "jobs", "title", "TEXT")?;
+        ensure_column(&conn, "jobs", "output_tail", "TEXT")?;
         ensure_column(&conn, "jobs", "pgid", "INTEGER")?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -188,5 +191,56 @@ mod tests {
         // Second call is a no-op, not a duplicate-column error.
         ensure_column(&conn, "t", "b", "INTEGER").unwrap();
         assert!(has_b(&conn));
+    }
+
+    #[tokio::test]
+    async fn open_migrates_a_legacy_jobs_table_missing_new_columns() {
+        // Simulate a database created before `title`/`output_tail`/`pgid` existed on
+        // `jobs`: a real on-disk file (not `:memory:`) with the old, narrower schema.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE jobs (
+                    id           TEXT PRIMARY KEY,
+                    status       TEXT NOT NULL,
+                    code         INTEGER,
+                    error        TEXT,
+                    started_unix INTEGER NOT NULL
+                );",
+            )
+            .unwrap();
+        }
+
+        let db = Db::open(&path).expect("open must migrate the legacy table in place");
+
+        let has_column = |name: &'static str| {
+            let db = db.clone();
+            async move {
+                db.call(move |c| {
+                    let mut stmt = c.prepare("PRAGMA table_info(jobs)")?;
+                    let names = stmt.query_map([], |r| r.get::<_, String>(1))?;
+                    Ok(names.filter_map(Result::ok).any(|n| n == name))
+                })
+                .await
+                .unwrap()
+            }
+        };
+        assert!(has_column("title").await, "title column added");
+        assert!(has_column("output_tail").await, "output_tail column added");
+        assert!(has_column("pgid").await, "pgid column added");
+
+        // The insert `JobStore::spawn` issues (jobs/mod.rs) must now succeed against
+        // the migrated table.
+        db.call(|c| {
+            c.execute(
+                "INSERT INTO jobs (id, title, status, code, error, started_unix, output_tail, pgid) \
+                 VALUES (?1, ?2, 'running', NULL, NULL, ?3, NULL, ?4)",
+                rusqlite::params!["job-legacy", "some-title", 123_i64, 456_i64],
+            )
+        })
+        .await
+        .expect("insert against migrated legacy table must succeed");
     }
 }

@@ -157,12 +157,18 @@ pub(super) fn spawn_reaper(jobs: Arc<Mutex<HashMap<JobId, Arc<Job>>>>, db: Db, d
     });
 }
 
-/// One full pass: purge aged-out jobs, compact the logs of finished survivors, and
-/// sweep orphan log files left with no row.
+/// One full pass: purge aged-out jobs, compact the logs of finished survivors,
+/// sweep orphan log files left with no row, and drop expired OAuth tokens.
 async fn reaper_pass(jobs: &Mutex<HashMap<JobId, Arc<Job>>>, db: &Db, dir: &Path) {
     reap_once(jobs, db, dir, RETENTION_SECS).await;
     compact_once(jobs, db, dir, TRIM_AGED_AFTER_SECS).await;
     reap_orphans(db, dir, RETENTION_SECS).await;
+    // Tokens share this DB and the same wall clock as the job reap, so they ride
+    // the same pass rather than a second timer. Counts only — the sweep never
+    // reads a token value.
+    let now = now_unix();
+    crate::oauth::sweep_expired_access(db, now).await;
+    crate::oauth::sweep_expired_refresh(db, now).await;
 }
 
 /// Compact every *finished* job's log to a trailing tail: `TRIM_RECENT_LINES`
@@ -598,6 +604,47 @@ mod tests {
         let lines = lines_of(&log).await;
         assert!(lines[0].starts_with(TRIM_MARKER), "marker first: {lines:?}");
         assert_eq!(lines.len(), TRIM_AGED_LINES + 1, "marker + aged tail");
+    }
+
+    #[tokio::test]
+    async fn reaper_pass_sweeps_expired_oauth_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::memory();
+        let jobs = Mutex::new(HashMap::new());
+        // One dead and one live row per table: lazy eviction never touches either
+        // unless the very same token is re-presented.
+        db.call(|conn| {
+            let (dead, live) = (now_unix() - 1, now_unix() + 3600);
+            for table in ["access_tokens", "refresh_tokens"] {
+                conn.execute(
+                    &format!("INSERT INTO {table} (token, expires_unix) VALUES ('dead', ?1)"),
+                    [dead],
+                )?;
+                conn.execute(
+                    &format!("INSERT INTO {table} (token, expires_unix) VALUES ('live', ?1)"),
+                    [live],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        reaper_pass(&jobs, &db, dir.path()).await;
+
+        let (access, refresh): (i64, i64) = db
+            .call(|conn| {
+                conn.query_row(
+                    "SELECT (SELECT COUNT(*) FROM access_tokens), \
+                            (SELECT COUNT(*) FROM refresh_tokens)",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(access, 1, "the pass must sweep expired access tokens");
+        assert_eq!(refresh, 1, "the pass must sweep expired refresh tokens");
     }
 
     #[tokio::test]
