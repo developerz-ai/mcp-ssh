@@ -6,6 +6,7 @@
 //! would start a reaper and a startup reconcile that flips the live server's
 //! `running` rows to `failed`. Here we only ever touch the database directly.
 use crate::db::{Db, now_unix};
+use crate::jobs::JobStatus;
 
 /// Open the database the running server uses. Idempotent — applies the same schema
 /// and pragmas, safe to run alongside the daemon (SQLite WAL allows it).
@@ -74,8 +75,8 @@ fn render_jobs(rows: &[JobRow]) -> String {
     for r in rows {
         let code = r.code.map(|c| c.to_string()).unwrap_or_else(|| "-".into());
         // For a failure the error is the useful column; otherwise the title.
-        let note = match (r.status.as_str(), r.error.as_deref()) {
-            ("failed", Some(e)) => e,
+        let note = match (r.status.parse::<JobStatus>(), r.error.as_deref()) {
+            (Ok(JobStatus::Failed), Some(e)) => e,
             _ => r.title.as_deref().unwrap_or("-"),
         };
         out.push_str(&format!(
@@ -116,7 +117,7 @@ async fn kill_job(db: &Db, id: &str) -> anyhow::Result<String> {
     let Some((status, pgid)) = row else {
         return Ok(format!("no such job: {id}"));
     };
-    if status != "running" {
+    if status != JobStatus::Running.as_str() {
         return Ok(format!("job {id} is not running (status: {status})"));
     }
     let Some(pgid) = pgid else {

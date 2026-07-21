@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime};
 
 use tokio::sync::{Mutex, watch};
 
-use super::{Job, JobId, JobState, ProcessGroupId};
+use super::{Job, JobId, JobState, JobStatus, ProcessGroupId};
 use crate::db::{Db, now_unix};
 
 /// Jobs (and their logs) older than this are reaped hourly. Seconds, to compare
@@ -211,7 +211,7 @@ pub(super) async fn compact_once(
         let jid = JobId::from(id.clone());
         let running = match jobs.lock().await.get(&jid) {
             Some(job) => matches!(*job.state.lock().await, JobState::Running),
-            None => status == "running",
+            None => status == JobStatus::Running.as_str(),
         };
         if running || group_still_writing(pgid).await {
             continue;

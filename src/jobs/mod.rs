@@ -16,12 +16,14 @@ use tokio::sync::{Mutex, watch};
 mod id;
 mod log;
 mod reaper;
+mod status;
 
 pub use id::JobId;
 use log::{DEFAULT_PAGE, read_page, read_page_tail};
 pub use log::{JobLogError, Page, paginate};
 pub(crate) use reaper::kill_group;
 use reaper::{group_alive, kill_job, spawn_reaper};
+pub use status::JobStatus;
 
 /// Lines of a finished job's output snapshotted into the DB. Bounds the row so the
 /// tail survives the live log being trimmed/reaped without bloating SQLite.
@@ -38,22 +40,23 @@ pub enum JobState {
 /// Map a `JobState` onto the DB row's `(status, code, error)` columns.
 fn state_columns(state: &JobState) -> (&'static str, Option<i32>, Option<String>) {
     match state {
-        JobState::Running => ("running", None, None),
-        JobState::Exited { code } => ("exited", Some(*code), None),
-        JobState::Failed { error } => ("failed", None, Some(error.clone())),
+        JobState::Running => (JobStatus::Running.as_str(), None, None),
+        JobState::Exited { code } => (JobStatus::Exited.as_str(), Some(*code), None),
+        JobState::Failed { error } => (JobStatus::Failed.as_str(), None, Some(error.clone())),
     }
 }
 
 /// Rebuild a `JobState` from a DB row's columns. An unrecognized status (a corrupt
 /// row) reads as `Failed` so the anomaly surfaces rather than masquerading as a
-/// live or cleanly-exited job.
+/// live or cleanly-exited job — `JobStatus::from_str` itself never silently
+/// coerces; the coercion to `Failed` happens explicitly, here.
 fn state_from_columns(status: &str, code: Option<i32>, error: Option<String>) -> JobState {
-    match status {
-        "running" => JobState::Running,
-        "exited" => JobState::Exited {
+    match status.parse::<JobStatus>() {
+        Ok(JobStatus::Running) => JobState::Running,
+        Ok(JobStatus::Exited) => JobState::Exited {
             code: code.unwrap_or(-1),
         },
-        _ => JobState::Failed {
+        Ok(JobStatus::Failed) | Err(_) => JobState::Failed {
             error: error.unwrap_or_else(|| status.to_string()),
         },
     }
@@ -682,7 +685,7 @@ impl JobStore {
                 return false;
             }
         };
-        if status != "running" {
+        if status != JobStatus::Running.as_str() {
             return false;
         }
         // Only a pgid a real job could have written is signalable — see
