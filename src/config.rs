@@ -404,6 +404,64 @@ mod tests {
         );
     }
 
+    #[test]
+    fn db_path_matches_server_config_across_sources() {
+        // The admin CLI (`mcp-ssh jobs`/`job kill`/`sessions`) resolves the DB path via
+        // `db_path_in`, independently of `Config::from_env` (used by `serve`). If the two
+        // ever diverge, admin inspects (or kills jobs in!) a different database than the
+        // running server — silently, with no error. Pin them to agree across every source:
+        // env override, config-file value, and the bare default.
+        let dir = tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+
+        // 1. Env-set: MCP_SSH_DB wins over everything.
+        let env = MapEnv::new(&[
+            ("MCP_SSH_CONFIG", cfg_path.to_str().unwrap()),
+            ("MCP_SSH_DB", "/tmp/env-set.db"),
+            ("MCP_SSH_USER", "test"),
+            ("MCP_SSH_PASS", "test"),
+        ]);
+        let admin_path = db_path_in(&env).expect("admin resolve");
+        let server_path = Config::from_env(&env).expect("server load").db_path;
+        assert_eq!(admin_path, PathBuf::from("/tmp/env-set.db"));
+        assert_eq!(
+            admin_path, server_path,
+            "env-set path must match server config"
+        );
+
+        // 2. Config-file value: no env override, db_path comes from the TOML file.
+        let file_cfg = FileConfig {
+            user: Some("test".into()),
+            pass: Some("test".into()),
+            db_path: Some("/tmp/file-set.db".into()),
+            ..Default::default()
+        };
+        std::fs::write(&cfg_path, toml::to_string_pretty(&file_cfg).unwrap()).unwrap();
+        let env = MapEnv::new(&[("MCP_SSH_CONFIG", cfg_path.to_str().unwrap())]);
+        let admin_path = db_path_in(&env).expect("admin resolve");
+        let server_path = Config::from_env(&env).expect("server load").db_path;
+        assert_eq!(admin_path, PathBuf::from("/tmp/file-set.db"));
+        assert_eq!(
+            admin_path, server_path,
+            "file-set path must match server config"
+        );
+
+        // 3. Default: neither env nor file sets a db_path.
+        let absent = dir.path().join("absent.toml");
+        let env = MapEnv::new(&[
+            ("MCP_SSH_CONFIG", absent.to_str().unwrap()),
+            ("MCP_SSH_USER", "test"),
+            ("MCP_SSH_PASS", "test"),
+        ]);
+        let admin_path = db_path_in(&env).expect("admin resolve");
+        let server_path = Config::from_env(&env).expect("server load").db_path;
+        assert_eq!(admin_path, PathBuf::from("/var/lib/mcp-ssh/mcp-ssh.db"));
+        assert_eq!(
+            admin_path, server_path,
+            "default path must match server config"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn set_auth_tightens_a_preexisting_loose_config_file() {
