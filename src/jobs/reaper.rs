@@ -89,8 +89,9 @@ pub(crate) async fn kill_group(pgid: u32) -> bool {
 
 /// True if process group `pgid` still has at least one member. `kill -0` delivers
 /// no signal, only checks deliverability; stdio is discarded so a "No such
-/// process" line never reaches the terminal.
-async fn group_alive(pgid: u32) -> bool {
+/// process" line never reaches the terminal. Shared with the startup reconcile in
+/// `super`, which needs the same "did this group outlive the restart?" answer.
+pub(super) async fn group_alive(pgid: u32) -> bool {
     tokio::process::Command::new("kill")
         .arg("-0")
         .arg("--")

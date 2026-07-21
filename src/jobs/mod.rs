@@ -20,7 +20,7 @@ pub use id::JobId;
 use log::{DEFAULT_PAGE, read_page, read_page_tail};
 pub use log::{JobLogError, Page, paginate};
 pub(crate) use reaper::kill_group;
-use reaper::{kill_job, spawn_reaper};
+use reaper::{group_alive, kill_job, spawn_reaper};
 
 /// Lines of a finished job's output snapshotted into the DB. Bounds the row so the
 /// tail survives the live log being trimmed/reaped without bloating SQLite.
@@ -180,6 +180,101 @@ fn sh_single_quote(path: &std::path::Path) -> String {
     format!("'{escaped}'")
 }
 
+/// Reconcile rows left `running` by a previous process, run once at startup.
+/// Most such jobs died with that process — but each leads its own process group
+/// (see `run`), so outside a systemd `KillMode=control-group` shutdown a group can
+/// reparent to init and keep running. So a row is flipped to `failed` only once
+/// its persisted group is really gone; a survivor stays `running`, truthfully.
+/// (Under `KillMode=control-group` the groups *are* killed on stop, so that path
+/// still probes dead and reconciles to `failed` exactly as before.)
+///
+/// Liveness is `kill -0` on the persisted pgid, which the OS could in principle
+/// have recycled onto an unrelated process. Negligible here: recycling has to wrap
+/// the whole pid space, and rows live at most 24h (the reaper's retention), so the
+/// worst case is one stale row reading `running` until it's reaped. A row with no
+/// pgid (the OS withheld the pid, or a row predating the column) can't be probed
+/// and is treated as dead, as before.
+///
+/// Scoped to `started_unix <= boot` minus the ids live in this process: `<` alone
+/// missed a dead job from a crash loop restarting within the same wall-clock second
+/// (it stayed `running` for up to 24h). The jobs lock is held across the candidate
+/// query, and `run` inserts into the map (under that lock) before writing its row —
+/// so any row this process creates either has its id in the snapshot or appears only
+/// after the query ran. Probing then happens off the lock (it spawns a process per
+/// candidate) and the update names those candidate ids explicitly, so a job started
+/// meanwhile is never touched.
+async fn reconcile_stale_running(
+    db: &crate::db::Db,
+    jobs: &Mutex<HashMap<JobId, Arc<Job>>>,
+    boot: i64,
+) {
+    let candidates = {
+        let live = jobs.lock().await;
+        let live_ids: Vec<String> = live.keys().map(|id| id.as_ref().to_string()).collect();
+        db.call(move |conn| {
+            // `NOT IN ()` is a syntax error, and at boot the map is always empty —
+            // only add the clause when there are ids.
+            let exclude = if live_ids.is_empty() {
+                String::new()
+            } else {
+                let placeholders = vec!["?"; live_ids.len()].join(",");
+                format!(" AND id NOT IN ({placeholders})")
+            };
+            let sql = format!(
+                "SELECT id, pgid FROM jobs \
+                 WHERE status = 'running' AND started_unix <= ?{exclude}"
+            );
+            let params = std::iter::once(rusqlite::types::Value::from(boot))
+                .chain(live_ids.into_iter().map(rusqlite::types::Value::from));
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(params), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .await
+    };
+    let candidates = match candidates {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(%error, "startup job reconcile: querying stale rows failed");
+            return;
+        }
+    };
+
+    let mut dead: Vec<String> = Vec::new();
+    for (id, pgid) in candidates {
+        match pgid.and_then(|p| u32::try_from(p).ok()) {
+            Some(pgid) if group_alive(pgid).await => {
+                tracing::info!(id = %id, pgid, "job outlived the previous process — still running");
+            }
+            _ => dead.push(id),
+        }
+    }
+    if dead.is_empty() {
+        return;
+    }
+    // One statement per id (like `reap_once`), so a long backlog can't run into
+    // SQLite's bound-parameter cap. `status = 'running'` again: a candidate another
+    // writer (the `job kill` CLI) finished since the query must keep its own final
+    // state, not be overwritten.
+    if let Err(error) = db
+        .call(move |conn| {
+            for id in &dead {
+                conn.execute(
+                    "UPDATE jobs SET status = 'failed', error = 'server restarted' \
+                     WHERE status = 'running' AND id = ?1",
+                    [id.as_str()],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+    {
+        tracing::warn!(%error, "startup job reconcile failed");
+    }
+}
+
 #[derive(Clone)]
 pub struct JobStore {
     dir: PathBuf,
@@ -204,46 +299,13 @@ impl JobStore {
         std::fs::create_dir_all(&dir)?;
         let jobs: Arc<Mutex<HashMap<JobId, Arc<Job>>>> = Arc::new(Mutex::new(HashMap::new()));
 
-        // Startup reconcile: a row left `running` by a previous process can't still
-        // be running — that process (and its children) died with it. Flip those to
-        // `failed` so history is truthful. Scoped to `started_unix <= boot` minus
-        // the ids live in this process: `<` alone missed a dead job from a crash
-        // loop restarting within the same wall-clock second (it stayed `running`
-        // for up to 24h). The jobs lock is held across the update, and `run`
-        // inserts into the map (under that lock) before writing its row — so any
-        // row this process creates either has its id in the snapshot or appears
-        // only after the update ran. `new` is sync, so the reconcile is spawned.
+        // Startup reconcile: rows left `running` by a previous process. `new` is
+        // sync, so it's spawned; `boot` tells that process's rows from this one's.
         let boot = crate::db::now_unix();
         {
             let db = db.clone();
             let jobs = jobs.clone();
-            tokio::spawn(async move {
-                let live = jobs.lock().await;
-                let live_ids: Vec<String> = live.keys().map(|id| id.as_ref().to_string()).collect();
-                let result = db
-                    .call(move |conn| {
-                        // `NOT IN ()` is a syntax error, and at boot the map is
-                        // always empty — only add the clause when there are ids.
-                        let exclude = if live_ids.is_empty() {
-                            String::new()
-                        } else {
-                            let placeholders = vec!["?"; live_ids.len()].join(",");
-                            format!(" AND id NOT IN ({placeholders})")
-                        };
-                        let sql = format!(
-                            "UPDATE jobs SET status = 'failed', error = 'server restarted' \
-                             WHERE status = 'running' AND started_unix <= ?{exclude}"
-                        );
-                        let params = std::iter::once(rusqlite::types::Value::from(boot))
-                            .chain(live_ids.into_iter().map(rusqlite::types::Value::from));
-                        conn.execute(&sql, rusqlite::params_from_iter(params))
-                    })
-                    .await;
-                drop(live);
-                if let Err(error) = result {
-                    tracing::warn!(%error, "startup job reconcile failed");
-                }
-            });
+            tokio::spawn(async move { reconcile_stale_running(&db, &jobs, boot).await });
         }
 
         spawn_reaper(jobs.clone(), db.clone(), dir.clone());
@@ -601,6 +663,19 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         panic!("job row never reached a finished state");
+    }
+
+    /// A job row's `status` column, or `None` when there's no such row.
+    async fn row_status(db: &Db, id: &str) -> Option<String> {
+        let id = id.to_string();
+        db.call(move |conn| {
+            conn.query_row("SELECT status FROM jobs WHERE id = ?1", [id], |r| {
+                r.get::<_, String>(0)
+            })
+            .optional()
+        })
+        .await
+        .unwrap()
     }
 
     /// The production shell (interactive bash) must expand aliases defined in
@@ -1164,6 +1239,57 @@ mod tests {
             "a same-second stale running row must reconcile to failed"
         );
         drop(store);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_reconcile_keeps_a_surviving_group_running() {
+        use std::process::Stdio;
+        let dir = tempfile::tempdir().unwrap().keep();
+        let db = Db::memory();
+        // A job whose group outlived the previous process: leader of its own group
+        // (pgid == pid), exactly like a real job's shell.
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 300")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = i64::from(child.id().expect("child pid"));
+        let started = crate::db::now_unix() - 3600;
+        db.call(move |conn| {
+            conn.execute(
+                "INSERT INTO jobs (id, status, started_unix, pgid) VALUES ('survivor', 'running', ?1, ?2)",
+                rusqlite::params![started, pgid],
+            )?;
+            // A second stale row whose pgid is long gone. It must flip — and since
+            // every dead candidate is written in one pass after all the probing,
+            // its flip is the signal that the survivor was probed too.
+            conn.execute(
+                "INSERT INTO jobs (id, status, started_unix, pgid) VALUES ('ghost', 'running', ?1, 2000000000)",
+                [started],
+            )
+        })
+        .await
+        .unwrap();
+
+        let store = JobStore::new(dir, Duration::from_secs(5), Shell::sh(), db.clone()).unwrap();
+        let (status, _code, _tail) = await_row(&db, &JobId::from("ghost")).await;
+        assert_eq!(
+            status, "failed",
+            "a dead group's row must reconcile to failed"
+        );
+        assert_eq!(
+            row_status(&db, "survivor").await.as_deref(),
+            Some("running"),
+            "a job whose process group survived the restart must stay running"
+        );
+
+        let _ = child.kill().await; // signal + reap the sleeper
+        drop(store); // keep the store (its reaper task) alive across the wait
     }
 
     #[tokio::test]
