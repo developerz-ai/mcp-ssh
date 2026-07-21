@@ -180,7 +180,8 @@ fn redirect_error(redirect_uri: &str, error: &str, state: Option<&str>) -> Respo
 /// anything it can't confidently classify as loopback is rejected.
 fn is_allowed_redirect(uri: &str) -> bool {
     if let Some(rest) = uri.strip_prefix("https://") {
-        return !rest.is_empty();
+        let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+        return !host.trim().is_empty();
     }
     if let Some(rest) = uri.strip_prefix("http://") {
         // Host is everything before the first `/`, `?`, `#`, then strip an optional
@@ -519,5 +520,10 @@ mod tests {
         assert!(!is_allowed_redirect("ftp://localhost/cb"));
         assert!(!is_allowed_redirect("not a url"));
         assert!(!is_allowed_redirect("https://"));
+        // empty/whitespace host after the scheme is still no host → rejected.
+        assert!(!is_allowed_redirect("https://?evil"));
+        assert!(!is_allowed_redirect("https:// /cb"));
+        // valid https URL with query/fragment still accepted.
+        assert!(is_allowed_redirect("https://example.com?next=/x"));
     }
 }
