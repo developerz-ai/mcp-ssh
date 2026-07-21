@@ -158,3 +158,7 @@ Non-negotiable: SOLID, SRP, tested code. The bar: idiomatic, boring, readable Ru
 - One host, one service user. Targets the box it runs on; not a fan-out / multi-host tool.
 - TLS, multi-host routing, and rate limiting live in the reverse proxy, not here.
 - NOT building: an SSH client, a fleet orchestrator, a job scheduler, a secrets vault.
+
+## Note
+
+Do not use git worktrees — work directly in this checkout. If a task is big enough to need subagents, run them as a team in this same checkout: split the work into disjoint pieces so no two agents touch the same files.
