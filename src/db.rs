@@ -22,6 +22,15 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
     token        TEXT PRIMARY KEY,
     expires_unix INTEGER NOT NULL
 );
+-- One row per (registered client, callback URI it may receive auth codes at).
+-- Holds no secret: a `client_id` is public per OAuth 2.1 (clients here are public
+-- + PKCE, so there is no client secret), and a redirect URI is the client's own
+-- published callback.
+CREATE TABLE IF NOT EXISTS clients (
+    client_id    TEXT NOT NULL,
+    redirect_uri TEXT NOT NULL,
+    PRIMARY KEY (client_id, redirect_uri)
+);
 CREATE TABLE IF NOT EXISTS jobs (
     id           TEXT PRIMARY KEY,
     title        TEXT,

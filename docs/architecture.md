@@ -116,6 +116,11 @@ discovery metadata (`/.well-known/oauth-authorization-server`), dynamic client r
 `/token`. All MCP clients — Claude, Cursor, or any spec-compliant GUI — drive this flow
 automatically; the user logs in once with the username/password set via `mcp-ssh set-auth`.
 
+Registration is not a formality: `/register` persists the `client_id` → `redirect_uri` binding,
+and `/authorize` issues a code only to a URI that exact `client_id` registered. A victim lured to
+an `/authorize` link carrying someone else's `redirect_uri` therefore gets a `400`, not a code —
+so a valid Basic login can't be turned into an auth code for an attacker's callback.
+
 Credentials are a single username/password, set once with `mcp-ssh set-auth <user>` and read
 from config/env at boot. Missing credentials = the server refuses to start.
 
