@@ -10,7 +10,6 @@ use std::{
     time::Duration,
 };
 
-use rusqlite::OptionalExtension;
 use tokio::sync::{Mutex, watch};
 
 mod id;
@@ -18,6 +17,7 @@ mod log;
 mod reaper;
 mod signal;
 mod status;
+mod store;
 
 pub use id::JobId;
 use log::{DEFAULT_PAGE, read_page, read_page_tail};
@@ -26,10 +26,7 @@ use reaper::spawn_reaper;
 pub(crate) use signal::kill_group;
 use signal::{group_alive, kill_job};
 pub use status::JobStatus;
-
-/// Lines of a finished job's output snapshotted into the DB. Bounds the row so the
-/// tail survives the live log being trimmed/reaped without bloating SQLite.
-const TAIL_LINES: usize = 500;
+pub(crate) use store::{JobRepo, JobRow};
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -37,67 +34,6 @@ pub enum JobState {
     Running,
     Exited { code: i32 },
     Failed { error: String },
-}
-
-/// Map a `JobState` onto the DB row's `(status, code, error)` columns.
-fn state_columns(state: &JobState) -> (&'static str, Option<i32>, Option<String>) {
-    match state {
-        JobState::Running => (JobStatus::Running.as_str(), None, None),
-        JobState::Exited { code } => (JobStatus::Exited.as_str(), Some(*code), None),
-        JobState::Failed { error } => (JobStatus::Failed.as_str(), None, Some(error.clone())),
-    }
-}
-
-/// Rebuild a `JobState` from a DB row's columns. An unrecognized status (a corrupt
-/// row) reads as `Failed` so the anomaly surfaces rather than masquerading as a
-/// live or cleanly-exited job — `JobStatus::from_str` itself never silently
-/// coerces; the coercion to `Failed` happens explicitly, here.
-fn state_from_columns(status: &str, code: Option<i32>, error: Option<String>) -> JobState {
-    match status.parse::<JobStatus>() {
-        Ok(JobStatus::Running) => JobState::Running,
-        Ok(JobStatus::Exited) => JobState::Exited {
-            code: code.unwrap_or(-1),
-        },
-        Ok(JobStatus::Failed) | Err(_) => JobState::Failed {
-            error: error.unwrap_or_else(|| status.to_string()),
-        },
-    }
-}
-
-/// Record a finished job's final state and a bounded output tail into the DB, so
-/// `list`/`poll` reflect it across a restart and the tail outlives the live log
-/// being trimmed or reaped. Best effort: failures are logged, never propagated —
-/// the live log file remains the source of truth while it exists.
-async fn persist_final(
-    db: &crate::db::Db,
-    id: &JobId,
-    log_path: &std::path::Path,
-    state: &JobState,
-) {
-    let (status, code, error) = state_columns(state);
-    // A tail we can't read just stays empty; the row still records the status.
-    let tail = log::tail(log_path, TAIL_LINES).await.unwrap_or_default();
-    let row_id = id.as_ref().to_string();
-    if let Err(e) = db
-        .call(move |conn| {
-            conn.execute(
-                "UPDATE jobs SET status = ?1, code = ?2, error = ?3, output_tail = ?4 \
-                 WHERE id = ?5",
-                rusqlite::params![status, code, error, tail, row_id],
-            )
-        })
-        .await
-    {
-        tracing::warn!(error = %e, id = %id, "failed to persist final job state");
-    }
-}
-
-/// Render a saved output tail (already bounded at write time) the same newest-first
-/// way the live log is polled, so a finished job whose log was reaped paginates
-/// consistently — cursor 0 is the newest saved lines, paging back through the tail.
-fn page_from_tail(tail: &str, cursor: usize, limit: usize) -> Page {
-    let lines: Vec<&str> = tail.lines().collect();
-    log::paginate_tail(&lines, cursor, limit)
 }
 
 /// Process group id to signal on kill. Wrapping the raw pid keeps this
@@ -233,35 +169,14 @@ fn sh_single_quote(path: &std::path::Path) -> String {
 /// candidate) and the update names those candidate ids explicitly, so a job started
 /// meanwhile is never touched.
 async fn reconcile_stale_running(
-    db: &crate::db::Db,
+    repo: &JobRepo,
     jobs: &Mutex<HashMap<JobId, Arc<Job>>>,
     boot: i64,
 ) {
     let candidates = {
         let live = jobs.lock().await;
         let live_ids: Vec<String> = live.keys().map(|id| id.as_ref().to_string()).collect();
-        db.call(move |conn| {
-            // `NOT IN ()` is a syntax error, and at boot the map is always empty —
-            // only add the clause when there are ids.
-            let exclude = if live_ids.is_empty() {
-                String::new()
-            } else {
-                let placeholders = vec!["?"; live_ids.len()].join(",");
-                format!(" AND id NOT IN ({placeholders})")
-            };
-            let sql = format!(
-                "SELECT id, pgid FROM jobs \
-                 WHERE status = 'running' AND started_unix <= ?{exclude}"
-            );
-            let params = std::iter::once(rusqlite::types::Value::from(boot))
-                .chain(live_ids.into_iter().map(rusqlite::types::Value::from));
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(rusqlite::params_from_iter(params), |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?))
-            })?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()
-        })
-        .await
+        repo.stale_running(boot, live_ids).await
     };
     let candidates = match candidates {
         Ok(rows) => rows,
@@ -271,35 +186,22 @@ async fn reconcile_stale_running(
         }
     };
 
-    let mut dead: Vec<String> = Vec::new();
-    for (id, pgid) in candidates {
-        match pgid.and_then(ProcessGroupId::from_persisted) {
+    let mut dead: Vec<JobId> = Vec::new();
+    for candidate in candidates {
+        match candidate.pgid {
             Some(pgid) if group_alive(pgid).await => {
-                tracing::info!(id = %id, pgid = pgid.get(), "job outlived the previous process — still running");
+                tracing::info!(id = %candidate.id, pgid = pgid.get(), "job outlived the previous process — still running");
             }
-            _ => dead.push(id),
+            _ => dead.push(candidate.id),
         }
     }
     if dead.is_empty() {
         return;
     }
-    // One statement per id (like `reap_once`), so a long backlog can't run into
-    // SQLite's bound-parameter cap. `status = 'running'` again: a candidate another
-    // writer (the `job kill` CLI) finished since the query must keep its own final
-    // state, not be overwritten.
-    if let Err(error) = db
-        .call(move |conn| {
-            for id in &dead {
-                conn.execute(
-                    "UPDATE jobs SET status = 'failed', error = 'server restarted' \
-                     WHERE status = 'running' AND id = ?1",
-                    [id.as_str()],
-                )?;
-            }
-            Ok(())
-        })
-        .await
-    {
+    // Only rows still `running` are flipped (see `JobRepo::mark_restart_failed`): a
+    // candidate another writer (the `job kill` CLI) finished since the query must
+    // keep its own final state, not be overwritten.
+    if let Err(error) = repo.mark_restart_failed(dead).await {
         tracing::warn!(%error, "startup job reconcile failed");
     }
 }
@@ -315,7 +217,7 @@ pub struct JobStore {
     jobs: Arc<Mutex<HashMap<JobId, Arc<Job>>>>,
     /// Durable metadata + saved output tails, so `list`/`poll` show history across
     /// restarts. Live output still streams to the per-job log files.
-    db: crate::db::Db,
+    repo: JobRepo,
 }
 
 impl JobStore {
@@ -327,24 +229,25 @@ impl JobStore {
     ) -> std::io::Result<Self> {
         std::fs::create_dir_all(&dir)?;
         let jobs: Arc<Mutex<HashMap<JobId, Arc<Job>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let repo = JobRepo::new(db);
 
         // Startup reconcile: rows left `running` by a previous process. `new` is
         // sync, so it's spawned; `boot` tells that process's rows from this one's.
         let boot = crate::db::now_unix();
         {
-            let db = db.clone();
+            let repo = repo.clone();
             let jobs = jobs.clone();
-            tokio::spawn(async move { reconcile_stale_running(&db, &jobs, boot).await });
+            tokio::spawn(async move { reconcile_stale_running(&repo, &jobs, boot).await });
         }
 
-        spawn_reaper(jobs.clone(), db.clone(), dir.clone());
+        spawn_reaper(jobs.clone(), repo.clone(), dir.clone());
         Ok(Self {
             dir,
             inline_timeout,
             interactive_shell,
             seq: Arc::new(AtomicU64::new(1)),
             jobs,
-            db,
+            repo,
         })
     }
 
@@ -418,24 +321,8 @@ impl JobStore {
         // starts `running`; the waiter records the final state + a bounded output
         // tail on exit.
         let started = crate::db::now_unix();
-        {
-            let db = self.db.clone();
-            let row_id = id.as_ref().to_string();
-            // Persist the pgid so `mcp-ssh job kill` can signal the group even when
-            // this process no longer tracks the job (e.g. after a restart).
-            let pgid_val = pgid.map(|p| i64::from(p.get()));
-            if let Err(error) = db
-                .call(move |conn| {
-                    conn.execute(
-                        "INSERT INTO jobs (id, title, status, code, error, started_unix, output_tail, pgid) \
-                         VALUES (?1, ?2, 'running', NULL, NULL, ?3, NULL, ?4)",
-                        rusqlite::params![row_id, title, started, pgid_val],
-                    )
-                })
-                .await
-            {
-                tracing::warn!(%error, id = %id, "failed to persist job row");
-            }
+        if let Err(error) = self.repo.insert_running(&id, title, started, pgid).await {
+            tracing::warn!(%error, id = %id, "failed to persist job row");
         }
 
         // Waiter owns the child so it can reap it; updates shared state on exit,
@@ -443,7 +330,7 @@ impl JobStore {
         // row exists before this UPDATE runs (a fast command can exit immediately).
         {
             let state = state.clone();
-            let db = self.db.clone();
+            let repo = self.repo.clone();
             let log_path = log_path.clone();
             let id = id.clone();
             tokio::spawn(async move {
@@ -460,7 +347,7 @@ impl JobStore {
                 // DB must never delay the inline window (which would misreport a
                 // fast command as backgrounded).
                 let _ = tx.send(true);
-                persist_final(&db, &id, &log_path, &result).await;
+                repo.finish(&id, &log_path, &result).await;
             });
         }
 
@@ -572,26 +459,7 @@ impl JobStore {
         cursor: usize,
         limit: Option<usize>,
     ) -> Result<Option<(JobState, Page)>, JobLogError> {
-        let row_id = id.as_ref().to_string();
-        let row = self
-            .db
-            .call(move |conn| {
-                conn.query_row(
-                    "SELECT status, code, error, output_tail FROM jobs WHERE id = ?1",
-                    [row_id],
-                    |r| {
-                        Ok((
-                            r.get::<_, String>(0)?,
-                            r.get::<_, Option<i64>>(1)?,
-                            r.get::<_, Option<String>>(2)?,
-                            r.get::<_, Option<String>>(3)?,
-                        ))
-                    },
-                )
-                .optional()
-            })
-            .await;
-        let (status, code, error, tail) = match row {
+        let row = match self.repo.find(id).await {
             Ok(Some(row)) => row,
             Ok(None) => return Ok(None),
             Err(e) => {
@@ -599,46 +467,23 @@ impl JobStore {
                 return Ok(None);
             }
         };
-        let state = state_from_columns(&status, code.map(|c| c as i32), error);
         let log_path = self.dir.join(format!("{id}.log"));
         let limit = limit.unwrap_or(DEFAULT_PAGE);
         let page = match read_page_tail(&log_path, cursor, limit).await {
             Ok(page) => page,
             Err(JobLogError::Read(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                page_from_tail(tail.as_deref().unwrap_or(""), cursor, limit)
+                store::page_from_tail(&row.tail, cursor, limit)
             }
             Err(error) => return Err(error),
         };
-        Ok(Some((state, page)))
+        Ok(Some((row.state, page)))
     }
 
     pub async fn list(&self) -> Vec<JobSummary> {
         // History lives in the DB, so `list` reflects finished jobs and jobs from a
         // previous process — not just what this process currently tracks.
-        let rows = self
-            .db
-            .call(|conn| {
-                let mut stmt =
-                    conn.prepare("SELECT id, status, code, error FROM jobs ORDER BY id")?;
-                let rows = stmt.query_map([], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, Option<i64>>(2)?,
-                        r.get::<_, Option<String>>(3)?,
-                    ))
-                })?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()
-            })
-            .await;
-        match rows {
-            Ok(rows) => rows
-                .into_iter()
-                .map(|(id, status, code, error)| JobSummary {
-                    id: JobId::from(id),
-                    state: state_from_columns(&status, code.map(|c| c as i32), error),
-                })
-                .collect(),
+        match self.repo.summaries().await {
+            Ok(summaries) => summaries,
             Err(error) => {
                 tracing::warn!(%error, "failed to list jobs");
                 Vec::new()
@@ -667,34 +512,22 @@ impl JobStore {
     /// for an unknown id, a job that already finished, a row with no usable pgid,
     /// or a group that survived `TERM`→`KILL`.
     async fn kill_persisted(&self, id: &JobId) -> bool {
-        let row_id = id.as_ref().to_string();
-        let row = self
-            .db
-            .call(move |conn| {
-                conn.query_row(
-                    "SELECT status, pgid FROM jobs WHERE id = ?1",
-                    [row_id],
-                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?)),
-                )
-                .optional()
-            })
-            .await;
-        let (status, pgid) = match row {
-            Ok(Some(row)) => row,
+        let target = match self.repo.kill_target(id).await {
+            Ok(Some(target)) => target,
             Ok(None) => return false,
             Err(error) => {
                 tracing::warn!(%error, id = %id, "failed to read job row for kill");
                 return false;
             }
         };
-        if status != JobStatus::Running.as_str() {
+        if target.status != JobStatus::Running.as_str() {
             return false;
         }
         // Only a pgid a real job could have written is signalable — see
         // `ProcessGroupId::from_persisted`. A corrupt row (out of `u32`, or the
         // server's own group as `0`) is refused, not signalled.
-        let Some(group) = pgid.and_then(ProcessGroupId::from_persisted) else {
-            tracing::warn!(id = %id, ?pgid, "job has no usable process group — cannot kill");
+        let Some(group) = target.pgid.and_then(ProcessGroupId::from_persisted) else {
+            tracing::warn!(id = %id, pgid = ?target.pgid, "job has no usable process group — cannot kill");
             return false;
         };
         if !kill_group(group).await {
@@ -702,21 +535,10 @@ impl JobStore {
             // record a kill that didn't happen.
             return false;
         }
-        // `status = 'running'` guard: another writer (the `mcp-ssh job kill` CLI, or
-        // the server that owns the job) may have recorded the real exit as the group
-        // died — that final state wins over ours.
-        let row_id = id.as_ref().to_string();
-        if let Err(error) = self
-            .db
-            .call(move |conn| {
-                conn.execute(
-                    "UPDATE jobs SET status = 'failed', error = 'killed' \
-                     WHERE id = ?1 AND status = 'running'",
-                    [row_id],
-                )
-            })
-            .await
-        {
+        // Recorded only while the row still reads `running`: another writer (the
+        // `mcp-ssh job kill` CLI, or the server that owns the job) may have written
+        // the real exit as the group died — that final state wins over ours.
+        if let Err(error) = self.repo.mark_killed(id, "killed").await {
             tracing::warn!(%error, id = %id, "failed to record killed job");
         }
         true
@@ -1127,7 +949,8 @@ mod tests {
         // the startup reconcile leaves the row alone — this is about `kill`.
         let started = crate::db::now_unix() + 3600;
         store
-            .db
+            .repo
+            .db()
             .call(move |conn| {
                 conn.execute(
                     "INSERT INTO jobs (id, status, started_unix) VALUES ('legacy', 'running', ?1)",
@@ -1139,7 +962,7 @@ mod tests {
 
         assert!(!store.kill(&JobId::from("legacy")).await);
         assert_eq!(
-            row_status(&store.db, "legacy").await.as_deref(),
+            row_status(store.repo.db(), "legacy").await.as_deref(),
             Some("running"),
             "an unsignalable job must not be recorded as killed"
         );
@@ -1158,7 +981,8 @@ mod tests {
         let started = crate::db::now_unix() + 3600;
         for (id, pgid) in [("zero", 0_i64), ("negative", -1)] {
             store
-                .db
+                .repo
+                .db()
                 .call(move |conn| {
                     conn.execute(
                         "INSERT INTO jobs (id, status, started_unix, pgid) VALUES (?1, 'running', ?2, ?3)",
@@ -1173,7 +997,7 @@ mod tests {
                 "pgid {pgid} must be refused, not signalled"
             );
             assert_eq!(
-                row_status(&store.db, id).await.as_deref(),
+                row_status(store.repo.db(), id).await.as_deref(),
                 Some("running"),
                 "a refused kill must leave the row untouched"
             );
@@ -1264,7 +1088,7 @@ mod tests {
 
         // Negative retention => cutoff is in the future, so the just-started job
         // (its DB row written by `run`) counts as stale this pass.
-        reaper::reap_once(&store.jobs, &store.db, &store.dir, -1).await;
+        reaper::reap_once(&store.jobs, &store.repo, &store.dir, -1).await;
 
         // Evicted from the map and its row deleted (poll can't find it)...
         assert!(
@@ -1300,7 +1124,8 @@ mod tests {
         store.jobs.lock().await.insert(id.clone(), job);
         // A matching running row so the DB-driven reaper actually considers it.
         store
-            .db
+            .repo
+            .db()
             .call(|conn| {
                 conn.execute(
                     "INSERT INTO jobs (id, status, started_unix) VALUES ('jfake', 'running', ?1)",
@@ -1311,7 +1136,7 @@ mod tests {
             .unwrap();
 
         // The job is stale (negative retention); kill fails => must not be evicted.
-        reaper::reap_once(&store.jobs, &store.db, &store.dir, -1).await;
+        reaper::reap_once(&store.jobs, &store.repo, &store.dir, -1).await;
 
         assert!(
             store.poll(&id, 0, None).await.unwrap().is_some(),

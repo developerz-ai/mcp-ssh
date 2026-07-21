@@ -6,7 +6,7 @@
 //! would start a reaper and a startup reconcile that flips the live server's
 //! `running` rows to `failed`. Here we only ever touch the database directly.
 use crate::db::{Db, now_unix};
-use crate::jobs::JobStatus;
+use crate::jobs::{JobId, JobRepo, JobRow, JobStatus};
 
 /// Open the database the running server uses. Idempotent — applies the same schema
 /// and pragmas, safe to run alongside the daemon (SQLite WAL allows it).
@@ -14,56 +14,23 @@ fn open_db() -> anyhow::Result<Db> {
     Db::open(&crate::config::db_path()?)
 }
 
-// ---- jobs ----
-
-struct JobRow {
-    id: String,
-    status: String,
-    code: Option<i64>,
-    error: Option<String>,
-    started_unix: i64,
-    title: Option<String>,
+/// The `jobs` table, through the same typed repository the server uses — these
+/// commands never write their own SQL.
+fn open_repo() -> anyhow::Result<JobRepo> {
+    Ok(JobRepo::new(open_db()?))
 }
+
+// ---- jobs ----
 
 /// `mcp-ssh jobs [--all]` — list running jobs (or every job, most-recent first).
 pub async fn jobs(all: bool) -> anyhow::Result<()> {
-    let db = open_db()?;
-    let rows = fetch_jobs(&db, all).await?;
+    let rows = open_repo()?.listing(all).await?;
     if rows.is_empty() {
         println!("{}", if all { "no jobs" } else { "no active jobs" });
     } else {
         print!("{}", render_jobs(&rows));
     }
     Ok(())
-}
-
-async fn fetch_jobs(db: &Db, all: bool) -> anyhow::Result<Vec<JobRow>> {
-    let rows = db
-        .call(move |conn| {
-            // Active-only by default; `--all` includes finished jobs (capped, newest
-            // first, so a long-lived box's history can't flood the terminal).
-            let sql = if all {
-                "SELECT id, status, code, error, started_unix, title \
-                 FROM jobs ORDER BY started_unix DESC LIMIT 200"
-            } else {
-                "SELECT id, status, code, error, started_unix, title \
-                 FROM jobs WHERE status = 'running' ORDER BY started_unix DESC"
-            };
-            let mut stmt = conn.prepare(sql)?;
-            let rows = stmt.query_map([], |r| {
-                Ok(JobRow {
-                    id: r.get(0)?,
-                    status: r.get(1)?,
-                    code: r.get(2)?,
-                    error: r.get(3)?,
-                    started_unix: r.get(4)?,
-                    title: r.get(5)?,
-                })
-            })?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()
-        })
-        .await?;
-    Ok(rows)
 }
 
 fn render_jobs(rows: &[JobRow]) -> String {
@@ -95,32 +62,22 @@ fn render_jobs(rows: &[JobRow]) -> String {
 
 /// `mcp-ssh job kill <id>` — signal a running job's process group dead.
 pub async fn kill(id: &str) -> anyhow::Result<()> {
-    let db = open_db()?;
-    println!("{}", kill_job(&db, id).await?);
+    println!("{}", kill_job(&open_repo()?, id).await?);
     Ok(())
 }
 
-async fn kill_job(db: &Db, id: &str) -> anyhow::Result<String> {
-    let lookup = id.to_string();
-    let row: Option<(String, Option<i64>)> = db
-        .call(move |conn| {
-            use rusqlite::OptionalExtension;
-            conn.query_row(
-                "SELECT status, pgid FROM jobs WHERE id = ?1",
-                [lookup],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?)),
-            )
-            .optional()
-        })
-        .await?;
-
-    let Some((status, pgid)) = row else {
+async fn kill_job(repo: &JobRepo, id: &str) -> anyhow::Result<String> {
+    let job_id = JobId::from(id);
+    let Some(target) = repo.kill_target(&job_id).await? else {
         return Ok(format!("no such job: {id}"));
     };
-    if status != JobStatus::Running.as_str() {
-        return Ok(format!("job {id} is not running (status: {status})"));
+    if target.status != JobStatus::Running.as_str() {
+        return Ok(format!(
+            "job {id} is not running (status: {})",
+            target.status
+        ));
     }
-    let Some(pgid) = pgid else {
+    let Some(pgid) = target.pgid else {
         return Ok(format!(
             "job {id} has no recorded process group (started before pgid tracking) — cannot kill from the CLI"
         ));
@@ -137,15 +94,7 @@ async fn kill_job(db: &Db, id: &str) -> anyhow::Result<String> {
     let killed = crate::jobs::kill_group(group).await;
     // Record the kill only if the row is still `running`: when the server owns the
     // job, its waiter may already have written the real exit as the group died.
-    let lookup = id.to_string();
-    db.call(move |conn| {
-        conn.execute(
-            "UPDATE jobs SET status = 'failed', error = 'killed via mcp-ssh kill' \
-             WHERE id = ?1 AND status = 'running'",
-            [lookup],
-        )
-    })
-    .await?;
+    repo.mark_killed(&job_id, "killed via mcp-ssh kill").await?;
 
     Ok(if killed {
         format!("killed {id}")
@@ -316,32 +265,21 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn fetch_jobs_filters_active_unless_all() {
+    /// A repository over a fresh in-memory DB, plus the raw handle the tests use to
+    /// plant rows the typed API can't produce (legacy or corrupt ones) and to read
+    /// columns back.
+    fn repo() -> (JobRepo, Db) {
         let db = Db::memory();
-        db.call(|conn| {
-            conn.execute_batch(
-                "INSERT INTO jobs (id, status, started_unix) VALUES ('a', 'running', 10);\
-                 INSERT INTO jobs (id, status, code, started_unix) VALUES ('b', 'exited', 0, 20);",
-            )
-        })
-        .await
-        .unwrap();
-
-        let active = fetch_jobs(&db, false).await.unwrap();
-        assert_eq!(active.len(), 1, "only the running job");
-        assert_eq!(active[0].id, "a");
-
-        let all = fetch_jobs(&db, true).await.unwrap();
-        assert_eq!(all.len(), 2, "every job");
-        // Newest first.
-        assert_eq!(all[0].id, "b");
+        (JobRepo::new(db.clone()), db)
     }
 
     #[tokio::test]
     async fn kill_job_reports_unknown_and_finished_without_signalling() {
-        let db = Db::memory();
-        assert_eq!(kill_job(&db, "ghost").await.unwrap(), "no such job: ghost");
+        let (repo, db) = repo();
+        assert_eq!(
+            kill_job(&repo, "ghost").await.unwrap(),
+            "no such job: ghost"
+        );
 
         db.call(|conn| {
             conn.execute(
@@ -352,14 +290,14 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            kill_job(&db, "done").await.unwrap(),
+            kill_job(&repo, "done").await.unwrap(),
             "job done is not running (status: exited)"
         );
     }
 
     #[tokio::test]
     async fn kill_job_without_pgid_cannot_signal() {
-        let db = Db::memory();
+        let (repo, db) = repo();
         // A running row from before pgid tracking (pgid is NULL).
         db.call(|conn| {
             conn.execute(
@@ -369,7 +307,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let msg = kill_job(&db, "legacy").await.unwrap();
+        let msg = kill_job(&repo, "legacy").await.unwrap();
         assert!(
             msg.contains("no recorded process group"),
             "must refuse to guess a pgid: {msg}"
@@ -439,7 +377,7 @@ mod tests {
         let waiter = tokio::spawn(async move { child.wait().await });
         let descendant = read_pid(&pidfile).await;
 
-        let db = Db::memory();
+        let (repo, db) = repo();
         db.call(move |conn| {
             conn.execute(
                 "INSERT INTO jobs (id, status, pgid, started_unix) VALUES ('real', 'running', ?1, 1)",
@@ -449,7 +387,7 @@ mod tests {
         .await
         .unwrap();
 
-        let msg = kill_job(&db, "real").await.unwrap();
+        let msg = kill_job(&repo, "real").await.unwrap();
         assert_eq!(msg, "killed real", "the whole group must be gone");
         let exit = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
             .await
@@ -495,7 +433,7 @@ mod tests {
 
     #[tokio::test]
     async fn kill_job_rejects_a_corrupt_pgid_without_signalling() {
-        let db = Db::memory();
+        let (repo, db) = repo();
         // Neither value can come from a real job's process group: negative is outside
         // u32, and `-0` is *this* process's own group. Both simulate a corrupt row
         // (hand-edited DB, or a future bug writing garbage into the column).
@@ -509,7 +447,7 @@ mod tests {
             .await
             .unwrap();
 
-            let msg = kill_job(&db, id).await.unwrap();
+            let msg = kill_job(&repo, id).await.unwrap();
             assert!(
                 msg.contains("corrupt pgid"),
                 "must refuse to signal pgid {pgid}: {msg}"

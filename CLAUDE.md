@@ -53,9 +53,9 @@ Keep this accurate — it's the navigation aid.
 |---|---|
 | `src/main.rs` | entry: CLI parse, config load, build axum router, serve; dispatches admin subcommands |
 | `src/cli.rs` | clap command definitions (`serve`/`set-auth`/`jobs`/`job kill`/`sessions`) |
-| `src/admin.rs` | local admin subcommands (`jobs`/`job kill`/`sessions`): read/act on the same SQLite directly — never builds a `JobStore` (that would start a reaper + reconcile and fail the live server's running rows). Never prints token values |
+| `src/admin.rs` | local admin subcommands (`jobs`/`job kill`/`sessions`): read/act on the same SQLite through `jobs::JobRepo` — never builds a `JobStore` (that would start a reaper + reconcile and fail the live server's running rows). Never prints token values |
 | `src/config.rs` | env + TOML file config; fails fast if auth creds missing. `db_path()` resolves the DB path alone for the cred-free admin commands |
-| `src/db.rs` | SQLite durable-state layer (`rusqlite`, `bundled`): OAuth `access_tokens`/`refresh_tokens` + registered `clients` (`client_id`→`redirect_uri`, no secrets) + job metadata + output tail. DB at `/var/lib/mcp-ssh/mcp-ssh.db`, WAL, auto-created; one serialized connection driven via `spawn_blocking` |
+| `src/db.rs` | SQLite durable-state layer (`rusqlite`, `bundled`): the schema + forward-only migrations for OAuth `access_tokens`/`refresh_tokens` + registered `clients` (`client_id`→`redirect_uri`, no secrets) + job metadata + output tail; the queries themselves live in the repositories (`src/jobs/store.rs`, `src/oauth/store.rs`). DB at `/var/lib/mcp-ssh/mcp-ssh.db`, WAL, auto-created; one serialized connection driven via `spawn_blocking` |
 | `src/auth.rs` | HTTP Basic auth middleware |
 | `src/oauth/` | minimal OAuth 2.1 server: discovery metadata, dynamic client registration, authorize + token with PKCE, bearer validation; tokens *and* client registrations persisted in SQLite (`src/db.rs`) so logins survive a restart; `/authorize` only issues a code to a `redirect_uri` the named `client_id` registered (exact match, else `invalid_request`); `sweep_expired_access`/`sweep_expired_refresh` bulk-delete dead rows (count only, never a token value) for the reaper to call |
 | `src/jobs/mod.rs` | job engine: run a command, return inline if fast (<2s) else a job id (or immediately when `bg`); live output streams to a per-job log file (polled paginated), metadata + output tail persisted to SQLite so history survives restarts; startup reconcile flips rows left `running` by a previous process to `failed` only once their persisted process group is really dead (a survivor stays `running`) |
@@ -63,6 +63,7 @@ Keep this accurate — it's the navigation aid.
 | `src/jobs/log.rs` | job log pagination: read per-job log files by page (cursor + limit) |
 | `src/jobs/reaper.rs` | reaper (startup + hourly): drops jobs >24h old (DB rows + log files, killing any still-`Running` group first via `src/jobs/signal.rs`), trims finished jobs' logs to a trailing tail (5000 lines <3h old, 500 after), mtime-ages orphaned files from a previous run, sweeps expired OAuth tokens (`src/oauth/store.rs`) on the same pass |
 | `src/jobs/signal.rs` | process-group signalling: `kill_job`/`kill_group` (TERM→KILL escalation) shared by `job(action="kill")`, the `mcp-ssh job kill` CLI, and the reaper; `group_alive` liveness probe the startup reconcile and reaper's log-compaction gate also reuse |
+| `src/jobs/store.rs` | `JobRepo`: the only place `jobs` SQL lives (engine, reaper, and admin CLI call typed methods) + the row⇄`JobState` mapping and the startup-reconcile query; mirrors `oauth::Store`. No `cmd` text reaches a query or a log line |
 | `src/tools/mod.rs` | MCP tool surface (`#[tool_router]`/`#[tool]` from rmcp): 3 tools (`bash`/`job`/`file`) dispatching on `action`. Thin adapters over jobs + files |
 | `src/tools/files.rs` | file operations (`tokio::fs`; `ls`/`find`/`grep` shelled out) |
 | `src/tools/files/shell.rs` | bounded runner behind the shelled-out file ops: streams a child's combined output under a byte cap + wall-clock deadline, killing it on either |
@@ -135,7 +136,8 @@ Non-negotiable: SOLID, SRP, tested code. The bar: idiomatic, boring, readable Ru
 |---|---|
 | Startup, router wiring, CLI | `src/main.rs` |
 | Config / env / required creds | `src/config.rs` |
-| SQLite durable state (tokens, job metadata, output tail) | `src/db.rs` |
+| SQLite connection, schema, migrations | `src/db.rs` |
+| Every `jobs` query (metadata, output tail, reconcile) | `src/jobs/store.rs` |
 | HTTP Basic auth | `src/auth.rs` |
 | OAuth 2.1 (discovery, registration, PKCE, bearer) | `src/oauth/` |
 | Running commands, backgrounding, job logs | `src/jobs/mod.rs` |
