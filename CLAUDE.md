@@ -62,6 +62,7 @@ Keep this accurate — it's the navigation aid.
 | `src/jobs/id.rs` | JobId newtype: human-readable ids — neutral `job` prefix + local `HH-MM-SS` (e.g., `job-23-30-07`); free of command text so secrets can't leak into an id, log line, or filename |
 | `src/jobs/log.rs` | job log pagination: read per-job log files by page (cursor + limit) |
 | `src/jobs/reaper.rs` | reaper (startup + hourly): drops jobs >24h old (DB rows + log files, killing any still-`Running` group first via `src/jobs/signal.rs`), trims finished jobs' logs to a trailing tail (5000 lines <3h old, 500 after), mtime-ages orphaned files from a previous run, sweeps expired OAuth tokens (`src/oauth/store.rs`) on the same pass |
+| `src/jobs/shell.rs` | `Shell`: how a user command is launched — bare `sh -c` (default) vs. interactive `bash -ic` (sources `~/.bashrc` for aliases/version managers) |
 | `src/jobs/signal.rs` | process-group signalling: `kill_job`/`kill_group` (TERM→KILL escalation) shared by `job(action="kill")`, the `mcp-ssh job kill` CLI, and the reaper; `group_alive` liveness probe the startup reconcile and reaper's log-compaction gate also reuse |
 | `src/jobs/store.rs` | `JobRepo`: the only place `jobs` SQL lives (engine, reaper, and admin CLI call typed methods) + the row⇄`JobState` mapping and the startup-reconcile query; mirrors `oauth::Store`. No `cmd` text reaches a query or a log line |
 | `src/tools/mod.rs` | MCP tool surface (`#[tool_router]`/`#[tool]` from rmcp): 3 tools (`bash`/`job`/`file`) dispatching on `action`. Thin adapters over jobs + files |
