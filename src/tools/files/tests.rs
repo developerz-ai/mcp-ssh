@@ -1,5 +1,4 @@
 use super::*;
-use std::time::Duration;
 
 #[tokio::test]
 async fn write_read_paginate_append_move_delete() {
@@ -312,55 +311,6 @@ async fn grep_recursive_finds_match_in_subdirs() {
     );
 }
 
-#[cfg(unix)]
-#[tokio::test]
-async fn shell_output_is_capped_and_infinite_producer_killed() {
-    // `yes` streams "y\n" forever. A correct runner reads to the cap, kills it,
-    // and returns in milliseconds; a runner that buffered the whole stream would
-    // spin on it — so the outer timeout is the proof of streaming, and the bounded
-    // length proves the peak buffer tracks the cap, not the (unbounded) stream.
-    let result = tokio::time::timeout(Duration::from_secs(10), sh("yes", &[]))
-        .await
-        .expect("runner must terminate an infinite producer (streamed cap)")
-        .expect("a capped listing is still Ok");
-    assert!(
-        result.contains("truncated"),
-        "capped output must carry a truncation marker: {:?}",
-        result.get(result.len().saturating_sub(120)..)
-    );
-    assert!(
-        result.len() <= MAX_SHELL_OUTPUT_BYTES + 200,
-        "peak buffer must track the cap, got {} bytes",
-        result.len()
-    );
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn shell_run_times_out_and_reaps_child() {
-    // A command that outlives the deadline must error promptly, not wait out the
-    // full sleep. `run_bounded` SIGKILLs and awaits the child, so it's reaped — no
-    // orphan outlives this call.
-    let start = std::time::Instant::now();
-    let err = run_bounded(
-        "sleep",
-        &["30"],
-        Duration::from_millis(200),
-        MAX_SHELL_OUTPUT_BYTES,
-    )
-    .await
-    .expect_err("a command exceeding the deadline must error");
-    let elapsed = start.elapsed();
-    assert!(
-        matches!(err, ShError::Timeout { .. }),
-        "must surface as a timeout: {err}"
-    );
-    assert!(
-        elapsed < Duration::from_secs(5),
-        "the deadline must fire promptly, not wait out the child: {elapsed:?}"
-    );
-}
-
 #[tokio::test]
 async fn binary_file_reads_as_lossy_utf8_not_error() {
     let dir = tempfile::tempdir().unwrap();
@@ -445,6 +395,33 @@ fn append_capped_marks_an_over_long_line_exactly_once() {
         s.len() <= MAX_READ_LINE_BYTES + LINE_TRUNCATED.len(),
         "the buffer stays bounded by the cap plus the marker"
     );
+}
+
+#[test]
+fn append_capped_seals_when_the_cap_lands_in_a_run_of_continuation_bytes() {
+    // A binary `read` can straddle the cap with a long run of continuation bytes
+    // (0x80). The boundary walk-back is floored at 3, so the kept head can't
+    // collapse: the marker's bytes still push the line past the cap, the seal
+    // latches, and a second marker can never be stamped.
+    let mut bytes = vec![b'a'; MAX_READ_LINE_BYTES - 64];
+    bytes.extend_from_slice(&[0x80u8; 128]);
+
+    let mut line = Vec::new();
+    append_capped(&mut line, &bytes);
+    assert!(
+        line.len() > MAX_READ_LINE_BYTES,
+        "the first overflow must seal the line, got {} bytes",
+        line.len()
+    );
+
+    append_capped(&mut line, b"tail");
+    let s = String::from_utf8_lossy(&line);
+    assert_eq!(
+        s.matches(LINE_TRUNCATED).count(),
+        1,
+        "the marker is stamped exactly once, even on binary input"
+    );
+    assert!(!s.contains("tail"), "bytes past the seal are dropped");
 }
 
 #[test]

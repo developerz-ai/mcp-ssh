@@ -30,6 +30,7 @@ TLS is deliberately **not** in the binary (keeps deps minimal). A reverse proxy 
 | `jobs/reaper.rs` | Reaper (startup + hourly): deletes jobs >24h old (DB rows + log files), trims finished jobs' logs to a tail, mtime-ages orphaned files, marks jobs stuck in `running` across a restart as failed; process-group kill helpers (TERM→KILL escalation). |
 | `tools/mod.rs` | The MCP tool surface — **three tools** (`bash`/`job`/`file`) dispatching on an `action` param; thin adapters over `jobs` and `files`. |
 | `tools/files.rs` | File operations (read/write/append/delete/list/grep/move). |
+| `tools/files/shell.rs` | The bounded runner behind `ls`/`find`/`grep`: streams combined output under a byte cap and a wall-clock deadline, killing the child on either. |
 
 ## 🔌 Request flow
 
