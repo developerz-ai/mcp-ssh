@@ -602,10 +602,76 @@ impl JobStore {
     /// Kill a running job by signalling its whole process group. Returns `false`
     /// when the id is unknown or the job already finished — nothing to signal.
     pub async fn kill(&self, id: &JobId) -> bool {
-        let Some(job) = self.jobs.lock().await.get(id).cloned() else {
+        // Bind to a local so the `jobs` guard is released at this `;` — the
+        // persisted path below re-reads shared state and must not hold it.
+        let tracked = self.jobs.lock().await.get(id).cloned();
+        match tracked {
+            Some(job) => kill_job(&job).await,
+            // Not tracked here. A job whose group outlived the process that
+            // started it (see `reconcile_stale_running`) is still killable
+            // through its persisted pgid, so don't call it unknown.
+            None => self.kill_persisted(id).await,
+        }
+    }
+
+    /// Kill a job this process doesn't track, from its DB row: each job leads its
+    /// own process group, so a group that outlived a restart is still signalable by
+    /// its persisted pgid. Returns whether the group is gone afterwards — `false`
+    /// for an unknown id, a job that already finished, a row with no usable pgid,
+    /// or a group that survived `TERM`→`KILL`.
+    async fn kill_persisted(&self, id: &JobId) -> bool {
+        let row_id = id.as_ref().to_string();
+        let row = self
+            .db
+            .call(move |conn| {
+                conn.query_row(
+                    "SELECT status, pgid FROM jobs WHERE id = ?1",
+                    [row_id],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?)),
+                )
+                .optional()
+            })
+            .await;
+        let (status, pgid) = match row {
+            Ok(Some(row)) => row,
+            Ok(None) => return false,
+            Err(error) => {
+                tracing::warn!(%error, id = %id, "failed to read job row for kill");
+                return false;
+            }
+        };
+        if status != "running" {
+            return false;
+        }
+        // A pgid outside u32 is a corrupt row; a raw `as` cast would wrap it onto a
+        // real (wrong) process group and signal that instead.
+        let Some(group) = pgid.and_then(|p| u32::try_from(p).ok()) else {
+            tracing::warn!(id = %id, ?pgid, "job has no usable process group — cannot kill");
             return false;
         };
-        kill_job(&job).await
+        if !kill_group(group).await {
+            // Still alive after TERM→KILL: leave the row `running` rather than
+            // record a kill that didn't happen.
+            return false;
+        }
+        // `status = 'running'` guard: another writer (the `mcp-ssh job kill` CLI, or
+        // the server that owns the job) may have recorded the real exit as the group
+        // died — that final state wins over ours.
+        let row_id = id.as_ref().to_string();
+        if let Err(error) = self
+            .db
+            .call(move |conn| {
+                conn.execute(
+                    "UPDATE jobs SET status = 'failed', error = 'killed' \
+                     WHERE id = ?1 AND status = 'running'",
+                    [row_id],
+                )
+            })
+            .await
+        {
+            tracing::warn!(%error, id = %id, "failed to record killed job");
+        }
+        true
     }
 }
 
@@ -883,6 +949,89 @@ mod tests {
             !store(Duration::from_secs(5))
                 .kill(&JobId::from("nope"))
                 .await
+        );
+    }
+
+    /// A job whose process group outlived the process that started it is tracked
+    /// only by its DB row — `kill` must still reach it through the persisted pgid
+    /// instead of reporting the id unknown.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_reaches_a_job_that_outlived_a_restart() {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let db = Db::memory();
+        // Leader of its own group (pgid == pid), exactly like a real job's shell.
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 300")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id().expect("child pid");
+        // Reap the signalled child so no zombie lingers to read as alive — mirrors
+        // init reaping a group whose server has exited.
+        let waiter = tokio::spawn(async move { child.wait().await });
+        // The row the startup reconcile leaves behind for a survivor: `running`,
+        // started before this store's boot, carrying the live pgid.
+        let started = crate::db::now_unix() - 3600;
+        db.call(move |conn| {
+            conn.execute(
+                "INSERT INTO jobs (id, status, started_unix, pgid) \
+                 VALUES ('survivor', 'running', ?1, ?2)",
+                rusqlite::params![started, i64::from(pid)],
+            )
+        })
+        .await
+        .unwrap();
+
+        let store = JobStore::new(dir, Duration::from_secs(5), Shell::sh(), db.clone()).unwrap();
+        assert!(
+            store.kill(&JobId::from("survivor")).await,
+            "a job present only in the DB must be killable via its persisted pgid"
+        );
+        // `sleep 300` cannot finish on its own here, so a completed wait proves the
+        // group was actually signalled — not just bookkeeping.
+        let status = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("the signalled group must exit")
+            .unwrap()
+            .unwrap();
+        assert!(!status.success(), "the sleeper died by signal");
+        assert_eq!(
+            row_status(&db, "survivor").await.as_deref(),
+            Some("failed"),
+            "the kill must be recorded, not left reading running"
+        );
+        drop(store); // keep the store (its reaper task) alive across the waits
+    }
+
+    #[tokio::test]
+    async fn kill_of_a_persisted_job_without_a_pgid_changes_nothing() {
+        let store = store(Duration::from_secs(5));
+        // A `running` row with no pgid (the OS withheld the pid, or a row predating
+        // the column): nothing to signal, so the kill must fail honestly rather than
+        // mark the row killed. `started_unix` is past this store's boot second so
+        // the startup reconcile leaves the row alone — this is about `kill`.
+        let started = crate::db::now_unix() + 3600;
+        store
+            .db
+            .call(move |conn| {
+                conn.execute(
+                    "INSERT INTO jobs (id, status, started_unix) VALUES ('legacy', 'running', ?1)",
+                    [started],
+                )
+            })
+            .await
+            .unwrap();
+
+        assert!(!store.kill(&JobId::from("legacy")).await);
+        assert_eq!(
+            row_status(&store.db, "legacy").await.as_deref(),
+            Some("running"),
+            "an unsignalable job must not be recorded as killed"
         );
     }
 
