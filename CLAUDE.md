@@ -65,8 +65,8 @@ Keep this accurate — it's the navigation aid.
 | `src/jobs/shell.rs` | `Shell`: how a user command is launched — bare `sh -c` (default) vs. interactive `bash -ic` (sources `~/.bashrc` for aliases/version managers) |
 | `src/jobs/signal.rs` | process-group signalling **and the one kill semantics**: `kill_job` (live handle) / `kill_persisted` (a row's pgid — running-check, corrupt-pgid gate, `failed` transition, returning a `KillOutcome` the engine and the `mcp-ssh job kill` CLI only render) over `kill_group`'s TERM→KILL escalation; `group_alive` liveness probe the startup reconcile and reaper's log-compaction gate also reuse |
 | `src/jobs/store.rs` | `JobRepo`: the only place `jobs` SQL lives (engine, reaper, and admin CLI call typed methods) + the row⇄`JobState` mapping and the startup-reconcile query; mirrors `oauth::Store`. No `cmd` text reaches a query or a log line |
-| `src/tools/mod.rs` | MCP tool surface (`#[tool_router]`/`#[tool]` from rmcp): 3 tools (`bash`/`job`/`file`) dispatching on `action`. Thin adapters over jobs + files |
-| `src/tools/files.rs` | file operations (`tokio::fs`; `ls`/`find`/`grep` shelled out) |
+| `src/tools/mod.rs` | MCP tool surface (`#[tool_router]`/`#[tool]` from rmcp): 3 tools (`bash`/`job`/`file`) dispatching on `action`. Thin adapters over jobs + files, and **the only place agent-facing wording lives** — `render_file`/`render_file_error` turn `files`' typed outcome/error into the sentence (and the `list`-redirect / no-clobber hints, which name `file`'s own actions) |
+| `src/tools/files.rs` | file operations (`tokio::fs`; `ls`/`find`/`grep` shelled out). Returns facts — `FileOutcome` / typed `FileError` (a failed shell op keeps its `ShError`) — never a rendered sentence |
 | `src/tools/files/shell.rs` | bounded runner behind the shelled-out file ops: streams a child's combined output under a byte cap + wall-clock deadline, killing it on either |
 
 Files ≤300 LOC. One responsibility per module (SRP). Split when a module grows a second reason to change.

@@ -1,5 +1,14 @@
 use super::*;
 
+/// The text a read/list/grep produced. Ops return a structured outcome now, so a
+/// body assertion stays one line.
+fn text(outcome: FileOutcome) -> String {
+    match outcome {
+        FileOutcome::Output(s) => s,
+        other => panic!("expected output text, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn write_read_paginate_append_move_delete() {
     let dir = tempfile::tempdir().unwrap();
@@ -7,12 +16,12 @@ async fn write_read_paginate_append_move_delete() {
     let a = a.to_str().unwrap();
 
     write(a, "l1\nl2\nl3").await.unwrap();
-    let page = read(a, 0, 2).await.unwrap();
+    let page = text(read(a, 0, 2).await.unwrap());
     assert!(page.contains("l1") && page.contains("l2") && !page.contains("l3"));
     assert!(page.contains("next_cursor=2"));
 
     append(a, "\nl4").await.unwrap();
-    assert!(read(a, 0, 100).await.unwrap().contains("l4"));
+    assert!(text(read(a, 0, 100).await.unwrap()).contains("l4"));
 
     let b = dir.path().join("b.txt");
     let b = b.to_str().unwrap();
@@ -30,22 +39,38 @@ async fn write_creates_missing_parent_dirs() {
     let nested = dir.path().join("a/b/c.txt");
     let nested = nested.to_str().unwrap();
     write(nested, "hi").await.unwrap();
-    assert_eq!(read(nested, 0, 10).await.unwrap(), "hi");
+    assert_eq!(text(read(nested, 0, 10).await.unwrap()), "hi");
 
     // append to a fresh path under a new dir works too.
     let ap = dir.path().join("x/y/z.log");
     let ap = ap.to_str().unwrap();
     append(ap, "one\n").await.unwrap();
-    assert!(read(ap, 0, 10).await.unwrap().contains("one"));
+    assert!(text(read(ap, 0, 10).await.unwrap()).contains("one"));
 }
 
+/// A directory `read` must fail as its own variant, not as a raw "Is a directory"
+/// errno — that's what lets the adapter redirect the agent to `list`.
 #[tokio::test]
-async fn read_on_directory_redirects_to_list() {
+async fn read_on_directory_is_a_typed_error_not_an_errno() {
     let dir = tempfile::tempdir().unwrap();
     let err = read(dir.path().to_str().unwrap(), 0, 10).await.unwrap_err();
     assert!(
-        err.contains("is a directory") && err.contains("list"),
-        "dir read should redirect to list: {err}"
+        matches!(err, FileError::IsDirectory { .. }),
+        "dir read must be typed: {err:?}"
+    );
+}
+
+/// A failed `ls`/`find`/`grep` must arrive as the typed `ShError` it was. The exit
+/// code is load-bearing (grep's exit 1 = no matches); flattening to a string threw
+/// it away and left the distinction to message text.
+#[tokio::test]
+async fn failed_shell_op_keeps_its_typed_exit_status() {
+    let err = list("/does/not/exist-mcp-ssh-test", false)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, FileError::Shell(ShError::Status { code, .. }) if code != 0),
+        "a failed listing must carry its exit status: {err:?}"
     );
 }
 
@@ -57,7 +82,7 @@ async fn oversized_no_newline_line_is_capped_not_slurped() {
     let p = dir.path().join("huge.txt");
     let big = vec![b'a'; 2 * 1024 * 1024];
     tokio::fs::write(&p, &big).await.unwrap();
-    let out = read(p.to_str().unwrap(), 0, 100).await.unwrap();
+    let out = text(read(p.to_str().unwrap(), 0, 100).await.unwrap());
     assert!(
         out.len() <= 16 * 1024,
         "oversized no-newline line must be bounded, got {} bytes",
@@ -82,7 +107,7 @@ async fn first_page_of_large_file_reports_lower_bound_not_a_full_scan() {
     }
     tokio::fs::write(&p, &body).await.unwrap();
 
-    let out = read(p.to_str().unwrap(), 0, 10).await.unwrap();
+    let out = text(read(p.to_str().unwrap(), 0, 10).await.unwrap());
     assert!(
         out.contains("line-00000") && out.contains("line-00009"),
         "page 1 must hold the first window: {out}"
@@ -110,7 +135,7 @@ async fn later_pages_advance_and_the_final_page_ends_cleanly() {
 
     // A middle page advances the cursor and still reports a lower bound (we stopped
     // once the two-line window filled, before learning the true total).
-    let mid = read(p, 1, 2).await.unwrap();
+    let mid = text(read(p, 1, 2).await.unwrap());
     assert!(
         mid.contains('b') && mid.contains('c') && !mid.contains('d'),
         "middle page holds its window: {mid}"
@@ -121,11 +146,11 @@ async fn later_pages_advance_and_the_final_page_ends_cleanly() {
     );
 
     // The last lines fit in the window, so the scan reaches EOF: exact end, no footer.
-    let last = read(p, 3, 10).await.unwrap();
+    let last = text(read(p, 3, 10).await.unwrap());
     assert_eq!(last, "d\ne", "final page is exact and carries no cursor");
 
     // Reading past the end is an empty page, never a bogus cursor.
-    let past = read(p, 99, 10).await.unwrap();
+    let past = text(read(p, 99, 10).await.unwrap());
     assert_eq!(past, "", "past-EOF read is empty with no footer");
 }
 
@@ -135,7 +160,7 @@ async fn grep_finds_match() {
     let c = dir.path().join("c.txt");
     let c = c.to_str().unwrap();
     write(c, "alpha\nbeta\ngamma").await.unwrap();
-    assert!(grep("beta", c, false).await.unwrap().contains("beta"));
+    assert!(text(grep("beta", c, false).await.unwrap()).contains("beta"));
 }
 
 #[tokio::test]
@@ -146,12 +171,12 @@ async fn grep_pattern_starting_with_dash_is_a_pattern_not_an_option() {
     let c = dir.path().join("code.rs");
     let c = c.to_str().unwrap();
     write(c, "fn f() -> i32 { 0 }").await.unwrap();
-    let out = grep("->", c, false).await.unwrap();
+    let out = text(grep("->", c, false).await.unwrap());
     assert!(out.contains("-> i32"), "dash pattern must match: {out}");
     let out = grep("-r", c, false).await.unwrap();
     assert!(
-        out.contains("no matches"),
-        "`-r` is a pattern with no hits, not a flag: {out}"
+        matches!(out, FileOutcome::NoMatches),
+        "`-r` is a pattern with no hits, not a flag: {out:?}"
     );
 }
 
@@ -163,8 +188,8 @@ async fn grep_no_matches_is_ok_and_distinguishable() {
     write(c, "alpha").await.unwrap();
     let out = grep("zzz", c, false).await.unwrap();
     assert!(
-        out.contains("no matches"),
-        "zero matches is a result, not an error or a blank page: {out}"
+        matches!(out, FileOutcome::NoMatches),
+        "zero matches is its own outcome, not an error or a blank page: {out:?}"
     );
 }
 
@@ -222,7 +247,7 @@ async fn list_non_recursive_shows_top_level_only() {
     write(f_top.to_str().unwrap(), "top").await.unwrap();
     write(f_nested.to_str().unwrap(), "nested").await.unwrap();
 
-    let out = list(dir.path().to_str().unwrap(), false).await.unwrap();
+    let out = text(list(dir.path().to_str().unwrap(), false).await.unwrap());
     assert!(out.contains("top.txt"), "should list top-level file: {out}");
     assert!(out.contains("sub"), "should list sub dir: {out}");
     assert!(!out.contains("nested.txt"), "should not recurse: {out}");
@@ -236,7 +261,7 @@ async fn list_recursive_finds_nested_files() {
     let f_nested = sub.join("deep.txt");
     write(f_nested.to_str().unwrap(), "deep").await.unwrap();
 
-    let out = list(dir.path().to_str().unwrap(), true).await.unwrap();
+    let out = text(list(dir.path().to_str().unwrap(), true).await.unwrap());
     assert!(
         out.contains("deep.txt"),
         "recursive find should reach nested file: {out}"
@@ -262,7 +287,7 @@ async fn list_recursive_is_depth_bounded() {
     let shallow = dir.path().join("shallow.txt");
     write(shallow.to_str().unwrap(), "y").await.unwrap();
 
-    let out = list(dir.path().to_str().unwrap(), true).await.unwrap();
+    let out = text(list(dir.path().to_str().unwrap(), true).await.unwrap());
     assert!(
         !out.contains("truncated"),
         "exclusion must be the depth bound, not the byte cap: {out}"
@@ -302,9 +327,11 @@ async fn grep_recursive_finds_match_in_subdirs() {
         .await
         .unwrap();
 
-    let out = grep("beta", dir.path().to_str().unwrap(), true)
-        .await
-        .unwrap();
+    let out = text(
+        grep("beta", dir.path().to_str().unwrap(), true)
+            .await
+            .unwrap(),
+    );
     assert!(
         out.contains("beta"),
         "recursive grep should find pattern in subdir: {out}"
@@ -319,7 +346,7 @@ async fn binary_file_reads_as_lossy_utf8_not_error() {
     tokio::fs::write(&p, b"hello\xff\xfeworld\n").await.unwrap();
     let result = read(p.to_str().unwrap(), 0, 100).await;
     assert!(result.is_ok(), "binary read should not hard-error");
-    let content = result.unwrap();
+    let content = text(result.unwrap());
     assert!(content.contains("hello"), "ASCII prefix should survive");
     assert!(content.contains("world"), "ASCII suffix should survive");
 }
@@ -335,13 +362,17 @@ async fn move_onto_an_existing_dest_errs_and_leaves_both_files_intact() {
 
     let err = rename(src, dst).await.unwrap_err();
     assert!(
-        err.contains("exists"),
-        "a clobbering move must error, not overwrite: {err}"
+        matches!(err, FileError::DestinationExists { .. }),
+        "a clobbering move must error, not overwrite: {err:?}"
     );
     // Move is all-or-nothing: neither file is touched.
-    assert_eq!(read(src, 0, 10).await.unwrap(), "SRC", "source stays put");
     assert_eq!(
-        read(dst, 0, 10).await.unwrap(),
+        text(read(src, 0, 10).await.unwrap()),
+        "SRC",
+        "source stays put"
+    );
+    assert_eq!(
+        text(read(dst, 0, 10).await.unwrap()),
         "DST",
         "destination is untouched"
     );
@@ -361,7 +392,7 @@ async fn move_onto_a_free_path_succeeds() {
         "source is gone after a move"
     );
     assert_eq!(
-        read(dst, 0, 10).await.unwrap(),
+        text(read(dst, 0, 10).await.unwrap()),
         "hello",
         "content lands at the free destination"
     );

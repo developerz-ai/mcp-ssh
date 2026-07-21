@@ -20,8 +20,11 @@ const MAX_SHELL_RUN_SECS: u64 = 30;
 /// A shelled-out command that didn't produce a clean result. Exit status and
 /// combined output stay separate so callers can special-case a status (grep's
 /// exit-1-means-no-matches) without parsing message text.
+///
+/// Visible to the whole `tools` module, not just `files`: `FileError::Shell`
+/// carries it out intact, so it must be at least as visible as `FileError`.
 #[derive(Debug, thiserror::Error)]
-pub(super) enum ShError {
+pub(in crate::tools) enum ShError {
     #[error("{0}")]
     Spawn(String),
     #[error("exit status {code}: {out}")]
