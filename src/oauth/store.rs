@@ -141,8 +141,11 @@ impl Store {
             return Err("invalid_grant");
         }
         // `/authorize` only issued this code after matching its URI against the
-        // client's registration, so re-checking it here carries that binding
-        // through to redemption (RFC 6749 §4.1.3).
+        // client's registration, so re-checking it here carries the *URI* binding
+        // through to redemption (RFC 6749 §4.1.3). The client binding does not
+        // carry: no `client_id` is stored with the code, and the token request
+        // never sends one. Safe for a public PKCE client — a stolen code is
+        // useless without the verifier — but it is a half-step short of §4.1.3.
         if entry.redirect_uri != redirect_uri {
             return Err("invalid_grant");
         }
