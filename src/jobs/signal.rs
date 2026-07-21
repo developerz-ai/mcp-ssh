@@ -4,11 +4,16 @@
 //! A job leads its own process group (so its pgid equals its pid; see
 //! `JobStore::run`), which lets a single signal to the negative pid reach the
 //! whole tree the command spawned, not just `sh` itself.
+//!
+//! Two entry points, one semantics: [`kill_job`] for a job this process still
+//! holds a handle to, [`kill_persisted`] for one it only has a row for — the
+//! engine's untracked jobs and every `mcp-ssh job kill`. Both decide on the same
+//! rules; only the answer's rendering differs per caller.
 use std::time::Duration;
 
 use tokio::sync::watch;
 
-use super::{Job, JobState, ProcessGroupId};
+use super::{Job, JobId, JobRepo, JobState, JobStatus, ProcessGroupId};
 
 /// Grace between `SIGTERM` and `SIGKILL` when killing a job's process group.
 const KILL_GRACE: Duration = Duration::from_secs(2);
@@ -42,13 +47,77 @@ pub(super) async fn kill_job(job: &Job) -> bool {
     true
 }
 
-/// Kill a process group by raw pgid, for callers that hold no in-process `Job`
-/// (the `mcp-ssh job kill` CLI, which acts on the persisted pgid). `SIGTERM`,
-/// then `SIGKILL` if the group outlives a short grace. Returns whether the group
-/// is gone afterwards. Liveness is probed with `kill -0` rather than a completion
-/// flag — the group's real parent (the server, or init after a restart) reaps the
-/// exited process, so no zombie lingers to read as alive.
-pub(crate) async fn kill_group(pgid: ProcessGroupId) -> bool {
+/// What killing a job from its persisted row decided. The two callers render it
+/// differently — `job(action="kill")` answers a bool, `mcp-ssh job kill` an
+/// operator sentence — so the decision is returned here, never formatted.
+#[derive(Debug)]
+pub(crate) enum KillOutcome {
+    /// No row with that id.
+    Unknown,
+    /// The row already holds a terminal state, so there is nothing to signal. The
+    /// status word is kept verbatim: a corrupt one is shown, not hidden.
+    NotRunning { status: String },
+    /// The row records no process group — it predates pgid tracking, or the OS
+    /// withheld the pid. Nothing to signal, and no pgid may be guessed.
+    NoProcessGroup,
+    /// The persisted pgid is one no real job could have written (outside `u32`,
+    /// which a raw cast would wrap onto a real but wrong group, or `0`, which is
+    /// *this* process's own group). Refused, not signalled.
+    CorruptProcessGroup { pgid: i64 },
+    /// The group is gone, and the row records the kill.
+    Killed,
+    /// The group outlived `TERM`→`KILL`, so the row is left `running` rather than
+    /// claim a kill that didn't happen.
+    Survived { pgid: ProcessGroupId },
+}
+
+/// Kill a job from its persisted row — the shared semantics for every caller that
+/// holds no in-process [`Job`]: the engine, for a job whose group outlived the
+/// process that started it, and the `mcp-ssh job kill` CLI, which never tracks
+/// one. Each job leads its own process group, so a persisted pgid stays
+/// signalable across a restart.
+///
+/// Only a row that still reads `running` is signalled, and only through
+/// [`ProcessGroupId::from_persisted`], the single gate that keeps a corrupt pgid
+/// from becoming a signal target. The `failed` transition is recorded — with
+/// `reason` in the `error` column — only once the group is actually gone, and
+/// only while the row still reads `running`: a real exit written meanwhile by the
+/// server that owns the job wins over ours. That write is best effort, since the
+/// kill has already happened by then — a failure is logged, not returned.
+pub(crate) async fn kill_persisted(
+    repo: &JobRepo,
+    id: &JobId,
+    reason: &'static str,
+) -> rusqlite::Result<KillOutcome> {
+    let Some(target) = repo.kill_target(id).await? else {
+        return Ok(KillOutcome::Unknown);
+    };
+    if target.status != JobStatus::Running.as_str() {
+        return Ok(KillOutcome::NotRunning {
+            status: target.status,
+        });
+    }
+    let Some(pgid) = target.pgid else {
+        return Ok(KillOutcome::NoProcessGroup);
+    };
+    let Some(group) = ProcessGroupId::from_persisted(pgid) else {
+        return Ok(KillOutcome::CorruptProcessGroup { pgid });
+    };
+    if !kill_group(group).await {
+        return Ok(KillOutcome::Survived { pgid: group });
+    }
+    if let Err(error) = repo.mark_killed(id, reason).await {
+        tracing::warn!(%error, id = %id, "failed to record killed job");
+    }
+    Ok(KillOutcome::Killed)
+}
+
+/// Kill a process group by raw pgid. `SIGTERM`, then `SIGKILL` if the group
+/// outlives a short grace. Returns whether the group is gone afterwards. Liveness
+/// is probed with `kill -0` rather than a completion flag — the group's real
+/// parent (the server, or init after a restart) reaps the exited process, so no
+/// zombie lingers to read as alive.
+pub(super) async fn kill_group(pgid: ProcessGroupId) -> bool {
     if !group_alive(pgid).await {
         return true; // nothing to signal — already gone
     }
@@ -120,9 +189,116 @@ async fn exited_within(mut done: watch::Receiver<bool>, grace: Duration) -> bool
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::Db;
     use std::path::PathBuf;
     use std::sync::Arc;
     use tokio::sync::Mutex;
+
+    /// A repository over a fresh in-memory DB, plus the raw handle the tests use to
+    /// plant rows the typed API can't produce (legacy or corrupt ones) and to read
+    /// columns back.
+    fn repo() -> (JobRepo, Db) {
+        let db = Db::memory();
+        (JobRepo::new(db.clone()), db)
+    }
+
+    /// Plant one row verbatim — `status`/`pgid` combinations `insert_running` can't
+    /// write, which is exactly what the refusals guard against.
+    async fn plant(db: &Db, id: &'static str, status: &'static str, pgid: Option<i64>) {
+        db.call(move |conn| {
+            conn.execute(
+                "INSERT INTO jobs (id, status, started_unix, pgid) VALUES (?1, ?2, 1, ?3)",
+                rusqlite::params![id, status, pgid],
+            )
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn status_of(db: &Db, id: &'static str) -> Option<String> {
+        use rusqlite::OptionalExtension;
+        db.call(move |conn| {
+            conn.query_row("SELECT status FROM jobs WHERE id = ?1", [id], |r| r.get(0))
+                .optional()
+        })
+        .await
+        .unwrap()
+    }
+
+    /// The kill under test, with the engine's reason unless the test cares.
+    async fn kill(repo: &JobRepo, id: &str) -> KillOutcome {
+        kill_persisted(repo, &JobId::from(id), "killed")
+            .await
+            .unwrap()
+    }
+
+    /// The decision table both kill callers now share: every row that must not be
+    /// signalled is refused with its own reason and left exactly as it was.
+    #[tokio::test]
+    async fn unsignalable_rows_are_refused_and_left_untouched() {
+        let (repo, db) = repo();
+        plant(&db, "done", "exited", Some(1234)).await;
+        plant(&db, "legacy", "running", None).await;
+        plant(&db, "zero", "running", Some(0)).await;
+        plant(&db, "wrapped", "running", Some(i64::from(u32::MAX) + 1)).await;
+
+        assert!(matches!(kill(&repo, "ghost").await, KillOutcome::Unknown));
+        assert!(
+            matches!(kill(&repo, "done").await, KillOutcome::NotRunning { status } if status == "exited"),
+            "a finished row is never signalled"
+        );
+        assert!(matches!(
+            kill(&repo, "legacy").await,
+            KillOutcome::NoProcessGroup
+        ));
+        // `0` is the dangerous one: `kill -- -0` would signal *this* process's own
+        // group, so this test is its own canary — a regression kills the runner.
+        assert!(matches!(
+            kill(&repo, "zero").await,
+            KillOutcome::CorruptProcessGroup { pgid: 0 }
+        ));
+        assert!(matches!(
+            kill(&repo, "wrapped").await,
+            KillOutcome::CorruptProcessGroup { .. }
+        ));
+
+        for id in ["legacy", "zero", "wrapped"] {
+            assert_eq!(
+                status_of(&db, id).await.as_deref(),
+                Some("running"),
+                "a refused kill must not record a kill that never happened: {id}"
+            );
+        }
+        assert_eq!(status_of(&db, "done").await.as_deref(), Some("exited"));
+    }
+
+    /// The recorded transition carries the caller's reason verbatim — that column is
+    /// how `mcp-ssh jobs` tells a CLI kill from the server's own.
+    #[tokio::test]
+    async fn a_gone_group_is_recorded_failed_with_the_caller_s_reason() {
+        let (repo, db) = repo();
+        // A pgid with no live members: `kill_group` reports it already gone, which is
+        // the same "the group is dead" answer a real signal ends at.
+        plant(&db, "gone", "running", Some(2_000_000_000)).await;
+
+        let outcome = kill_persisted(&repo, &JobId::from("gone"), "killed via mcp-ssh kill")
+            .await
+            .unwrap();
+        assert!(matches!(outcome, KillOutcome::Killed));
+
+        let row: (String, Option<String>) = db
+            .call(|conn| {
+                conn.query_row(
+                    "SELECT status, error FROM jobs WHERE id = 'gone'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(row.0, "failed");
+        assert_eq!(row.1.as_deref(), Some("killed via mcp-ssh kill"));
+    }
 
     #[cfg(unix)]
     #[tokio::test]

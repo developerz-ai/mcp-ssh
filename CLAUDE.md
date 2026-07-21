@@ -53,7 +53,7 @@ Keep this accurate — it's the navigation aid.
 |---|---|
 | `src/main.rs` | entry: CLI parse, config load, build axum router, serve; dispatches admin subcommands |
 | `src/cli.rs` | clap command definitions (`serve`/`set-auth`/`jobs`/`job kill`/`sessions`) |
-| `src/admin.rs` | local admin subcommands (`jobs`/`job kill`/`sessions`): read/act on the same SQLite through `jobs::JobRepo` — never builds a `JobStore` (that would start a reaper + reconcile and fail the live server's running rows). Never prints token values |
+| `src/admin.rs` | local admin subcommands (`jobs`/`job kill`/`sessions`): read/act on the same SQLite through `jobs::JobRepo` — never builds a `JobStore` (that would start a reaper + reconcile and fail the live server's running rows); `job kill` only renders `jobs::kill_persisted`'s outcome, it owns no kill logic. Never prints token values |
 | `src/config.rs` | env + TOML file config; fails fast if auth creds missing. `db_path()` resolves the DB path alone for the cred-free admin commands |
 | `src/db.rs` | SQLite durable-state layer (`rusqlite`, `bundled`): the schema + forward-only migrations for OAuth `access_tokens`/`refresh_tokens` + registered `clients` (`client_id`→`redirect_uri`, no secrets) + job metadata + output tail; the queries themselves live in the repositories (`src/jobs/store.rs`, `src/oauth/store.rs`). DB at `/var/lib/mcp-ssh/mcp-ssh.db`, WAL, auto-created; one serialized connection driven via `spawn_blocking` |
 | `src/auth.rs` | HTTP Basic auth middleware |
@@ -63,7 +63,7 @@ Keep this accurate — it's the navigation aid.
 | `src/jobs/log.rs` | job log pagination: read per-job log files by page (cursor + limit) |
 | `src/jobs/reaper.rs` | reaper (startup + hourly): drops jobs >24h old (DB rows + log files, killing any still-`Running` group first via `src/jobs/signal.rs`), trims finished jobs' logs to a trailing tail (5000 lines <3h old, 500 after), mtime-ages orphaned files from a previous run, sweeps expired OAuth tokens (`src/oauth/store.rs`) on the same pass |
 | `src/jobs/shell.rs` | `Shell`: how a user command is launched — bare `sh -c` (default) vs. interactive `bash -ic` (sources `~/.bashrc` for aliases/version managers) |
-| `src/jobs/signal.rs` | process-group signalling: `kill_job`/`kill_group` (TERM→KILL escalation) shared by `job(action="kill")`, the `mcp-ssh job kill` CLI, and the reaper; `group_alive` liveness probe the startup reconcile and reaper's log-compaction gate also reuse |
+| `src/jobs/signal.rs` | process-group signalling **and the one kill semantics**: `kill_job` (live handle) / `kill_persisted` (a row's pgid — running-check, corrupt-pgid gate, `failed` transition, returning a `KillOutcome` the engine and the `mcp-ssh job kill` CLI only render) over `kill_group`'s TERM→KILL escalation; `group_alive` liveness probe the startup reconcile and reaper's log-compaction gate also reuse |
 | `src/jobs/store.rs` | `JobRepo`: the only place `jobs` SQL lives (engine, reaper, and admin CLI call typed methods) + the row⇄`JobState` mapping and the startup-reconcile query; mirrors `oauth::Store`. No `cmd` text reaches a query or a log line |
 | `src/tools/mod.rs` | MCP tool surface (`#[tool_router]`/`#[tool]` from rmcp): 3 tools (`bash`/`job`/`file`) dispatching on `action`. Thin adapters over jobs + files |
 | `src/tools/files.rs` | file operations (`tokio::fs`; `ls`/`find`/`grep` shelled out) |
@@ -143,7 +143,7 @@ Non-negotiable: SOLID, SRP, tested code. The bar: idiomatic, boring, readable Ru
 | OAuth 2.1 (discovery, registration, PKCE, bearer) | `src/oauth/` |
 | Running commands, backgrounding, job logs | `src/jobs/mod.rs` |
 | Reaper (DB + log-file cleanup) | `src/jobs/reaper.rs` |
-| Process-group kill helpers | `src/jobs/signal.rs` |
+| Kill semantics + process-group signalling | `src/jobs/signal.rs` |
 | Tool definitions / MCP surface | `src/tools/mod.rs` |
 | File operations | `src/tools/files.rs` |
 

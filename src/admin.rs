@@ -6,7 +6,7 @@
 //! would start a reaper and a startup reconcile that flips the live server's
 //! `running` rows to `failed`. Here we only ever touch the database directly.
 use crate::db::{Db, now_unix};
-use crate::jobs::{JobId, JobRepo, JobRow, JobStatus};
+use crate::jobs::{JobId, JobRepo, JobRow, JobStatus, KillOutcome, kill_persisted};
 
 /// Open the database the running server uses. Idempotent — applies the same schema
 /// and pragmas, safe to run alongside the daemon (SQLite WAL allows it).
@@ -66,43 +66,25 @@ pub async fn kill(id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The CLI is pure rendering: the kill itself — running-check, the pgid gate, the
+/// `failed` transition — is [`kill_persisted`], the same code path the server takes
+/// for a job it doesn't track, so both agree on what a kill means.
 async fn kill_job(repo: &JobRepo, id: &str) -> anyhow::Result<String> {
-    let job_id = JobId::from(id);
-    let Some(target) = repo.kill_target(&job_id).await? else {
-        return Ok(format!("no such job: {id}"));
-    };
-    if target.status != JobStatus::Running.as_str() {
-        return Ok(format!(
-            "job {id} is not running (status: {})",
-            target.status
-        ));
-    }
-    let Some(pgid) = target.pgid else {
-        return Ok(format!(
+    let outcome = kill_persisted(repo, &JobId::from(id), "killed via mcp-ssh kill").await?;
+    Ok(match outcome {
+        KillOutcome::Unknown => format!("no such job: {id}"),
+        KillOutcome::NotRunning { status } => format!("job {id} is not running (status: {status})"),
+        KillOutcome::NoProcessGroup => format!(
             "job {id} has no recorded process group (started before pgid tracking) — cannot kill from the CLI"
-        ));
-    };
-
-    // Corrupt rows are refused, not signalled: outside `u32` a raw `as` cast would
-    // wrap onto a real (wrong) group, and `0` is worse — `kill -- -0` signals *this*
-    // process's own group. `ProcessGroupId` is the single gate for both.
-    let Some(group) = crate::jobs::ProcessGroupId::from_persisted(pgid) else {
-        return Ok(format!(
-            "job {id} has a corrupt pgid ({pgid}) — refusing to signal"
-        ));
-    };
-    let killed = crate::jobs::kill_group(group).await;
-    // Record the kill only if the row is still `running`: when the server owns the
-    // job, its waiter may already have written the real exit as the group died.
-    repo.mark_killed(&job_id, "killed via mcp-ssh kill").await?;
-
-    Ok(if killed {
-        format!("killed {id}")
-    } else {
-        format!(
-            "signalled {id} (pgid {}); the group may already be gone",
-            group.get()
-        )
+        ),
+        KillOutcome::CorruptProcessGroup { pgid } => {
+            format!("job {id} has a corrupt pgid ({pgid}) — refusing to signal")
+        }
+        KillOutcome::Killed => format!("killed {id}"),
+        KillOutcome::Survived { pgid } => format!(
+            "job {id} (pgid {}) outlived TERM then KILL — left running",
+            pgid.get()
+        ),
     })
 }
 

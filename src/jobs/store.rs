@@ -50,11 +50,11 @@ pub(super) struct StaleJob {
 
 /// What a kill decides on: the row's status word (rendered back to the operator by
 /// the CLI, so kept verbatim) and its persisted process group, unvalidated —
-/// callers gate it through `ProcessGroupId::from_persisted`.
+/// `super::signal` gates it through `ProcessGroupId::from_persisted`.
 #[derive(Debug)]
-pub(crate) struct KillTarget {
-    pub(crate) status: String,
-    pub(crate) pgid: Option<i64>,
+pub(super) struct KillTarget {
+    pub(super) status: String,
+    pub(super) pgid: Option<i64>,
 }
 
 /// One row the reaper weighs for log compaction.
@@ -200,7 +200,7 @@ impl JobRepo {
     }
 
     /// The status + process group a kill acts on. `Ok(None)` for an unknown id.
-    pub(crate) async fn kill_target(&self, id: &JobId) -> rusqlite::Result<Option<KillTarget>> {
+    pub(super) async fn kill_target(&self, id: &JobId) -> rusqlite::Result<Option<KillTarget>> {
         let row_id = id.as_ref().to_string();
         self.db
             .call(move |conn| {
@@ -222,7 +222,7 @@ impl JobRepo {
     /// Record a kill against a row that still reads `running`. `reason` lands in
     /// the `error` column and is a fixed message from the caller — never command
     /// text.
-    pub(crate) async fn mark_killed(
+    pub(super) async fn mark_killed(
         &self,
         id: &JobId,
         reason: &'static str,

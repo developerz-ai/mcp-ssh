@@ -25,7 +25,7 @@ use log::{DEFAULT_PAGE, read_page, read_page_tail};
 pub use log::{JobLogError, Page, paginate};
 use reaper::spawn_reaper;
 pub use shell::Shell;
-pub(crate) use signal::kill_group;
+pub(crate) use signal::{KillOutcome, kill_persisted};
 use signal::{group_alive, kill_job};
 pub use status::JobStatus;
 pub(crate) use store::{JobRepo, JobRow};
@@ -57,7 +57,9 @@ impl ProcessGroupId {
     /// The group behind a persisted `jobs.pgid`. `None` for anything a real job
     /// could never have written — outside `u32` (a raw `as` cast would wrap it
     /// onto a real, wrong group) or zero — so a corrupt row can't be signalled.
-    pub(crate) fn from_persisted(pgid: i64) -> Option<Self> {
+    /// Private to this module tree: outside it, a kill goes through
+    /// [`signal::kill_persisted`], which is the only caller allowed to gate a row.
+    fn from_persisted(pgid: i64) -> Option<Self> {
         u32::try_from(pgid).ok().and_then(Self::new)
     }
 
@@ -466,46 +468,34 @@ impl JobStore {
             // Not tracked here. A job whose group outlived the process that
             // started it (see `reconcile_stale_running`) is still killable
             // through its persisted pgid, so don't call it unknown.
-            None => self.kill_persisted(id).await,
+            None => self.kill_untracked(id).await,
         }
     }
 
-    /// Kill a job this process doesn't track, from its DB row: each job leads its
-    /// own process group, so a group that outlived a restart is still signalable by
-    /// its persisted pgid. Returns whether the group is gone afterwards — `false`
-    /// for an unknown id, a job that already finished, a row with no usable pgid,
-    /// or a group that survived `TERM`→`KILL`.
-    async fn kill_persisted(&self, id: &JobId) -> bool {
-        let target = match self.repo.kill_target(id).await {
-            Ok(Some(target)) => target,
-            Ok(None) => return false,
+    /// Kill a job this process doesn't track, through the persisted-row semantics
+    /// shared with the `mcp-ssh job kill` CLI. Returns whether the group is gone
+    /// afterwards — `false` for an unknown id, a job that already finished, a row
+    /// with no usable pgid, or a group that survived `TERM`→`KILL`.
+    async fn kill_untracked(&self, id: &JobId) -> bool {
+        let outcome = match kill_persisted(&self.repo, id, "killed").await {
+            Ok(outcome) => outcome,
             Err(error) => {
                 tracing::warn!(%error, id = %id, "failed to read job row for kill");
                 return false;
             }
         };
-        if target.status != JobStatus::Running.as_str() {
-            return false;
+        match outcome {
+            KillOutcome::Killed => true,
+            // Worth a line: the server still believes this job is running, yet no
+            // signal could be sent to it.
+            KillOutcome::NoProcessGroup | KillOutcome::CorruptProcessGroup { .. } => {
+                tracing::warn!(id = %id, ?outcome, "job has no usable process group — cannot kill");
+                false
+            }
+            KillOutcome::Unknown
+            | KillOutcome::NotRunning { .. }
+            | KillOutcome::Survived { .. } => false,
         }
-        // Only a pgid a real job could have written is signalable — see
-        // `ProcessGroupId::from_persisted`. A corrupt row (out of `u32`, or the
-        // server's own group as `0`) is refused, not signalled.
-        let Some(group) = target.pgid.and_then(ProcessGroupId::from_persisted) else {
-            tracing::warn!(id = %id, pgid = ?target.pgid, "job has no usable process group — cannot kill");
-            return false;
-        };
-        if !kill_group(group).await {
-            // Still alive after TERM→KILL: leave the row `running` rather than
-            // record a kill that didn't happen.
-            return false;
-        }
-        // Recorded only while the row still reads `running`: another writer (the
-        // `mcp-ssh job kill` CLI, or the server that owns the job) may have written
-        // the real exit as the group died — that final state wins over ours.
-        if let Err(error) = self.repo.mark_killed(id, "killed").await {
-            tracing::warn!(%error, id = %id, "failed to record killed job");
-        }
-        true
     }
 }
 
