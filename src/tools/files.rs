@@ -1,11 +1,58 @@
 //! File operations, executed locally as the service user. Read/write/move go
 //! through `tokio::fs`; list/grep shell out to `ls`/`find`/`grep` rather than
 //! reimplementing them — bounded by the runner in [`shell`].
+//!
+//! Ops return *facts* — a [`FileOutcome`] or a typed [`FileError`] — never a
+//! finished sentence. The agent-facing wording, and every hint that names the
+//! `file` tool's own actions, is rendered by the adapter in [`super`].
 use tokio::{fs, io::AsyncWriteExt};
 
 mod shell;
 
 use shell::{ShError, sh};
+
+/// What a file op produced. The text-producing ops (`read`/`list`/`grep`) carry
+/// their already-bounded output; the mutating ops carry only *what happened*, so
+/// the sentence describing it stays in the tool adapter.
+#[derive(Debug)]
+pub enum FileOutcome {
+    Output(String),
+    /// `grep` matched nothing — a result, not an error, and its own variant so it
+    /// can't be confused with matching an empty line.
+    NoMatches,
+    Wrote {
+        path: String,
+        bytes: usize,
+    },
+    Appended {
+        path: String,
+        bytes: usize,
+    },
+    Deleted {
+        path: String,
+    },
+    Moved {
+        src: String,
+        dest: String,
+    },
+}
+
+/// Why a file op couldn't produce a result. Variants stay structured so the
+/// adapter can phrase a next step (redirect a directory `read` to `list`, explain
+/// a refused clobbering move) and so a failed `ls`/`find`/`grep` keeps its typed
+/// [`ShError`] — grep's exit-1-means-no-matches lives on the code, not on message
+/// text, and flattening to a string threw that away.
+#[derive(Debug, thiserror::Error)]
+pub enum FileError {
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error("{path} is a directory")]
+    IsDirectory { path: String },
+    #[error("destination exists: {dest}")]
+    DestinationExists { dest: String },
+    #[error(transparent)]
+    Shell(#[from] ShError),
+}
 
 /// Deepest a recursive `list` (`find`) descends below its starting point. The
 /// streamed byte cap already bounds the *output*, but a pathologically deep tree
@@ -35,21 +82,21 @@ const LINE_TRUNCATED: &str = "…[truncated]";
 /// flight) — never the whole file. Slurping first and paginating after bounded
 /// the reply but not server memory: paging 200 lines of a multi-GB log would
 /// have materialized all of it and could OOM the service.
-pub async fn read(path: &str, cursor: usize, limit: usize) -> Result<String, String> {
+pub async fn read(path: &str, cursor: usize, limit: usize) -> Result<FileOutcome, FileError> {
     use tokio::io::{AsyncBufReadExt, BufReader};
-    // A directory can't be read as text: surface a useful redirect to `list`
-    // instead of a raw "Is a directory" errno.
+    // A directory can't be read as text: a typed variant lets the adapter redirect
+    // to `list` instead of handing back a raw "Is a directory" errno.
     match fs::metadata(path).await {
         Ok(meta) if meta.is_dir() => {
-            return Err(format!(
-                "{path} is a directory — use file(action=\"list\", path=\"{path}\") instead"
-            ));
+            return Err(FileError::IsDirectory {
+                path: path.to_string(),
+            });
         }
         Ok(_) => {}
-        Err(e) => return Err(e.to_string()),
+        Err(e) => return Err(e.into()),
     }
     let limit = limit.max(1);
-    let file = fs::File::open(path).await.map_err(|e| e.to_string())?;
+    let file = fs::File::open(path).await?;
     let mut reader = BufReader::new(file);
     let mut total = 0usize;
     let mut window: Vec<String> = Vec::new();
@@ -68,7 +115,7 @@ pub async fn read(path: &str, cursor: usize, limit: usize) -> Result<String, Str
         if window.len() >= limit {
             break;
         }
-        let chunk = reader.fill_buf().await.map_err(|e| e.to_string())?;
+        let chunk = reader.fill_buf().await?;
         if chunk.is_empty() {
             reached_eof = true;
             // EOF: emit a final line that had no terminating newline.
@@ -113,7 +160,7 @@ pub async fn read(path: &str, cursor: usize, limit: usize) -> Result<String, Str
     // ahead; or we stopped early, so a tail past the window is unknown-but-present.
     let more_remains = !reached_eof || next < total;
     if !more_remains {
-        return Ok(body);
+        return Ok(FileOutcome::Output(body));
     }
     // Early stop leaves `total` a lower bound — report it as `≥ n`, not a false exact.
     let total_desc = if reached_eof {
@@ -121,9 +168,11 @@ pub async fn read(path: &str, cursor: usize, limit: usize) -> Result<String, Str
     } else {
         format!("≥{total}")
     };
-    Ok(format!(
+    // The cursor footer rides along with the page it describes: it's part of the
+    // paginated *output*, not a sentence invented about an op that produced none.
+    Ok(FileOutcome::Output(format!(
         "{body}\n[lines {cursor}..{next} of {total_desc}; next_cursor={next}]"
-    ))
+    )))
 }
 
 /// Append `bytes` to the in-flight line, holding it at `MAX_READ_LINE_BYTES` so one
@@ -164,75 +213,78 @@ fn floor_char_boundary(bytes: &[u8], max: usize) -> usize {
     i
 }
 
-pub async fn write(path: &str, content: &str) -> Result<String, String> {
+pub async fn write(path: &str, content: &str) -> Result<FileOutcome, FileError> {
     ensure_parent(path).await?;
-    fs::write(path, content).await.map_err(|e| e.to_string())?;
-    Ok(format!("wrote {} bytes to {path}", content.len()))
+    fs::write(path, content).await?;
+    Ok(FileOutcome::Wrote {
+        path: path.to_string(),
+        bytes: content.len(),
+    })
 }
 
-pub async fn append(path: &str, content: &str) -> Result<String, String> {
+pub async fn append(path: &str, content: &str) -> Result<FileOutcome, FileError> {
     ensure_parent(path).await?;
     let mut f = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
-        .await
-        .map_err(|e| e.to_string())?;
-    f.write_all(content.as_bytes())
-        .await
-        .map_err(|e| e.to_string())?;
+        .await?;
+    f.write_all(content.as_bytes()).await?;
     // Flush before returning so a follow-up read is guaranteed to see the bytes.
-    f.flush().await.map_err(|e| e.to_string())?;
-    Ok(format!("appended {} bytes to {path}", content.len()))
+    f.flush().await?;
+    Ok(FileOutcome::Appended {
+        path: path.to_string(),
+        bytes: content.len(),
+    })
 }
 
-pub async fn delete(path: &str) -> Result<String, String> {
+pub async fn delete(path: &str) -> Result<FileOutcome, FileError> {
     // symlink_metadata, not metadata: a symlink must be unlinked, never followed.
     // Following classified a dir-symlink as a directory (remove_dir_all refuses
     // the top-level link) and made a dangling symlink undeletable (ENOENT on the
     // stat before any removal was attempted).
-    let meta = fs::symlink_metadata(path)
-        .await
-        .map_err(|e| e.to_string())?;
-    let r = if meta.is_dir() {
-        fs::remove_dir_all(path).await
+    let meta = fs::symlink_metadata(path).await?;
+    if meta.is_dir() {
+        fs::remove_dir_all(path).await?;
     } else {
-        fs::remove_file(path).await
-    };
-    r.map_err(|e| e.to_string())?;
-    Ok(format!("deleted {path}"))
+        fs::remove_file(path).await?;
+    }
+    Ok(FileOutcome::Deleted {
+        path: path.to_string(),
+    })
 }
 
-pub async fn rename(src: &str, dest: &str) -> Result<String, String> {
+pub async fn rename(src: &str, dest: &str) -> Result<FileOutcome, FileError> {
     // No silent clobber: `fs::rename` overwrites an existing `dest`, destroying data.
     // symlink_metadata (don't follow) so a symlink already at `dest` also counts as
     // occupying the path — we must not follow it and overwrite its target.
     if fs::symlink_metadata(dest).await.is_ok() {
-        return Err(format!(
-            "destination exists: {dest} — delete it or choose another path (move won't overwrite)"
-        ));
+        return Err(FileError::DestinationExists {
+            dest: dest.to_string(),
+        });
     }
     ensure_parent(dest).await?;
-    fs::rename(src, dest).await.map_err(|e| e.to_string())?;
-    Ok(format!("moved {src} -> {dest}"))
+    fs::rename(src, dest).await?;
+    Ok(FileOutcome::Moved {
+        src: src.to_string(),
+        dest: dest.to_string(),
+    })
 }
 
 /// Create the target's parent directories so writing a new file under a fresh
 /// path "just works" (like `mkdir -p` before a redirect), instead of failing with
 /// a bare `ENOENT` the agent then has to diagnose. A no-op when the parent already
 /// exists or the path has none (a bare filename in the cwd).
-async fn ensure_parent(path: &str) -> Result<(), String> {
+async fn ensure_parent(path: &str) -> Result<(), FileError> {
     if let Some(parent) = std::path::Path::new(path).parent() {
         if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)
-                .await
-                .map_err(|e| e.to_string())?;
+            fs::create_dir_all(parent).await?;
         }
     }
     Ok(())
 }
 
-pub async fn list(path: &str, recursive: bool) -> Result<String, String> {
+pub async fn list(path: &str, recursive: bool) -> Result<FileOutcome, FileError> {
     if recursive {
         // `find` has no `--`; anchor a leading-dash relative path with `./` so
         // it can't be parsed as an expression.
@@ -244,29 +296,25 @@ pub async fn list(path: &str, recursive: bool) -> Result<String, String> {
         // `-maxdepth` (after the starting point, before any test → no find warning)
         // caps how far the walk descends, so a deep tree can't recurse without bound.
         let depth = MAX_FIND_DEPTH.to_string();
-        sh("find", &[&path, "-maxdepth", &depth])
-            .await
-            .map_err(|e| e.to_string())
+        Ok(FileOutcome::Output(
+            sh("find", &[&path, "-maxdepth", &depth]).await?,
+        ))
     } else {
-        sh("ls", &["-la", "--", path])
-            .await
-            .map_err(|e| e.to_string())
+        Ok(FileOutcome::Output(sh("ls", &["-la", "--", path]).await?))
     }
 }
 
-pub async fn grep(pattern: &str, path: &str, recursive: bool) -> Result<String, String> {
+pub async fn grep(pattern: &str, path: &str, recursive: bool) -> Result<FileOutcome, FileError> {
     let flag = if recursive { "-rn" } else { "-n" };
     // `--` so a pattern like `->` or `-r` is a pattern, not an option: without
     // it, grepping Rust code for `->` errored, and `-r` silently recursed with
     // the *path* as the pattern — wrong results, not even an error.
     match sh("grep", &[flag, "--", pattern, path]).await {
-        Ok(s) => Ok(s),
-        // Exit 1 is grep's "no line matched" — a legitimate empty result. The
-        // marker keeps it distinguishable from matching an empty line.
-        Err(ShError::Status { code: 1, out }) if out.is_empty() => {
-            Ok("[grep: no matches]".to_string())
-        }
-        Err(e) => Err(e.to_string()),
+        Ok(s) => Ok(FileOutcome::Output(s)),
+        // Exit 1 is grep's "no line matched" — a legitimate empty result, so it
+        // leaves as an outcome rather than an error.
+        Err(ShError::Status { code: 1, out }) if out.is_empty() => Ok(FileOutcome::NoMatches),
+        Err(e) => Err(e.into()),
     }
 }
 

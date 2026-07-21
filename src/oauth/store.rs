@@ -25,6 +25,18 @@ pub const TOKEN_TTL: Duration = Duration::from_secs(24 * 3600);
 /// browser flow.
 pub const REFRESH_TTL: Duration = Duration::from_secs(365 * 24 * 3600);
 
+/// The RFC 6749 §5.2 wire error codes this server actually emits, consolidated
+/// so the literal strings exist in exactly one place instead of scattered
+/// across every fallible `Store` method. `Display` (via `thiserror`) renders
+/// the exact wire string callers put in the JSON `error` field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum GrantError {
+    #[error("invalid_grant")]
+    InvalidGrant,
+    #[error("server_error")]
+    ServerError,
+}
+
 struct CodeEntry {
     challenge: String,
     redirect_uri: String,
@@ -58,7 +70,7 @@ impl Store {
     /// receive its auth codes. Duplicate URIs in one request collapse to one row.
     /// Returns the new `client_id` — public data (see the `clients` DDL), so it is
     /// safe to hand back, but it is still never logged.
-    pub async fn register_client(&self, redirect_uris: &[String]) -> Result<String, &'static str> {
+    pub async fn register_client(&self, redirect_uris: &[String]) -> Result<String, GrantError> {
         let client_id = random_token();
         // Owned copies: the closure runs on the blocking pool and must be 'static.
         let rows: Vec<(String, String)> = redirect_uris
@@ -80,7 +92,7 @@ impl Store {
                 tx.commit()
             })
             .await
-            .map_err(|_| "server_error")?;
+            .map_err(|_| GrantError::ServerError)?;
         Ok(client_id)
     }
 
@@ -130,15 +142,15 @@ impl Store {
         code: &str,
         verifier: &str,
         redirect_uri: &str,
-    ) -> Result<Tokens, &'static str> {
+    ) -> Result<Tokens, GrantError> {
         let entry = self
             .codes
             .lock()
             .await
             .remove(code)
-            .ok_or("invalid_grant")?;
+            .ok_or(GrantError::InvalidGrant)?;
         if entry.expires < Instant::now() {
-            return Err("invalid_grant");
+            return Err(GrantError::InvalidGrant);
         }
         // `/authorize` only issued this code after matching its URI against the
         // client's registration, so re-checking it here carries the *URI* binding
@@ -147,10 +159,10 @@ impl Store {
         // never sends one. Safe for a public PKCE client — a stolen code is
         // useless without the verifier — but it is a half-step short of §4.1.3.
         if entry.redirect_uri != redirect_uri {
-            return Err("invalid_grant");
+            return Err(GrantError::InvalidGrant);
         }
         if !verify_pkce(&entry.challenge, verifier) {
-            return Err("invalid_grant");
+            return Err(GrantError::InvalidGrant);
         }
         self.issue().await
     }
@@ -158,7 +170,7 @@ impl Store {
     /// Exchange a refresh token for a fresh pair. The old refresh token is consumed
     /// (rotation, RFC 6749 §10.4 best practice): replaying it fails, and each use
     /// resets the `REFRESH_TTL` window, so an actively-used client never re-auths.
-    pub async fn refresh(&self, refresh_token: &str) -> Result<Tokens, &'static str> {
+    pub async fn refresh(&self, refresh_token: &str) -> Result<Tokens, GrantError> {
         let token = refresh_token.to_owned();
         // Delete + expiry-check in one statement so a token can't be redeemed twice
         // by concurrent requests. `RETURNING` hands back the row only if it existed;
@@ -175,12 +187,12 @@ impl Store {
                 .optional()
             })
             .await
-            .map_err(|_| "server_error")?;
+            .map_err(|_| GrantError::ServerError)?;
         // Unknown token, or it was already past its TTL (consuming an expired token
         // on the way out is fine — it's dead either way). Both → invalid_grant.
         match expiry {
             Some(exp) if exp > crate::db::now_unix() => self.issue().await,
-            _ => Err("invalid_grant"),
+            _ => Err(GrantError::InvalidGrant),
         }
     }
 
@@ -188,7 +200,7 @@ impl Store {
     /// concurrent clients accumulate distinct pairs that don't clobber each other.
     /// Both rows commit together, so a half-written pair — an access token with no
     /// refresh token, unrenewable and invisible to the client — is never left behind.
-    async fn issue(&self) -> Result<Tokens, &'static str> {
+    async fn issue(&self) -> Result<Tokens, GrantError> {
         let access = random_token();
         let refresh = random_token();
         let access_exp = crate::db::now_unix() + TOKEN_TTL.as_secs() as i64;
@@ -212,7 +224,7 @@ impl Store {
                 tx.commit()
             })
             .await
-            .map_err(|_| "server_error")?;
+            .map_err(|_| GrantError::ServerError)?;
         Ok(Tokens { access, refresh })
     }
 

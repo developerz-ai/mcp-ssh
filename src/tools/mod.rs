@@ -6,14 +6,18 @@ use rmcp::{
     ErrorData as McpError, ServerHandler,
     handler::server::{common::RequestId, router::tool::ToolRouter, wrapper::Parameters},
     model::{CallToolResult, Content, ServerCapabilities, ServerInfo},
-    schemars, tool, tool_handler, tool_router,
+    tool, tool_handler, tool_router,
 };
 // `RequestId` above is rmcp's extractor for the per-call JSON-RPC request id.
 use tracing::Instrument;
 
 use crate::jobs::{JobId, JobState, JobStore, Page, RunResult};
 
+mod args;
 mod files;
+
+use args::{BashArgs, FileAction, FileArgs, JobAction, JobArgs};
+use files::{FileError, FileOutcome};
 
 #[derive(Clone)]
 pub struct Tools {
@@ -21,131 +25,6 @@ pub struct Tools {
     // Read by the rmcp `#[tool_handler]` macro; dead-code analysis can't see it.
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
-}
-
-// ---- bash ----
-
-#[derive(serde::Deserialize, schemars::JsonSchema)]
-pub struct BashArgs {
-    /// Shell command to run.
-    pub cmd: String,
-    /// Working directory (optional).
-    pub cwd: Option<String>,
-    /// Seconds to wait inline before backgrounding (default 2).
-    pub timeout: Option<u64>,
-    /// Background immediately and return a job id without waiting.
-    pub bg: Option<bool>,
-    /// Run in an interactive bash that sources `~/.bashrc` so aliases and
-    /// version managers (mise/nvm/rbenv) resolve. Default false (faster bare
-    /// `sh -c`); set true when the command needs the user's shell setup.
-    pub interactive: Option<bool>,
-    /// Short label for this job, e.g. "build-api" or "deploy check". It becomes
-    /// the job id prefix (`<title>-HH:MM:SS`) so you can tell your own jobs apart
-    /// in `job(action="list")`. Optional; omit and the id is `job-HH:MM:SS`.
-    pub title: Option<String>,
-}
-
-// ---- job ----
-
-// `#[schemars(inline)]`: emit this enum inline on the `action` property
-// (`{"type":"string","enum":[...]}`) instead of a `$ref` into `$defs`. Clients
-// (Claude Desktop, codex, n8n) routinely drop `$defs`, so a `$ref` enum resolves
-// to nothing — the model can't see it's a string and sends a garbage placeholder
-// (`null`, then `true`), which fails deserialization before dispatch. Inlining is
-// the documented fix (MCP python-sdk #1373: Literal inlines, Enum uses `$ref`).
-//
-// Variants also carry NO `///` doc comments on purpose: a doc'd unit enum renders
-// as `oneOf` of `{const, description}`, which the same clients mishandle. Bare
-// variants render a flat `enum`. Per-action docs live in the `job` tool
-// description and the `action` field below.
-#[derive(serde::Deserialize, schemars::JsonSchema, Default)]
-#[serde(rename_all = "snake_case")]
-#[schemars(inline)]
-pub enum JobAction {
-    Poll,
-    // Read-only and id-free, so it's the safe fallback when `action` arrives as a
-    // non-string placeholder or is absent — see `lenient_action`.
-    #[default]
-    List,
-    Kill,
-}
-
-/// Tolerate the malformed `action` clients still send despite the inlined schema:
-/// a literal `null`, a bare `true`, a number — anything non-string. Accept a valid
-/// string variant; coerce everything else (and an omitted key, via `#[serde(default)]`)
-/// to the read-only `list` default instead of dead-ending the whole call. `list`
-/// is safe to guess: it's id-free and has no side effects, so the model just gets
-/// the job list back and retries. Destructive `file` actions get no such fallback.
-fn lenient_action<'de, D>(de: D) -> Result<JobAction, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::Deserialize as _;
-    Ok(match Option::<serde_json::Value>::deserialize(de)? {
-        Some(serde_json::Value::String(s)) => match s.as_str() {
-            "poll" => JobAction::Poll,
-            "kill" => JobAction::Kill,
-            // "list" or any unknown string falls through to the safe default.
-            _ => JobAction::List,
-        },
-        // null, bool, number, object, or array — the client bug. Default safely.
-        _ => JobAction::List,
-    })
-}
-
-#[derive(serde::Deserialize, schemars::JsonSchema)]
-pub struct JobArgs {
-    /// What to do: poll, list, or kill. Defaults to list.
-    #[serde(default, deserialize_with = "lenient_action")]
-    pub action: JobAction,
-    /// [poll, kill] job id.
-    pub id: Option<String>,
-    /// [poll] how many of the newest lines to skip. 0 (default) returns the most
-    /// recent page; pass the previous response's next_cursor to page further back.
-    pub cursor: Option<usize>,
-    /// [poll] max lines to return (default 200).
-    pub limit: Option<usize>,
-}
-
-// ---- file ----
-
-// `#[schemars(inline)]` for the same reason as `JobAction`: keep the enum on the
-// `action` property instead of a `$ref` clients drop. No lenient fallback here —
-// `file` actions are destructive (delete/write/move) with no safe default, so a
-// malformed `action` must error rather than be guessed.
-#[derive(serde::Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-#[schemars(inline)]
-pub enum FileAction {
-    Read,
-    Write,
-    Append,
-    Delete,
-    List,
-    Grep,
-    Move,
-}
-
-#[derive(serde::Deserialize, schemars::JsonSchema)]
-pub struct FileArgs {
-    /// What to do.
-    pub action: FileAction,
-    /// [read, write, append, delete, list, grep] target path.
-    pub path: Option<String>,
-    /// [write, append] file content.
-    pub content: Option<String>,
-    /// [grep] pattern to search for.
-    pub pattern: Option<String>,
-    /// [list, grep] recurse into subdirectories.
-    pub recursive: Option<bool>,
-    /// [move] source path.
-    pub src: Option<String>,
-    /// [move] destination path.
-    pub dest: Option<String>,
-    /// [read] line offset to start from (default 0).
-    pub cursor: Option<usize>,
-    /// [read] max lines to return (default 200).
-    pub limit: Option<usize>,
 }
 
 #[tool_router]
@@ -278,41 +157,55 @@ impl Tools {
         async move {
             tracing::info!("dispatch");
             let recursive = args.recursive.unwrap_or(false);
+            // A missing argument bails right here: it's this adapter's own
+            // validation, not a file-op failure, so it never becomes a `FileError`.
             let result = match args.action {
-                FileAction::Read => match args.path {
-                    Some(p) => {
-                        files::read(&p, args.cursor.unwrap_or(0), args.limit.unwrap_or(200)).await
-                    }
-                    None => Err("read requires `path`".into()),
-                },
-                FileAction::Write => match (args.path, args.content) {
-                    (Some(p), Some(c)) => files::write(&p, &c).await,
-                    _ => Err("write requires `path` and `content`".into()),
-                },
-                FileAction::Append => match (args.path, args.content) {
-                    (Some(p), Some(c)) => files::append(&p, &c).await,
-                    _ => Err("append requires `path` and `content`".into()),
-                },
-                FileAction::Delete => match args.path {
-                    Some(p) => files::delete(&p).await,
-                    None => Err("delete requires `path`".into()),
-                },
-                FileAction::List => match args.path {
-                    Some(p) => files::list(&p, recursive).await,
-                    None => Err("list requires `path`".into()),
-                },
-                FileAction::Grep => match (args.pattern, args.path) {
-                    (Some(pat), Some(p)) => files::grep(&pat, &p, recursive).await,
-                    _ => Err("grep requires `pattern` and `path`".into()),
-                },
-                FileAction::Move => match (args.src, args.dest) {
-                    (Some(s), Some(d)) => files::rename(&s, &d).await,
-                    _ => Err("move requires `src` and `dest`".into()),
-                },
+                FileAction::Read => {
+                    let Some(p) = args.path else {
+                        return Ok(err("read requires `path`"));
+                    };
+                    files::read(&p, args.cursor.unwrap_or(0), args.limit.unwrap_or(200)).await
+                }
+                FileAction::Write => {
+                    let (Some(p), Some(c)) = (args.path, args.content) else {
+                        return Ok(err("write requires `path` and `content`"));
+                    };
+                    files::write(&p, &c).await
+                }
+                FileAction::Append => {
+                    let (Some(p), Some(c)) = (args.path, args.content) else {
+                        return Ok(err("append requires `path` and `content`"));
+                    };
+                    files::append(&p, &c).await
+                }
+                FileAction::Delete => {
+                    let Some(p) = args.path else {
+                        return Ok(err("delete requires `path`"));
+                    };
+                    files::delete(&p).await
+                }
+                FileAction::List => {
+                    let Some(p) = args.path else {
+                        return Ok(err("list requires `path`"));
+                    };
+                    files::list(&p, recursive).await
+                }
+                FileAction::Grep => {
+                    let (Some(pat), Some(p)) = (args.pattern, args.path) else {
+                        return Ok(err("grep requires `pattern` and `path`"));
+                    };
+                    files::grep(&pat, &p, recursive).await
+                }
+                FileAction::Move => {
+                    let (Some(s), Some(d)) = (args.src, args.dest) else {
+                        return Ok(err("move requires `src` and `dest`"));
+                    };
+                    files::rename(&s, &d).await
+                }
             };
             Ok(match result {
-                Ok(s) => ok(s),
-                Err(e) => err(e),
+                Ok(outcome) => ok(render_file(outcome)),
+                Err(e) => err(render_file_error(&e)),
             })
         }
         .instrument(tracing::info_span!("tool", tool = "file", %request_id))
@@ -340,6 +233,36 @@ fn ok(text: impl Into<String>) -> CallToolResult {
 
 fn err(text: impl Into<String>) -> CallToolResult {
     CallToolResult::error(vec![Content::text(text.into())])
+}
+
+/// The sentence a finished file op reads as. `files` returns facts; the wording
+/// belongs here with the rest of the presentation.
+fn render_file(outcome: FileOutcome) -> String {
+    match outcome {
+        FileOutcome::Output(text) => text,
+        // A marker, not a blank page: zero matches must stay distinguishable from
+        // grep matching an empty line.
+        FileOutcome::NoMatches => "[grep: no matches]".to_string(),
+        FileOutcome::Wrote { path, bytes } => format!("wrote {bytes} bytes to {path}"),
+        FileOutcome::Appended { path, bytes } => format!("appended {bytes} bytes to {path}"),
+        FileOutcome::Deleted { path } => format!("deleted {path}"),
+        FileOutcome::Moved { src, dest } => format!("moved {src} -> {dest}"),
+    }
+}
+
+/// The message a failed file op reads as, plus the next step only this layer can
+/// phrase — the hints name `file`'s own actions, which the domain doesn't know.
+fn render_file_error(e: &FileError) -> String {
+    match e {
+        FileError::IsDirectory { path } => {
+            format!("{path} is a directory — use file(action=\"list\", path=\"{path}\") instead")
+        }
+        FileError::DestinationExists { dest } => format!(
+            "destination exists: {dest} — delete it or choose another path (move won't overwrite)"
+        ),
+        // Nothing to add: an errno or a failed `ls`/`find`/`grep` already says it.
+        FileError::Io(_) | FileError::Shell(_) => e.to_string(),
+    }
 }
 
 fn render(state: &JobState, page: &Page) -> String {
@@ -471,6 +394,141 @@ mod tests {
             !required.contains(&"action"),
             "`action` must not be required once it has a default: {schema}"
         );
+    }
+
+    /// `FileArgs` with everything unset but `action` — each test fills only the
+    /// fields its own action needs.
+    fn file_args(action: FileAction) -> FileArgs {
+        FileArgs {
+            action,
+            path: None,
+            content: None,
+            pattern: None,
+            recursive: None,
+            src: None,
+            dest: None,
+            cursor: None,
+            limit: None,
+        }
+    }
+
+    /// The text a tool call handed back, plus whether it was flagged an error.
+    fn result_text(r: &CallToolResult) -> (String, bool) {
+        let text = r
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap_or_default();
+        (text, r.is_error.unwrap_or(false))
+    }
+
+    /// The agent-facing wording lives here in the adapter, not in `files` — the ops
+    /// return facts. Drive the real dispatch over both sides of that boundary: a
+    /// mutating op reads as its confirmation sentence, and a typed failure gains the
+    /// next-step hint only this layer can phrase (it names `file`'s own actions).
+    #[tokio::test]
+    async fn file_dispatch_renders_outcomes_and_next_step_hints() {
+        let tools = tools();
+        let req = || RequestId(NumberOrString::Number(7));
+        let dir = tempfile::tempdir().unwrap();
+        let path = |name: &str| dir.path().join(name).to_string_lossy().into_owned();
+        let call = async |args: FileArgs| {
+            let r = tools.file(Parameters(args), req()).await.unwrap();
+            result_text(&r)
+        };
+
+        let note = path("note.txt");
+        let (out, is_err) = call(FileArgs {
+            path: Some(note.clone()),
+            content: Some("hello".into()),
+            ..file_args(FileAction::Write)
+        })
+        .await;
+        assert_eq!(out, format!("wrote 5 bytes to {note}"));
+        assert!(!is_err, "a completed write is not an error result");
+
+        let moved = path("moved.txt");
+        let (out, _) = call(FileArgs {
+            src: Some(note.clone()),
+            dest: Some(moved.clone()),
+            ..file_args(FileAction::Move)
+        })
+        .await;
+        assert_eq!(out, format!("moved {note} -> {moved}"));
+
+        // Move onto an occupied path: the refusal keeps its "what to do instead".
+        call(FileArgs {
+            path: Some(note.clone()),
+            content: Some("again".into()),
+            ..file_args(FileAction::Write)
+        })
+        .await;
+        let (out, is_err) = call(FileArgs {
+            src: Some(note.clone()),
+            dest: Some(moved),
+            ..file_args(FileAction::Move)
+        })
+        .await;
+        assert!(
+            is_err && out.contains("destination exists") && out.contains("won't overwrite"),
+            "a clobbering move must explain the alternative: {out}"
+        );
+
+        // Reading a directory redirects to `list` — the hint names the tool surface,
+        // which is exactly why it belongs to the adapter and not to `files`.
+        let (out, is_err) = call(FileArgs {
+            path: Some(dir.path().to_string_lossy().into_owned()),
+            ..file_args(FileAction::Read)
+        })
+        .await;
+        assert!(
+            is_err && out.contains("is a directory") && out.contains("file(action=\"list\""),
+            "a directory read must redirect to list: {out}"
+        );
+
+        let (out, is_err) = call(FileArgs {
+            pattern: Some("nothing-matches-this".into()),
+            path: Some(note),
+            ..file_args(FileAction::Grep)
+        })
+        .await;
+        assert_eq!(out, "[grep: no matches]");
+        assert!(!is_err, "zero matches is a marked result, not an error");
+    }
+
+    /// A missing argument is this adapter's own validation, not a file-op failure:
+    /// it must come back as an error result naming the field, never reach `files`.
+    #[tokio::test]
+    async fn file_dispatch_rejects_missing_arguments() {
+        let tools = tools();
+        for (args, want) in [
+            (file_args(FileAction::Read), "read requires `path`"),
+            (
+                file_args(FileAction::Write),
+                "write requires `path` and `content`",
+            ),
+            (
+                file_args(FileAction::Append),
+                "append requires `path` and `content`",
+            ),
+            (file_args(FileAction::Delete), "delete requires `path`"),
+            (file_args(FileAction::List), "list requires `path`"),
+            (
+                file_args(FileAction::Grep),
+                "grep requires `pattern` and `path`",
+            ),
+            (
+                file_args(FileAction::Move),
+                "move requires `src` and `dest`",
+            ),
+        ] {
+            let r = tools
+                .file(Parameters(args), RequestId(NumberOrString::Number(1)))
+                .await
+                .unwrap();
+            assert_eq!(result_text(&r), (want.to_string(), true));
+        }
     }
 
     fn tools() -> Tools {
