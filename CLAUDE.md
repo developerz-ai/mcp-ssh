@@ -55,8 +55,8 @@ Keep this accurate — it's the navigation aid.
 | `src/cli.rs` | clap command definitions (`serve`/`set-auth`/`jobs`/`job kill`/`sessions`) |
 | `src/admin.rs` | local admin subcommands (`jobs`/`job kill`/`sessions`): read/act on the same SQLite through `jobs::JobRepo` — never builds a `JobStore` (that would start a reaper + reconcile and fail the live server's running rows); `job kill` only renders `jobs::kill_persisted`'s outcome, it owns no kill logic. Never prints token values |
 | `src/config.rs` | env + TOML file config; fails fast if auth creds missing. `db_path()` resolves the DB path alone for the cred-free admin commands |
-| `src/db.rs` | SQLite durable-state layer (`rusqlite`, `bundled`): the schema + forward-only migrations for OAuth `access_tokens`/`refresh_tokens` + registered `clients` (`client_id`→`redirect_uri`, no secrets) + job metadata + output tail; the queries themselves live in the repositories (`src/jobs/store.rs`, `src/oauth/store.rs`). DB at `/var/lib/mcp-ssh/mcp-ssh.db`, WAL, auto-created; one serialized connection driven via `spawn_blocking` |
-| `src/auth.rs` | HTTP Basic auth middleware |
+| `src/db.rs` | SQLite durable-state layer (`rusqlite`, `bundled`): the schema + forward-only migrations for OAuth `access_tokens`/`refresh_tokens` + registered `clients` (`client_id`→`redirect_uri`, no secrets) + output tail; the queries themselves live in the repositories (`src/jobs/store.rs`, `src/oauth/store.rs`). DB at `/var/lib/mcp-ssh/mcp-ssh.db`, WAL, auto-created; one serialized connection driven via `spawn_blocking` |
+| `src/auth.rs` | OAuth bearer validation for `/mcp`; HTTP Basic user login for `/authorize` only |
 | `src/oauth/` | minimal OAuth 2.1 server: discovery metadata, dynamic client registration, authorize + token with PKCE, bearer validation; tokens *and* client registrations persisted in SQLite (`src/db.rs`) so logins survive a restart; `/authorize` only issues a code to a `redirect_uri` the named `client_id` registered (exact match, else `invalid_request`); `sweep_expired_access`/`sweep_expired_refresh` bulk-delete dead rows (count only, never a token value) for the reaper to call |
 | `src/jobs/mod.rs` | job engine: run a command, return inline if fast (<2s) else a job id (or immediately when `bg`); live output streams to a per-job log file (polled paginated), metadata + output tail persisted to SQLite so history survives restarts; startup reconcile flips rows left `running` by a previous process to `failed` only once their persisted process group is really dead (a survivor stays `running`) |
 | `src/jobs/id.rs` | JobId newtype: human-readable ids — neutral `job` prefix + local `HH-MM-SS` (e.g., `job-23-30-07`); free of command text so secrets can't leak into an id, log line, or filename |
@@ -140,7 +140,7 @@ Non-negotiable: SOLID, SRP, tested code. The bar: idiomatic, boring, readable Ru
 | Config / env / required creds | `src/config.rs` |
 | SQLite connection, schema, migrations | `src/db.rs` |
 | Every `jobs` query (metadata, output tail, reconcile) | `src/jobs/store.rs` |
-| HTTP Basic auth | `src/auth.rs` |
+| OAuth bearer validation + Basic login | `src/auth.rs` |
 | OAuth 2.1 (discovery, registration, PKCE, bearer) | `src/oauth/` |
 | Running commands, backgrounding, job logs | `src/jobs/mod.rs` |
 | Reaper (DB + log-file cleanup) | `src/jobs/reaper.rs` |
