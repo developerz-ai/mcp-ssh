@@ -16,13 +16,15 @@ use tokio::sync::{Mutex, watch};
 mod id;
 mod log;
 mod reaper;
+mod signal;
 mod status;
 
 pub use id::JobId;
 use log::{DEFAULT_PAGE, read_page, read_page_tail};
 pub use log::{JobLogError, Page, paginate};
-pub(crate) use reaper::kill_group;
-use reaper::{group_alive, kill_job, spawn_reaper};
+use reaper::spawn_reaper;
+pub(crate) use signal::kill_group;
+use signal::{group_alive, kill_job};
 pub use status::JobStatus;
 
 /// Lines of a finished job's output snapshotted into the DB. Bounds the row so the

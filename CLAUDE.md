@@ -61,7 +61,8 @@ Keep this accurate — it's the navigation aid.
 | `src/jobs/mod.rs` | job engine: run a command, return inline if fast (<2s) else a job id (or immediately when `bg`); live output streams to a per-job log file (polled paginated), metadata + output tail persisted to SQLite so history survives restarts; startup reconcile flips rows left `running` by a previous process to `failed` only once their persisted process group is really dead (a survivor stays `running`) |
 | `src/jobs/id.rs` | JobId newtype: human-readable ids — neutral `job` prefix + local `HH-MM-SS` (e.g., `job-23-30-07`); free of command text so secrets can't leak into an id, log line, or filename |
 | `src/jobs/log.rs` | job log pagination: read per-job log files by page (cursor + limit) |
-| `src/jobs/reaper.rs` | reaper (startup + hourly): drops jobs >24h old (DB rows + log files, killing any still-`Running` group first), trims finished jobs' logs to a trailing tail (5000 lines <3h old, 500 after), mtime-ages orphaned files from a previous run, sweeps expired OAuth tokens (`src/oauth/store.rs`) on the same pass; process-group kill helpers (TERM→KILL escalation), shared with `job(action="kill")` and the `mcp-ssh job kill` CLI (`kill_group` by persisted pgid) plus the `group_alive` liveness probe the startup reconcile reuses |
+| `src/jobs/reaper.rs` | reaper (startup + hourly): drops jobs >24h old (DB rows + log files, killing any still-`Running` group first via `src/jobs/signal.rs`), trims finished jobs' logs to a trailing tail (5000 lines <3h old, 500 after), mtime-ages orphaned files from a previous run, sweeps expired OAuth tokens (`src/oauth/store.rs`) on the same pass |
+| `src/jobs/signal.rs` | process-group signalling: `kill_job`/`kill_group` (TERM→KILL escalation) shared by `job(action="kill")`, the `mcp-ssh job kill` CLI, and the reaper; `group_alive` liveness probe the startup reconcile and reaper's log-compaction gate also reuse |
 | `src/tools/mod.rs` | MCP tool surface (`#[tool_router]`/`#[tool]` from rmcp): 3 tools (`bash`/`job`/`file`) dispatching on `action`. Thin adapters over jobs + files |
 | `src/tools/files.rs` | file operations (`tokio::fs`; `ls`/`find`/`grep` shelled out) |
 | `src/tools/files/shell.rs` | bounded runner behind the shelled-out file ops: streams a child's combined output under a byte cap + wall-clock deadline, killing it on either |
@@ -138,7 +139,8 @@ Non-negotiable: SOLID, SRP, tested code. The bar: idiomatic, boring, readable Ru
 | HTTP Basic auth | `src/auth.rs` |
 | OAuth 2.1 (discovery, registration, PKCE, bearer) | `src/oauth/` |
 | Running commands, backgrounding, job logs | `src/jobs/mod.rs` |
-| Reaper (DB + log-file cleanup) + process-group kill helpers | `src/jobs/reaper.rs` |
+| Reaper (DB + log-file cleanup) | `src/jobs/reaper.rs` |
+| Process-group kill helpers | `src/jobs/signal.rs` |
 | Tool definitions / MCP surface | `src/tools/mod.rs` |
 | File operations | `src/tools/files.rs` |
 
