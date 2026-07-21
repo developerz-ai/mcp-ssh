@@ -72,6 +72,42 @@ async fn test_app_with_token() -> (Router, String) {
     (app, token)
 }
 
+/// `/healthz` is unauthenticated and returns a bare 200 — used by liveness probes.
+#[tokio::test]
+async fn healthz_returns_200_without_auth() {
+    let res = test_app()
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    assert_eq!(&bytes[..], b"ok");
+}
+
+/// `/healthz` being public must not weaken `/mcp`'s auth guard.
+#[tokio::test]
+async fn healthz_does_not_bypass_mcp_auth() {
+    let res = test_app()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header(header::HOST, "mcp.example.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
 #[tokio::test]
 async fn discovery_metadata_is_public() {
     let res = test_app()
