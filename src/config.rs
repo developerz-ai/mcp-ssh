@@ -413,8 +413,17 @@ mod tests {
         // env override, config-file value, and the bare default.
         let dir = tempdir().unwrap();
         let cfg_path = dir.path().join("config.toml");
+        // Seed a file-set db_path up front, so case 1 proves env *overrides* a
+        // configured value rather than merely filling a gap.
+        let file_cfg = FileConfig {
+            user: Some("test".into()),
+            pass: Some("test".into()),
+            db_path: Some("/tmp/file-set.db".into()),
+            ..Default::default()
+        };
+        std::fs::write(&cfg_path, toml::to_string_pretty(&file_cfg).unwrap()).unwrap();
 
-        // 1. Env-set: MCP_SSH_DB wins over everything.
+        // 1. Env-set: MCP_SSH_DB wins over everything, the file's db_path included.
         let env = MapEnv::new(&[
             ("MCP_SSH_CONFIG", cfg_path.to_str().unwrap()),
             ("MCP_SSH_DB", "/tmp/env-set.db"),
@@ -430,13 +439,6 @@ mod tests {
         );
 
         // 2. Config-file value: no env override, db_path comes from the TOML file.
-        let file_cfg = FileConfig {
-            user: Some("test".into()),
-            pass: Some("test".into()),
-            db_path: Some("/tmp/file-set.db".into()),
-            ..Default::default()
-        };
-        std::fs::write(&cfg_path, toml::to_string_pretty(&file_cfg).unwrap()).unwrap();
         let env = MapEnv::new(&[("MCP_SSH_CONFIG", cfg_path.to_str().unwrap())]);
         let admin_path = db_path_in(&env).expect("admin resolve");
         let server_path = Config::from_env(&env).expect("server load").db_path;
