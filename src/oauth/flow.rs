@@ -54,10 +54,15 @@ pub async fn authorize(
     }
 
     // Client binding (OAuth 2.1 §4.1.2.1): the code may only be delivered to a URI
-    // this client registered. Without it, a victim lured to an `/authorize` link
-    // carrying an attacker's `redirect_uri` + PKCE challenge hands their code to the
-    // attacker the moment they complete the Basic login. Unknown client or
-    // unregistered URI → 400 inline, never a redirect to the unbound URI.
+    // this client registered. Without it, an `/authorize` link naming a real
+    // `client_id` could carry an attacker's `redirect_uri` + PKCE challenge and hand
+    // the victim's code over the moment they complete the Basic login. Unknown client
+    // or unregistered URI → 400 inline, never a redirect to the unbound URI.
+    //
+    // Defense in depth, not a complete anti-phishing control: `/register` is
+    // unauthenticated (it bootstraps auth), so an attacker can still register their
+    // own id for their own callback and lure a victim to a self-consistent link. The
+    // Basic prompt is the last line of defense there.
     if !st
         .store
         .client_allows_redirect(&p.client_id, &p.redirect_uri)
