@@ -70,6 +70,66 @@ async fn oversized_no_newline_line_is_capped_not_slurped() {
 }
 
 #[tokio::test]
+async fn first_page_of_large_file_reports_lower_bound_not_a_full_scan() {
+    // Reading page 1 must not walk the whole file just to print an exact total: on a
+    // multi-GB log that would defeat the line cursor. Proof by count — the footer
+    // reports the page-sized lower bound (`≥ n`), never the file's true line count.
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("big.txt");
+    let mut body = String::new();
+    for i in 0..5000 {
+        body.push_str(&format!("line-{i:05}\n"));
+    }
+    tokio::fs::write(&p, &body).await.unwrap();
+
+    let out = read(p.to_str().unwrap(), 0, 10).await.unwrap();
+    assert!(
+        out.contains("line-00000") && out.contains("line-00009"),
+        "page 1 must hold the first window: {out}"
+    );
+    assert!(
+        !out.contains("line-00010"),
+        "page must stop at the window edge: {out}"
+    );
+    assert!(
+        out.contains("of ≥10") && out.contains("next_cursor=10"),
+        "early stop must report a lower-bound total: {out}"
+    );
+    assert!(
+        !out.contains("of 5000"),
+        "an exact total would mean the scan walked to EOF: {out}"
+    );
+}
+
+#[tokio::test]
+async fn later_pages_advance_and_the_final_page_ends_cleanly() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("multi.txt");
+    tokio::fs::write(&p, b"a\nb\nc\nd\ne\n").await.unwrap();
+    let p = p.to_str().unwrap();
+
+    // A middle page advances the cursor and still reports a lower bound (we stopped
+    // once the two-line window filled, before learning the true total).
+    let mid = read(p, 1, 2).await.unwrap();
+    assert!(
+        mid.contains('b') && mid.contains('c') && !mid.contains('d'),
+        "middle page holds its window: {mid}"
+    );
+    assert!(
+        mid.contains("of ≥3") && mid.contains("next_cursor=3"),
+        "middle page advances on a lower-bound total: {mid}"
+    );
+
+    // The last lines fit in the window, so the scan reaches EOF: exact end, no footer.
+    let last = read(p, 3, 10).await.unwrap();
+    assert_eq!(last, "d\ne", "final page is exact and carries no cursor");
+
+    // Reading past the end is an empty page, never a bogus cursor.
+    let past = read(p, 99, 10).await.unwrap();
+    assert_eq!(past, "", "past-EOF read is empty with no footer");
+}
+
+#[tokio::test]
 async fn grep_finds_match() {
     let dir = tempfile::tempdir().unwrap();
     let c = dir.path().join("c.txt");
@@ -184,6 +244,40 @@ async fn list_recursive_finds_nested_files() {
 }
 
 #[tokio::test]
+async fn list_recursive_is_depth_bounded() {
+    // A tree deeper than `MAX_FIND_DEPTH`: entries past the bound must not appear,
+    // so a pathologically deep tree can't drive `find` into an unbounded descent.
+    let dir = tempfile::tempdir().unwrap();
+
+    // Nest `path/d/d/.../d` several levels beyond the depth bound.
+    let mut deep = dir.path().to_path_buf();
+    for _ in 0..(MAX_FIND_DEPTH as usize + 5) {
+        deep = deep.join("d");
+    }
+    tokio::fs::create_dir_all(&deep).await.unwrap();
+    let buried = deep.join("buried.txt");
+    write(buried.to_str().unwrap(), "x").await.unwrap();
+
+    // A shallow file within the bound must still be listed.
+    let shallow = dir.path().join("shallow.txt");
+    write(shallow.to_str().unwrap(), "y").await.unwrap();
+
+    let out = list(dir.path().to_str().unwrap(), true).await.unwrap();
+    assert!(
+        !out.contains("truncated"),
+        "exclusion must be the depth bound, not the byte cap: {out}"
+    );
+    assert!(
+        out.contains("shallow.txt"),
+        "within-bound file must be listed: {out}"
+    );
+    assert!(
+        !out.contains("buried.txt"),
+        "file past maxdepth must not be listed: {out}"
+    );
+}
+
+#[tokio::test]
 async fn delete_directory_removes_entire_tree() {
     let dir = tempfile::tempdir().unwrap();
     let sub = dir.path().join("to_delete");
@@ -228,4 +322,123 @@ async fn binary_file_reads_as_lossy_utf8_not_error() {
     let content = result.unwrap();
     assert!(content.contains("hello"), "ASCII prefix should survive");
     assert!(content.contains("world"), "ASCII suffix should survive");
+}
+
+#[tokio::test]
+async fn move_onto_an_existing_dest_errs_and_leaves_both_files_intact() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src.txt");
+    let dst = dir.path().join("dst.txt");
+    let (src, dst) = (src.to_str().unwrap(), dst.to_str().unwrap());
+    write(src, "SRC").await.unwrap();
+    write(dst, "DST").await.unwrap();
+
+    let err = rename(src, dst).await.unwrap_err();
+    assert!(
+        err.contains("exists"),
+        "a clobbering move must error, not overwrite: {err}"
+    );
+    // Move is all-or-nothing: neither file is touched.
+    assert_eq!(read(src, 0, 10).await.unwrap(), "SRC", "source stays put");
+    assert_eq!(
+        read(dst, 0, 10).await.unwrap(),
+        "DST",
+        "destination is untouched"
+    );
+}
+
+#[tokio::test]
+async fn move_onto_a_free_path_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src.txt");
+    let dst = dir.path().join("free.txt");
+    let (src, dst) = (src.to_str().unwrap(), dst.to_str().unwrap());
+    write(src, "hello").await.unwrap();
+
+    rename(src, dst).await.unwrap();
+    assert!(
+        read(src, 0, 10).await.is_err(),
+        "source is gone after a move"
+    );
+    assert_eq!(
+        read(dst, 0, 10).await.unwrap(),
+        "hello",
+        "content lands at the free destination"
+    );
+}
+
+#[test]
+fn append_capped_marks_an_over_long_line_exactly_once() {
+    // Overflow the per-line cap, then feed more: the line seals with a single marker
+    // and the later bytes are dropped, never appended after it.
+    let mut line = Vec::new();
+    append_capped(&mut line, &vec![b'a'; MAX_READ_LINE_BYTES + 5_000]);
+    append_capped(&mut line, b"tail");
+
+    let s = String::from_utf8(line).expect("ASCII head + a valid-UTF-8 marker");
+    assert!(s.starts_with("aaa"), "the line's head survives");
+    assert!(
+        s.ends_with(LINE_TRUNCATED),
+        "an over-long line carries the truncation marker: …{}",
+        &s[s.len().saturating_sub(24)..]
+    );
+    assert_eq!(
+        s.matches(LINE_TRUNCATED).count(),
+        1,
+        "the marker is stamped exactly once"
+    );
+    assert!(
+        !s.contains("tail"),
+        "bytes past the seal are dropped, never appended after the marker"
+    );
+    assert!(
+        s.len() <= MAX_READ_LINE_BYTES + LINE_TRUNCATED.len(),
+        "the buffer stays bounded by the cap plus the marker"
+    );
+}
+
+#[test]
+fn append_capped_seals_when_the_cap_lands_in_a_run_of_continuation_bytes() {
+    // A binary `read` can straddle the cap with a long run of continuation bytes
+    // (0x80). The boundary walk-back is floored at 3, so the kept head can't
+    // collapse: the marker's bytes still push the line past the cap, the seal
+    // latches, and a second marker can never be stamped.
+    let mut bytes = vec![b'a'; MAX_READ_LINE_BYTES - 64];
+    bytes.extend_from_slice(&[0x80u8; 128]);
+
+    let mut line = Vec::new();
+    append_capped(&mut line, &bytes);
+    assert!(
+        line.len() > MAX_READ_LINE_BYTES,
+        "the first overflow must seal the line, got {} bytes",
+        line.len()
+    );
+
+    append_capped(&mut line, b"tail");
+    let s = String::from_utf8_lossy(&line);
+    assert_eq!(
+        s.matches(LINE_TRUNCATED).count(),
+        1,
+        "the marker is stamped exactly once, even on binary input"
+    );
+    assert!(!s.contains("tail"), "bytes past the seal are dropped");
+}
+
+#[test]
+fn append_capped_trims_a_split_multibyte_char_before_the_marker() {
+    // The cap falls in the middle of a 3-byte char (€ = E2 82 AC): the straddling
+    // char is dropped so the marker isn't preceded by a broken code point.
+    let mut bytes = vec![b'a'; MAX_READ_LINE_BYTES - 1];
+    bytes.extend_from_slice("€".as_bytes());
+    bytes.extend_from_slice(b"zzzz");
+
+    let mut line = Vec::new();
+    append_capped(&mut line, &bytes);
+
+    let s = String::from_utf8(line).expect("head trimmed to a boundary → clean UTF-8");
+    assert!(
+        s.ends_with(LINE_TRUNCATED) && !s.contains('€'),
+        "the split char is dropped, the marker stamped cleanly: …{}",
+        &s[s.len().saturating_sub(24)..]
+    );
 }

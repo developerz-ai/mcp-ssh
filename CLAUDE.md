@@ -64,6 +64,7 @@ Keep this accurate — it's the navigation aid.
 | `src/jobs/reaper.rs` | reaper (startup + hourly): drops jobs >24h old (DB rows + log files, killing any still-`Running` group first), trims finished jobs' logs to a trailing tail (5000 lines <3h old, 500 after), mtime-ages orphaned files from a previous run, marks jobs stuck `running` across a restart as failed; process-group kill helpers (TERM→KILL escalation), shared with `job(action="kill")` and the `mcp-ssh job kill` CLI (`kill_group` by persisted pgid) |
 | `src/tools/mod.rs` | MCP tool surface (`#[tool_router]`/`#[tool]` from rmcp): 3 tools (`bash`/`job`/`file`) dispatching on `action`. Thin adapters over jobs + files |
 | `src/tools/files.rs` | file operations (`tokio::fs`; `ls`/`find`/`grep` shelled out) |
+| `src/tools/files/shell.rs` | bounded runner behind the shelled-out file ops: streams a child's combined output under a byte cap + wall-clock deadline, killing it on either |
 
 Files ≤300 LOC. One responsibility per module (SRP). Split when a module grows a second reason to change.
 
