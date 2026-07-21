@@ -23,7 +23,7 @@ RUN apt-get update \
 COPY --from=builder /build/target/release/mcp-ssh /usr/bin/mcp-ssh
 # Never run as root: dedicated service user owning its job-log dir (config default).
 RUN useradd --system --no-create-home --shell /usr/sbin/nologin mcp-ssh \
-    && mkdir -p /var/lib/mcp-ssh/jobs \
+    && mkdir -p /var/lib/mcp-ssh/logs/jobs \
     && chown -R mcp-ssh:mcp-ssh /var/lib/mcp-ssh
 USER mcp-ssh
 EXPOSE 1337
