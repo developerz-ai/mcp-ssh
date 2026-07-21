@@ -126,6 +126,8 @@ impl Store {
 
     /// Mint and store a new access + refresh pair. Every call is independent, so
     /// concurrent clients accumulate distinct pairs that don't clobber each other.
+    /// Both rows commit together, so a half-written pair — an access token with no
+    /// refresh token, unrenewable and invisible to the client — is never left behind.
     async fn issue(&self) -> Result<Tokens, &'static str> {
         let access = random_token();
         let refresh = random_token();
@@ -134,15 +136,20 @@ impl Store {
         let (access_db, refresh_db) = (access.clone(), refresh.clone());
         self.db
             .call(move |conn| {
-                conn.execute(
+                // `unchecked_transaction` rather than `transaction`: `Db::call` hands
+                // out `&Connection`, and it holds the connection mutex for the whole
+                // closure, so the nesting `transaction`'s `&mut self` guards against
+                // can't happen. Dropping `tx` uncommitted rolls back.
+                let tx = conn.unchecked_transaction()?;
+                tx.execute(
                     "INSERT INTO access_tokens (token, expires_unix) VALUES (?1, ?2)",
                     (access_db, access_exp),
                 )?;
-                conn.execute(
+                tx.execute(
                     "INSERT INTO refresh_tokens (token, expires_unix) VALUES (?1, ?2)",
                     (refresh_db, refresh_exp),
                 )?;
-                Ok(())
+                tx.commit()
             })
             .await
             .map_err(|_| "server_error")?;
@@ -303,6 +310,48 @@ mod tests {
         let tokens = store.redeem(&code, VERIFIER, "http://cb").await.unwrap();
         assert!(store.validate(&tokens.access).await);
         assert!(!store.validate("nope").await);
+    }
+
+    #[tokio::test]
+    async fn issue_commits_both_rows_of_a_pair() {
+        let store = store();
+        mint(&store).await;
+
+        assert_eq!(
+            row_count(&store.db, "access_tokens").await,
+            1,
+            "the access row is committed"
+        );
+        assert_eq!(
+            row_count(&store.db, "refresh_tokens").await,
+            1,
+            "and its refresh row with it — a pair is never half-written"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_refresh_insert_rolls_the_access_row_back() {
+        let store = store();
+        // Make the second INSERT fail. Without one transaction the first INSERT
+        // would already be committed, leaving an orphan access token that can
+        // never be refreshed — and that the caller never learns about.
+        store
+            .db
+            .call(|conn| conn.execute("DROP TABLE refresh_tokens", []))
+            .await
+            .unwrap();
+
+        let code = store.new_code(CHALLENGE.into(), "http://cb".into()).await;
+        assert!(
+            store.redeem(&code, VERIFIER, "http://cb").await.is_err(),
+            "a pair that can't be stored must not be handed out"
+        );
+
+        assert_eq!(
+            row_count(&store.db, "access_tokens").await,
+            0,
+            "the access row must roll back with the failed refresh insert"
+        );
     }
 
     #[tokio::test]
