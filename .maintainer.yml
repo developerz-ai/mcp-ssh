@@ -1,0 +1,48 @@
+# yaml-language-server: $schema=https://developerz.ai/schemas/maintainer.v1.json
+# developerz.ai maintainer policy — developerz-ai/mcp-ssh
+#
+# Dogfood pass: a maintained-by-bot Rust crate in the developerz-ai org.
+# Mirrors developerz-ai/wurk's posture (the working OSS-dogfood template) with
+# Rust/MCP-server deltas — no Ruby/Bundler-specific triage assumptions, and
+# `release` defaults to release-please per the schema. Triage the way the bot
+# triages every other free-OSS repo on this account: qualify → label → ask
+# reporter → handoff to coding fleet over the webhook sink.
+#
+# Caveat (issue #1047 / #1046): this repo is owned by the developerz-ai org,
+# so it lands on the SAME shared enterprise-tier account as `wurk` and cannot,
+# by itself, dogfood the `oss_verified` free-tier loop. The free-OSS auto-merge
+# gate (`enforceAutoMergeTierGate`, packages/policy/src/tier-gate.ts) refuses
+# here regardless of `auto_merge`; setting it explicitly is a no-op override
+# on this account and only forces OFF on a tier change. So this file is the
+# "everything's wired, dogfood the maintainer loop" form, not the
+# `oss_verified` form — that lands with a real OSS-org-owned repo.
+version: 1
+
+tone:
+  voice: friendly
+  language: en
+
+triage:
+  ask_for_repro: true
+  required_fields: [steps, expected, actual, version]
+  qualify_into: [bug, feature, dupe, question]
+  # Same dogfood threshold as wurk — a moderately-scoped plan hands off to the
+  # coding fleet instead of escalating for review, exercising the handoff loop.
+  confidence_threshold: 0.4
+
+handoff:
+  mode: webhook
+  ask_reporter_first: false
+
+pr:
+  wait_for_other_bots: [coderabbit, copilot]
+  # `auto_merge` left unset — the enterprise-tier account it lands on refuses
+  # free-OSS auto-merge regardless (see caveat above + the schema's tier gate).
+  # Setting it here is a deliberate no-op on this account, not a promise.
+
+escalate:
+  always: [security, license, cla]
+  ask_before_acting: [breaking_change, major_dep_bump, first_time_contributor, large_pr]
+
+limits:
+  max_comments_per_issue_per_day: 10
