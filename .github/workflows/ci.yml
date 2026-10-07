@@ -16,7 +16,8 @@ env:
 
 jobs:
   fmt:
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    # GitHub-hosted runner (org rule: private repos on Ubicloud, public on GitHub-hosted).
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -26,28 +27,28 @@ jobs:
       - run: cargo fmt --check
 
   check:
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - uses: useblacksmith/rust-cache@v3
+      - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
   release:
     needs: [fmt, check]
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: useblacksmith/rust-cache@v3
+      - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deb
@@ -59,7 +60,7 @@ jobs:
   docker:
     needs: [fmt, check]
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: read
