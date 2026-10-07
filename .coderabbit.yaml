@@ -116,7 +116,7 @@ reviews:
     # CI
     - path: ".github/workflows/**"
       instructions: |
-        Runner: blacksmith-2vcpu-ubuntu-2404. Pin actions to major versions.
+        Runner: ubuntu-latest (public repo: GitHub-hosted). Pin actions to major versions.
         Required jobs: fmt, clippy (-D warnings), test.
 
     # Dockerfile
