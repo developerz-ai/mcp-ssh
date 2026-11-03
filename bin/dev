@@ -15,8 +15,39 @@ if [ -f .env ]; then
   set +a
 fi
 
-if command -v cargo-watch >/dev/null 2>&1; then
-  exec cargo watch -x 'run -- serve'
-else
-  exec cargo run -- serve
+# One launcher per checkout; keep the lock until the entire dev group exits.
+mkdir -p .local
+exec 9>.local/dev.lock
+if ! flock -n 9; then
+  echo 'error: bin/dev is already running in this checkout' >&2
+  exit 1
 fi
+rm -f .local/dev.pid
+
+if command -v cargo-watch >/dev/null 2>&1; then
+  command=(cargo watch -x 'run -- serve')
+else
+  command=(cargo run -- serve)
+fi
+
+# A private session includes cargo-watch, cargo, the server and its children.
+# Record the kernel birth time as well as PID so a stale file cannot kill a
+# process that later reused the same PID. Publish only after setsid completes.
+setsid bash -c '
+  set -euo pipefail
+  stat=$(< /proc/$$/stat)
+  read -ra fields <<< "${stat##*) }"
+  printf "%s %s\n" "$$" "${fields[19]}" > .local/dev.pid.tmp
+  mv .local/dev.pid.tmp .local/dev.pid
+  exec "$@"
+' dev "${command[@]}" &
+child=$!
+trap 'kill -TERM -- "-$child" 2>/dev/null || true' INT TERM
+trap 'rm -f .local/dev.pid .local/dev.pid.tmp' EXIT
+status=0
+wait "$child" || status=$?
+# wait can be interrupted by our signal trap before the child exits.
+if kill -0 "$child" 2>/dev/null; then
+  wait "$child" || status=$?
+fi
+exit "$status"

@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""Regression guard: dev shutdown must never target another checkout."""
+import os
+from pathlib import Path
+import shutil
+import signal
+import subprocess
+import tempfile
+import time
+import unittest
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+class DevLifecycle(unittest.TestCase):
+    def test_checkout_isolation_and_stale_record(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            home = base / "home"
+            cargo_bin = home / ".cargo/bin"
+            cargo_bin.mkdir(parents=True)
+            fake = cargo_bin / "cargo-watch"
+            fake.write_text("#!/bin/sh\nsleep 300 &\necho $! > .local/child.pid\nwait\n")
+            fake.chmod(0o755)
+            shutil.copy2(fake, cargo_bin / "cargo")
+            env = dict(os.environ, HOME=str(home))
+            processes = []
+            groups = []
+            try:
+                for name in ("first", "second"):
+                    checkout = base / name
+                    (checkout / "bin").mkdir(parents=True)
+                    for script in ("dev", "stop"):
+                        shutil.copy2(ROOT / "bin" / script, checkout / "bin" / script)
+                    process = subprocess.Popen(
+                        ["bash", "bin/dev"], cwd=checkout, env=env,
+                        start_new_session=True,
+                    )
+                    processes.append(process)
+                    record = checkout / ".local/dev.pid"
+                    self.wait_for(lambda: record.exists(), "dev did not record its group")
+                    pid, started = record.read_text().split()
+                    groups.append(int(pid))
+                    self.wait_for(lambda: (checkout / ".local/child.pid").exists(),
+                                  "fake server did not start")
+                first, second = base / "first", base / "second"
+                # A second launcher must not replace the live group's identity.
+                duplicate = subprocess.run(["bash", "bin/dev"], cwd=first, env=env)
+                self.assertNotEqual(duplicate.returncode, 0)
+                self.assertEqual(int((first / ".local/dev.pid").read_text().split()[0]),
+                                 groups[0])
+                subprocess.run(["bash", "bin/stop"], cwd=first, check=True)
+                processes[0].wait(timeout=5)
+                self.assertIsNone(processes[1].poll(), "other checkout was stopped")
+                os.kill(groups[1], 0)
+                child = int((first / ".local/child.pid").read_text())
+                self.wait_for(lambda: self.dead(child), "server child survived shutdown")
+                # A recycled PID with a mismatched birth time must not be signalled.
+                (first / ".local/dev.pid").write_text(f"{groups[1]} 0\n")
+                subprocess.run(["bash", "bin/stop"], cwd=first, check=True)
+                self.assertIsNone(processes[1].poll())
+                os.kill(groups[1], 0)
+                subprocess.run(["bash", "bin/stop"], cwd=second, check=True)
+                processes[1].wait(timeout=5)
+                subprocess.run(["bash", "bin/stop"], cwd=second, check=True)
+            finally:
+                for group in groups + [p.pid for p in processes]:
+                    try:
+                        os.killpg(group, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                for process in processes:
+                    process.wait(timeout=5)
+
+    @staticmethod
+    def dead(pid):
+        try:
+            return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z"
+        except FileNotFoundError:
+            return True
+
+    def wait_for(self, predicate, message):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(0.02)
+        self.fail(message)
+
+
+if __name__ == "__main__":
+    unittest.main()

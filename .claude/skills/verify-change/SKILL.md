@@ -16,13 +16,14 @@ passes it locally passes everywhere.
 | Step | Command | What it is |
 |------|---------|------------|
 | install | `bin/setup` | export PATH="$HOME/.cargo/bin:$PATH"; { dpkg -s coreutils findutils grep curl openssl >/dev/null 2>&1 \|\| { sudo -n apt-get update && sudo -n apt-get install -y --no-install-recommends coreutils findutils grep curl openssl; }; }; { command -v rustup >/dev/null 2>&1 \|\| curl -sSf https://sh.rustup.rs \| sh -s -- -y --default-toolchain stable --profile minimal; } && cargo build |
-| run | `bin/dev` | export PATH="$HOME/.cargo/bin:$PATH"; if [ -f .env ]; then set -a; . ./.env; set +a; fi; command -v cargo-watch >/dev/null 2>&1 && cargo watch -x "run -- serve" \|\| cargo run -- serve — on developerz.ai runs, start it with code_bash_background when you need a running stack |
+| run | `bin/dev` | Loads `.env`, starts cargo-watch (or cargo) in a private process group, and records its PID + kernel birth time in `.local/dev.pid`; a checkout-local lock prevents duplicate launchers. Requires Linux `/proc`, `setsid` and `flock` (util-linux). On developerz.ai runs, start it with code_bash_background when you need a running stack |
 | prove | `bin/check` | export PATH="$HOME/.cargo/bin:$PATH"; cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test |
-| stop | `bin/stop` | pkill -f 'target/[d]ebug/mcp-ssh serve' 2>/dev/null \|\| true; pkill -f 'target/[r]elease/mcp-ssh serve' 2>/dev/null \|\| true; exit 0 — on developerz.ai runs, the platform runs this when your session ends — do not stop the stack yourself |
+| stop | `bin/stop` | Signals only the recorded dev process group after checking its kernel birth time and group/session identity; missing or stale records are no-ops. Never use host-wide process-name matching. On developerz.ai runs, the platform runs this when your session ends — do not stop the stack yourself |
 
 ## Rules
 
 - Run every command from the repo root — the scripts `cd` there themselves.
+- Changed `bin/dev` or `bin/stop`? Run `python3 bin/test-dev-lifecycle` (Python 3 required) to prove checkout isolation, descendant shutdown, duplicate-launch rejection, and stale-PID safety before the full gate.
 - `bin/check` red is not a pull request. Fix the cause, never silence the gate.
 
 ## Exit codes `bin/check` must use
