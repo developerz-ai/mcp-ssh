@@ -3,6 +3,11 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# rustup provides the toolchain this repo pins (rust-toolchain.toml). A mise
+# shim for cargo may sit earlier on PATH and fail with "No version is set for
+# shim" — put ~/.cargo/bin first.
+export PATH="$HOME/.cargo/bin:$PATH"
+
 if [ -f .env ]; then
   set -a
   # shellcheck disable=SC1091

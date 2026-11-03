@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+cd "$(dirname "$0")/.."
+
+# rustup provides the toolchain this repo pins (rust-toolchain.toml: stable +
+# rustfmt/clippy). A mise shim for cargo may sit earlier on PATH and fail with
+# "No version is set for shim" — put ~/.cargo/bin first.
+export PATH="$HOME/.cargo/bin:$PATH"
+
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
