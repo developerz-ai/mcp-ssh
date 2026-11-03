@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Regression guard: dev shutdown must never target another checkout."""
+"""Regression guards for the bin/dev + bin/stop lifecycle: shutdown must never
+target another checkout, and dev.lock must never wedge behind a descendant."""
 import os
 from pathlib import Path
 import shutil
@@ -71,6 +72,89 @@ class DevLifecycle(unittest.TestCase):
                         pass
                 for process in processes:
                     process.wait(timeout=5)
+
+    def test_detached_descendant_releases_lock(self):
+        # A descendant that setsid's out of the dev group outlives a launcher
+        # shutdown. It must not inherit lock FD 9, or it keeps dev.lock held
+        # while dev.pid is gone and blocks every new bin/dev launch.
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            home = base / "home"
+            cargo_bin = home / ".cargo/bin"
+            cargo_bin.mkdir(parents=True)
+            fake = cargo_bin / "cargo-watch"
+            fake.write_text(
+                "#!/bin/sh\n"
+                "setsid sleep 300 &\n"
+                "echo $! > \".local/detached-$$.pid\"\n"
+                "sleep 300 &\n"
+                "echo $! > .local/child.pid\n"
+                "wait\n"
+            )
+            fake.chmod(0o755)
+            shutil.copy2(fake, cargo_bin / "cargo")
+            env = dict(os.environ, HOME=str(home))
+            checkout = base / "checkout"
+            (checkout / "bin").mkdir(parents=True)
+            for script in ("dev", "stop"):
+                shutil.copy2(ROOT / "bin" / script, checkout / "bin" / script)
+            record = checkout / ".local/dev.pid"
+            launcher = subprocess.Popen(
+                ["bash", "bin/dev"], cwd=checkout, env=env,
+                start_new_session=True,
+            )
+            second = None
+            detached_pids = []
+            try:
+                self.wait_for(lambda: record.exists(), "dev did not record its group")
+                first_group = int(record.read_text().split()[0])
+                self.wait_for(
+                    lambda: bool(detached_pids or list(checkout.glob(".local/detached-*.pid"))),
+                    "fake workload did not spawn a detached descendant",
+                )
+                if not detached_pids:
+                    detached_pids.append(
+                        int(next(checkout.glob(".local/detached-*.pid")).read_text()))
+                # TERM only the launcher: its trap kills the dev group, while
+                # the setsid'd descendant escapes it.
+                launcher.send_signal(signal.SIGTERM)
+                launcher.wait(timeout=5)
+                self.wait_for(lambda: not record.exists(),
+                              "dev.pid survived the launcher")
+                self.assertFalse(self.dead(detached_pids[0]),
+                                 "descendant did not outlive the shutdown")
+                # The survivor must not hold dev.lock: a new launcher starts
+                # even though the detached descendant is still alive.
+                second = subprocess.Popen(
+                    ["bash", "bin/dev"], cwd=checkout, env=env,
+                    start_new_session=True,
+                )
+                self.wait_for(
+                    lambda: record.exists()
+                    and int(record.read_text().split()[0]) != first_group,
+                    "surviving detached descendant kept dev.lock held",
+                )
+            finally:
+                for pid_file in checkout.glob(".local/detached-*.pid"):
+                    try:
+                        detached_pids.append(int(pid_file.read_text()))
+                    except ValueError:
+                        pass
+                for group in (launcher.pid, second.pid if second else None):
+                    if group is None:
+                        continue
+                    try:
+                        os.killpg(group, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                for pid in detached_pids:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                for process in (launcher, second):
+                    if process is not None:
+                        process.wait(timeout=5)
 
     @staticmethod
     def dead(pid):

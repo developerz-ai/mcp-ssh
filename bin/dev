@@ -15,7 +15,9 @@ if [ -f .env ]; then
   set +a
 fi
 
-# One launcher per checkout; keep the lock until the entire dev group exits.
+# One launcher per checkout. The launcher process alone holds the lock: the
+# workload child drops FD 9 below, so a descendant that outlives a
+# hard-killed launcher cannot keep dev.lock held while dev.pid is gone.
 mkdir -p .local
 exec 9>.local/dev.lock
 if ! flock -n 9; then
@@ -39,6 +41,9 @@ setsid bash -c '
   read -ra fields <<< "${stat##*) }"
   printf "%s %s\n" "$$" "${fields[19]}" > .local/dev.pid.tmp
   mv .local/dev.pid.tmp .local/dev.pid
+  # The launcher alone owns dev.lock: drop the inherited FD 9 so neither this
+  # exec nor any detached descendant can hold the lock past the launcher.
+  exec 9>&-
   exec "$@"
 ' dev "${command[@]}" &
 child=$!
