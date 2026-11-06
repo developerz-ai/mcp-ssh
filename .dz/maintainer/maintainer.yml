@@ -1,0 +1,108 @@
+# .dz/maintainer/maintainer.yml — how the developerz.ai maintainer agent may act on developerz-ai/mcp-ssh.
+# Proposed by dz-runner setup mode; MERGING this pull request is the opt-in.
+#
+# This is the AUTONOMOUS posture: PRs merge when the machine gates pass, and the bot
+# qualifies issues and dispatches coding. Releases follow the `release:` block below.
+# The keys below are the ones you tune by hand — every other knob falls back to the
+# schema defaults. Full reference: https://developerz.ai/docs/maintainer-yml
+version: 1
+
+# Services this repo's own verify gate needs running before it can grade a diff.
+# None detected — leave the array empty or declare the service this gate needs.
+services: []
+
+# handoff: coding dispatches to the developerz fleet (BYOVM). `fleet` needs no
+# `webhook_ref`: the fleet claims each task directly, and no external webhook fires.
+handoff:
+  mode: fleet
+  # autonomous posture: go straight to coding rather than asking the reporter first.
+  ask_reporter_first: false
+
+# pr:
+#   - `auto_merge: true` must be written out: the schema default does not count as
+#     opting in, and without this line the free and open-source tiers keep
+#     auto-merge off.
+#   - `auto_merge_scope: own_and_dependency_bots`: auto-merge covers the pull requests
+#     the bot opened plus Dependabot and Renovate; a person still merges their own.
+#     `any` widens it to every author.
+#   - `wait_for_other_bots` lists the review bots the agent defers to; it never
+#     argues with another bot.
+#   - `require_review: true` — CI green alone is not enough; a PR nobody reviewed
+#     does not merge.
+#   - `large_threshold_lines` is sized from this repo's own history: 90% of its last 57 merged changes were 1,140 lines or fewer. It holds a pull request above it only if you list `large_pr` under `escalate.ask_before_acting`.
+pr:
+  auto_merge: true
+  auto_merge_scope: own_and_dependency_bots
+  wait_for_other_bots: [coderabbit, copilot]
+  require_review: true
+  large_threshold_lines: 1200
+  # Close a contributor pull request that has waited on its author this long, after
+  # two reminders. false turns it off. See /docs/stale-work.
+  close_awaiting_author_after_days: 21
+  # On the 1st of each month, close a pull request with no activity this long.
+  # false turns it off. See /docs/maintainer-yml.
+  close_inactive_after_days: 90
+
+# release: derived from the detected mechanism. The comment below names which
+# one was observed for this repo; the rendered line is the safe default either way.
+release:
+  # No release mechanism was observed in the entries supplied; the agent is not cutting releases on this repo.
+  manager: none
+  channels: []
+
+# review: the developerz.ai reviewer, alongside any review bot already installed.
+# `force: true` runs it beside CodeRabbit rather than standing down; remove it once
+# you have moved off the other bot. `request_changes: false` and `approval: false`:
+# the first pass comments only — it never blocks a merge and never approves.
+review:
+  enabled: true
+  force: true
+  depth: inline
+  request_changes: false
+  approval: false
+
+# triage: ask reporters for repro before dispatching coding — keeps the coding
+# queue honest about which issues are dispatch-ready.
+triage:
+  ask_for_repro: true
+  # Close a report whose repro request the reporter never answered, after one
+  # reminder. false turns it off. See /docs/stale-work.
+  close_unanswered_repro_after_days: 14
+  # On the 1st of each month, close an issue with no activity this long.
+  # false turns it off. See /docs/maintainer-yml.
+  close_inactive_after_days: 90
+
+# escalate: what stays with a human.
+#   - `always` is the schema default, written out so you can see it.
+#   - `ask_before_acting` is empty by default: no pull request waits on a human
+#     ack. Write categories (e.g. [large_pr, breaking_change]) to opt in.
+#     `pr.human_merge` paths still hold; security, license and CLA still escalate.
+escalate:
+  always: [hostile_tone, direct_mention]
+
+# scout: the platform's daily survey of this repo files only what is already BROKEN
+# (red CI, failing tests, a security advisory, a broken build or link) — never an
+# improvement idea. `full` lets it file ideas too; `off` stops the survey.
+scout:
+  survey: broken_only
+
+# Proactive checkups, each a scout reading a brief you commit. Off by default: the
+# platform maintains this repo, it does not hunt for improvements. Uncomment `schedules:`
+# and the entries you want (drop the leading `# ` on each line) to run them weekly.
+# schedules:
+#   # A weekly hygiene checkup: resource leaks, slow algorithms, duplicated helpers and
+#   # indexes, docs that drifted from the code, oversized or dead code. It reads the
+#   # brief at .dz/schedules/hygiene.md — edit that file to steer it, delete this entry to stop it.
+#   # It runs on your boxes and your key, and files what it finds as asks.
+#   - name: hygiene
+#     days: [sun]
+#     hours_utc: [23]
+#     brief_file: .dz/schedules/hygiene.md
+#   # A weekly devops checkup: a score on five axes (reliable, secure, fast, efficient,
+#   # cheap) and a list of findings, each with its evidence. It reads the brief at
+#   # .dz/schedules/devops.md — edit that file to steer it, delete this entry to stop it.
+#   # It runs on your boxes and your key, and files what it finds as asks.
+#   - name: devops
+#     days: [sat]
+#     hours_utc: [11]
+#     brief_file: .dz/schedules/devops.md
