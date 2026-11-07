@@ -63,7 +63,7 @@ regex = "1"
 # error tracking → GlitchTip (Sentry-protocol). rustls transport, never
 # native-tls: `default-features = false` drops `native-tls` + `debug-images`
 # (both default). Re-enable only error-tracking integrations + reqwest/rustls.
-sentry = { version = "0.48", default-features = false, features = [
+sentry = { version = "0.49", default-features = false, features = [
     "reqwest",
     "rustls",
     "backtrace",
