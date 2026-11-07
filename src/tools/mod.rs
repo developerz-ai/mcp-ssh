@@ -5,7 +5,7 @@
 use rmcp::{
     ErrorData as McpError, ServerHandler,
     handler::server::{common::RequestId, router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, Content, ServerCapabilities, ServerInfo},
+    model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo},
     tool, tool_handler, tool_router,
 };
 // `RequestId` above is rmcp's extractor for the per-call JSON-RPC request id.
@@ -228,11 +228,11 @@ impl ServerHandler for Tools {
 // ---- helpers ----
 
 fn ok(text: impl Into<String>) -> CallToolResult {
-    CallToolResult::success(vec![Content::text(text.into())])
+    CallToolResult::success(vec![ContentBlock::text(text.into())])
 }
 
 fn err(text: impl Into<String>) -> CallToolResult {
-    CallToolResult::error(vec![Content::text(text.into())])
+    CallToolResult::error(vec![ContentBlock::text(text.into())])
 }
 
 /// The sentence a finished file op reads as. `files` returns facts; the wording
