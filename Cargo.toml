@@ -41,11 +41,11 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 
 # cli + config
 clap = { version = "4", features = ["derive"] }
-toml = "0.8"
+toml = "1.1"
 rpassword = "7"
 
 # auth (opaque tokens + PKCE S256 — no JWT/JWKS needed)
-base64 = "0.22"
+base64 = "0.23"
 sha2 = "0.10"
 rand = "0.8"
 urlencoding = "2"

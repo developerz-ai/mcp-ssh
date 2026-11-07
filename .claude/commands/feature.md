@@ -1,7 +1,7 @@
 ---
 description: End-to-end feature/bug-sweep workflow for mcp-ssh — understand, diagnose against the deployed service, explore in parallel, split into path-disjoint slices, build with parallel agents in this one checkout (no worktrees), gate with bin/check, PR, sequential squash-merge, release via tag → .deb + GHCR. Tracks in GitHub issues. Reads intent from the prompt.
 argument-hint: <what you want built or fixed, plain language> [+ reference URL(s)]
-allowed-tools: Read, Write, Edit, Glob, Grep, Bash, Agent, Task, SendMessage, TaskCreate, TaskUpdate, TaskList, Skill, WebFetch, mcp__codegraph, mcp__glitchtip
+allowed-tools: Read, Write, Edit, Glob, Grep, Bash, Agent, Task, SendMessage, TaskCreate, TaskUpdate, TaskList, Skill, WebFetch, mcp__codegraph, mcp__sentry-mcp
 ---
 
 # /feature
@@ -64,7 +64,7 @@ Whole-crate green is the coordinator's, once, **in the background**, after every
 2. **Distrust the paperwork.** Check `docs/architecture.md`, `docs/plans/**/status.yml`, the module map against the code *before* planning off it. Live example: `CLAUDE.md`, `/planx` and `/implement` all say integration tests live in `tests/` — **`tests/` is empty**; every test is colocated `#[cfg(test)]` (plus `src/app_tests.rs`, `src/tools/files/tests.rs`). Brief an agent off that line and it writes a file nothing runs. `git log` the area first. State which claims you falsified.
 
 3. **Diagnose against the deployed service — early, not at the end.** Evidence beats reasoning, costs one command. Read-only:
-   - **GlitchTip** (`mcp__glitchtip`, per `.mcp.json`) — wired in `src/sentry.rs`; an issue usually names the module and release. Events are credential-scrubbed: `***REDACTED***` means *scrubbed*, not empty.
+   - **GlitchTip** (`mcp__sentry-mcp`, per `.mcp.json`) — wired in `src/sentry.rs`; an issue usually names the module and release. Events are credential-scrubbed: `***REDACTED***` means *scrubbed*, not empty.
    - On a host you have: `systemctl status mcp-ssh`, `journalctl -u mcp-ssh -n 200`, `mcp-ssh jobs --all`, `mcp-ssh sessions`, `curl -fsS http://127.0.0.1:1337/.well-known/oauth-authorization-server`. (`mcp-ssh job kill` is **not** read-only.)
    - Locally: `bin/dev`, `bin/mcp-token` for a bearer, drive `/mcp` with a real client.
 
