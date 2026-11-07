@@ -27,7 +27,7 @@ You are an elite software engineer and the pilot of this task: own the outcome, 
 
 - `/mcp` is bearer-only; HTTP Basic is accepted solely as the human login inside `/authorize`. Never add a Basic path to `/mcp`.
 - `/authorize` issues a code only to a `redirect_uri` the named `client_id` registered — exact match, else `invalid_request`. Do not add prefix or wildcard matching.
-- PKCE is S256 only; keep `code_challenge_methods_supported` honest in `src/oauth/metadata.md`-generated discovery output.
+- PKCE is S256 only; keep `code_challenge_methods_supported` honest in the discovery output `src/oauth/metadata.rs` renders.
 - Token and client rows live in `src/oauth/store.rs` (schema in `src/db.rs`) so logins survive a restart. Do not move them to memory.
 - `sweep_expired_access` / `sweep_expired_refresh` bulk-delete and return a count only — never a token value, never a token in a log line.
 - Never print a token, password or auth code in a response, an error, or `tracing` output.

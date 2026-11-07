@@ -9,7 +9,10 @@ applies: [rust]
 2. Confirm it is up: `curl -fsS http://127.0.0.1:1337/.well-known/oauth-authorization-server`.
 3. Credentials come from `.env` (`MCP_SSH_USER` / `MCP_SSH_PASS`) or the environment — `bin/mcp-token` sources `.env` itself. It errors `set MCP_SSH_USER (or put it in .env)` if neither is set.
 4. Mint the token: `bin/mcp-token` → prints the access token to stdout. Override the base URL with `MCP_SSH_URL` when the server is not on the local bind.
-5. Use it: `claude mcp add --transport http mcp-ssh http://localhost:1337/mcp --header "Authorization: Bearer $(bin/mcp-token)"`.
+5. Use it without a token on any command line — `--header "Authorization: Bearer $(bin/mcp-token)"` puts the minted token in `claude`'s argv and the process list, the same exposure step 6 forbids for the password. Put the *variable name* in the header instead:
+   `export MCP_SSH_TOKEN="$(bin/mcp-token)"` (a shell builtin — nothing is exec'd), then
+   `claude mcp add-json --scope local mcp-ssh '{"type":"http","url":"http://localhost:1337/mcp","headers":{"Authorization":"Bearer ${MCP_SSH_TOKEN}"}}'`.
+   The client stores `Bearer ${MCP_SSH_TOKEN}` verbatim (confirm with `claude mcp get mcp-ssh`) and expands it from the environment when it connects, so the variable has to be set in the environment the client runs in. A `${VAR}` header in a committed `.mcp.json` is the repo's own pattern (`.mcp.json:26`).
 6. The script runs the real flow: `/register` (dynamic client registration) → `/authorize` with HTTP Basic + PKCE S256 → `/token` code exchange. The Basic header goes through a curl config on stdin (`-K -`), never argv — keep it that way so the password cannot surface in the process list.
 7. Tokens and client registrations are persisted in SQLite (`src/db.rs`, `src/oauth/store.rs`), so they survive a server restart; re-run `bin/mcp-token` anyway for a fresh 24h token.
 8. Failure branches: `client registration failed (server down?)` -> server is not listening, go to step 1; `no auth code (bad credentials or server down?)` -> wrong `MCP_SSH_USER`/`MCP_SSH_PASS`.

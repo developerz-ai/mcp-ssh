@@ -4,8 +4,12 @@
 
 | Where | What lives there |
 |---|---|
-| [`idea/`](idea/) | Why this repository is shaped the way it is: the product idea, the architecture, the principles a change is weighed against. *(not created yet)* |
-| [`standards/`](standards/) | How work is done here: the rules a change follows, and for each rule the check that enforces it. *(not created yet)* |
+| [`architecture.md`](architecture.md) | How the binary is put together: stack, modules, request and job lifecycles. |
+| [`usage.md`](usage.md) | The three MCP tools — `bash`, `job`, `file` — their params and examples. |
+| [`deploy.md`](deploy.md) | Install, reverse proxy, systemd, and connecting a client. |
+| [`connect-claude.md`](connect-claude.md) | Claude desktop/mobile as a custom connector, with the public-internet caveat. |
+| [`plans/`](plans/) | Dated implementation plans behind shipped work. |
+| [`prompts/`](prompts/) | The agent prompt and skill text this repo runs on. |
 
 The brain itself is the repo root's [`CLAUDE.md`](../CLAUDE.md); the
 commands are `bin/{setup,dev,check,stop}`.
