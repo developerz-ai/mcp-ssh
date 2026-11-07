@@ -193,15 +193,15 @@ pub(crate) fn init() -> sentry::ClientInitGuard {
         })
     };
 
-    let opts = ClientOptions {
-        dsn,
-        environment: Some(environment.into()),
-        release: Some(env!("CARGO_PKG_VERSION").into()),
-        send_default_pii: false,
-        traces_sample_rate: 0.0,
-        before_send: Some(before_send),
-        ..Default::default()
-    };
+    // sentry 0.49 made `ClientOptions` `#[non_exhaustive]`: build from `new()`
+    // and set fields, with tracing off through the builder.
+    let mut opts = ClientOptions::new()
+        .environment(environment)
+        .release(env!("CARGO_PKG_VERSION"))
+        .send_default_pii(false)
+        .traces_sample_rate(0.0);
+    opts.dsn = dsn;
+    opts.before_send = Some(before_send);
 
     sentry::init(opts)
 }
