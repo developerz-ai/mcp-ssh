@@ -43,14 +43,10 @@ pr:
   # false turns it off. See /docs/maintainer-yml.
   close_inactive_after_days: 90
 
-# release: this repo's mechanism IS observed — a tag-triggered workflow, not the agent.
-# Pushing a `v*` tag to main runs .github/workflows/ci.yml jobs `release` (cargo deb →
-# softprops/action-gh-release publishes target/debian/*.deb) and `docker` (ghcr.io/developerz-ai/mcp-ssh,
-# semver tags). `manager: none` therefore means the bot drives no release-please bump PR and
-# cuts no tag itself; the tag is pushed by whoever cuts the release (see
-# .claude/skills/release-cut/SKILL.md). Set `manager: release-please` only if you want the bot
-# to cut tags from conventional commits — the workflow then builds what it tags.
+# release: derived from the detected mechanism. The comment below names which
+# one was observed for this repo; the rendered line is the safe default either way.
 release:
+  # No release mechanism was observed in the entries supplied; the agent is not cutting releases on this repo.
   manager: none
   channels: []
 
