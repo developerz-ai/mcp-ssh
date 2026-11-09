@@ -46,7 +46,7 @@ rpassword = "7"
 
 # auth (opaque tokens + PKCE S256 — no JWT/JWKS needed)
 base64 = "0.23"
-sha2 = "0.10"
+sha2 = "0.11"
 rand = "0.8"
 urlencoding = "2"
 
