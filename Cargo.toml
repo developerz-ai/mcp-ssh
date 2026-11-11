@@ -37,7 +37,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # durable state: OAuth tokens/refresh + job metadata + saved output tails.
 # `bundled` compiles SQLite into the binary (no system libsqlite dep), keeping
 # the single-binary deploy. Accessed via spawn_blocking — see `src/db.rs`.
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 # cli + config
 clap = { version = "4", features = ["derive"] }
@@ -46,7 +46,7 @@ rpassword = "7"
 
 # auth (opaque tokens + PKCE S256 — no JWT/JWKS needed)
 base64 = "0.23"
-sha2 = "0.10"
+sha2 = "0.11"
 rand = "0.8"
 urlencoding = "2"
 
