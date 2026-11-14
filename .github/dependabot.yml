@@ -1,4 +1,7 @@
-# Weekly, with minor and patch updates grouped per ecosystem; a major update arrives on its own.
+# Cargo weekly; Docker and GitHub Actions monthly (as in developerz-ai/wurk: a weekly cadence there is
+# mostly one PR per patch release for no change in what ships). Minor and patch updates are grouped
+# per ecosystem; a major update arrives on its own. The developerz.ai maintainer agent reviews,
+# fixes and merges every Dependabot PR (.dz/maintainer/maintainer.yml).
 # The 14-day cooldown lets a compromised release get caught before it reaches us. Security updates
 # are unaffected.
 version: 2
@@ -18,8 +21,7 @@ updates:
   - package-ecosystem: "docker"
     directory: "/"
     schedule:
-      interval: "weekly"
-      day: "monday"
+      interval: "monthly"
       time: "10:00"
     cooldown:
       default-days: 14
@@ -34,8 +36,7 @@ updates:
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: "weekly"
-      day: "monday"
+      interval: "monthly"
       time: "10:00"
     cooldown:
       default-days: 14

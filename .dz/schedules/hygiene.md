@@ -1,10 +1,8 @@
-<!-- Proposed by developerz.ai onboarding (an automated agent). This file is yours: the
-`hygiene` entry under `schedules:` in your policy file reads it each time it fires.
-Edit it to steer the checkup; delete that entry to stop it. -->
+<!-- Read by the monthly `improve` checkup (.dz/briefs/improve.md). Edit it to steer that pass. -->
 
 # Hygiene checkup
 
-This is the weekly hygiene checkup: a deep read for defects tests never show. You read files only: no shell, network or database, so a finding whose harm depends
+This is the hygiene read the monthly `improve` checkup uses: a deep read for defects tests never show. You read files only: no shell, network or database, so a finding whose harm depends
 on a size or a rate you cannot see is marked `measure first: yes`, never guessed.
 
 ## What to look for

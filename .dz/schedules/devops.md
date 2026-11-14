@@ -1,10 +1,8 @@
-<!-- Proposed by developerz.ai onboarding (an automated agent). This file is yours: the
-`devops` entry under `schedules:` in your policy file reads it each time it fires.
-Edit it to steer the checkup; delete that entry to stop it. -->
+<!-- Read by the monthly `improve` checkup (.dz/briefs/improve.md). Edit it to steer that pass. -->
 
 # Devops checkup
 
-This is the weekly devops checkup: a grade of how this repository ships, on five axes. You read files only: no shell, network or database. You also have the Signals block: recent CI job failures and failed tasks.
+This is the devops grade the monthly `improve` checkup uses: a grade of how this repository ships, on five axes. You read files only: no shell, network or database. You also have the Signals block: recent CI job failures and failed tasks.
 
 **Evidence or nothing.** Every point lost names a `path:line` or a Signals line. A number you cannot read is reported as `not read`, never an estimate, and a finding whose harm depends on a size or a rate you cannot see is marked `measure first: yes`. Do not fix what is not broken.
 
