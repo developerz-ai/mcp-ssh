@@ -7,6 +7,7 @@ use tower::ServiceExt;
 
 use super::*;
 use crate::config::Password;
+use crate::oauth::store;
 use crate::oauth::{Store, router};
 
 const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
@@ -448,29 +449,9 @@ fn consent_form_debug_hides_the_password() {
     assert!(!format!("{form:?}").contains(PASS));
 }
 
-/// Captures every log line the flow emits, for the no-secrets check.
-#[derive(Clone, Default)]
-struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
-
-impl std::io::Write for Captured {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
 #[tokio::test(start_paused = true)]
 async fn auth_log_events_never_carry_a_secret() {
-    let captured = Captured::default();
-    let sink = captured.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
-        .with_writer(move || sink.clone())
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
+    let captured = crate::log_capture_tests::capture();
 
     let app = app();
     let (client_id, csrf) = consent(&app).await;
@@ -490,7 +471,7 @@ async fn auth_log_events_never_carry_a_secret() {
     let reused = post_form(&app, "/token", &rotate).await;
     assert_eq!(reused.status, StatusCode::BAD_REQUEST, "reuse");
 
-    let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    let logs = captured.text();
     assert!(logs.contains("login_failed"), "{logs}");
     assert!(logs.contains("login_succeeded"), "{logs}");
     assert!(logs.contains("refresh_reuse"), "{logs}");
