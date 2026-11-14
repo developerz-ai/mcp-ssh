@@ -1,126 +1,163 @@
-# .dz/maintainer/maintainer.yml — how the developerz.ai maintainer agent may act on developerz-ai/mcp-ssh.
-# Proposed by the developerz.ai maintainer agent for the maintainers of this repository; MERGING this pull request is the opt-in.
+# yaml-language-server: $schema=https://developerz.ai/schemas/maintainer.v1.json
+# developerz.ai maintainer policy: developerz-ai/mcp-ssh
 #
-# This is the AUTONOMOUS posture: PRs merge when the machine gates pass, and the bot
-# qualifies issues and dispatches coding. Releases follow the `release:` block below.
-# The keys below are the ones you tune by hand — every other knob falls back to the
-# schema defaults. Full reference: https://developerz.ai/docs/maintainer-yml
+# FULLY AI-MAINTAINED, on the same posture as developerz-ai/wurk and developerz-ai/db-mcp-gateway
+# (owner, 2026-11-14: no human maintenance unless we add new features). For everyone, org members,
+# collaborators and the dependency bots alike, the agent triages, answers, reviews, declines with a
+# reason, merges on green and closes what has stalled on its reporter or author. A human is asked
+# only for a breaking change (`escalate`) and the platform's hardcoded asks (security reports,
+# license, CLA).
+#
+# CLAUDE.md is the authority and this file never relaxes it. Its NEVER list is `non_goals` below: a
+# PR that matches one is declined with the rule quoted, whoever opened it.
+#
+# The gate is the repo's `main-protection` ruleset, not this file: it requires `fmt` and `check`.
+# Read it before trusting any sentence here about it: `gh api repos/developerz-ai/mcp-ssh/rulesets`.
 version: 1
 
-# Services this repo's own verify gate needs running before it can grade a diff.
-# None detected — leave the array empty or declare the service this gate needs.
+# `bin/check` needs nothing running: SQLite is compiled in and the e2e suite boots the binary itself.
 services: []
 
-# handoff: coding dispatches to the developerz fleet (BYOVM). `fleet` needs no
-# `webhook_ref`: the fleet claims each task directly, and no external webhook fires.
+tone:
+  voice: friendly
+  language: en
+
+triage:
+  ask_for_repro: true
+  required_fields: [steps, expected, actual, version]
+  qualify_into: [bug, feature, dupe, question, docs]
+  # Nobody reads this tracker by hand: below this confidence the bot stops and waits for a person.
+  confidence_threshold: 0.4
+  close_unanswered_repro_after_days: 14
+  stale_after_days: 30
+  stale_action: comment_then_close
+  close_inactive_after_days: 30
+  # CLAUDE.md's NEVER entries that describe a change someone could propose, plus its "NOT building"
+  # list. `--no-verify` and force-pushing `main` are rules for how to work, not proposals.
+  non_goals:
+    - "Logging or returning the password or a token: in responses, errors or logs"
+    - "Running as root instead of a dedicated service user"
+    - "Serving without TLS, or terminating TLS in the binary instead of the reverse proxy"
+    - "Serving without MCP_SSH_ALLOWED_HOSTS set"
+    - "Weakening or bypassing the auth middleware, or adding an auth path other than OAuth 2.1"
+    - "A new MCP tool where a param or action on bash, job or file would do"
+    - "Multi-host fan-out, an SSH client, a fleet orchestrator, a job scheduler or a secrets vault"
+    - "Outside human contributors' changes to CI, release or publish automation (.github/, bin/, deploy/, Dockerfile, .dz/): members own that pipeline"
+
 handoff:
   mode: fleet
-  # autonomous posture: go straight to coding rather than asking the reporter first.
   ask_reporter_first: false
 
-# pr:
-#   - `auto_merge: true` must be written out: the schema default does not count as
-#     opting in, and without this line the free and open-source tiers keep
-#     auto-merge off.
-#   - `auto_merge_scope: own_and_dependency_bots`: auto-merge covers the pull requests
-#     the bot opened plus Dependabot and Renovate; a person still merges their own.
-#     `any` widens it to every author.
-#   - `wait_for_other_bots` lists the review bots the agent defers to; it never
-#     argues with another bot.
-#   - `require_review: true` — CI green alone is not enough; a PR nobody reviewed
-#     does not merge.
-#   - `large_threshold_lines` is sized from this repo's own history: 90% of its last 71 merged changes were 656 lines or fewer. It holds a pull request above it only if you list `large_pr` under `escalate.ask_before_acting`.
 pr:
-  auto_merge: true
-  auto_merge_scope: own_and_dependency_bots
   wait_for_other_bots: [coderabbit, copilot]
+  # The `main-protection` ruleset's required checks, named so the agent knows which red check is
+  # the author's to fix. Re-check against the ruleset when either changes; this list is not the
+  # ruleset. `audit` and `shellcheck` run in ci.yml but are not required.
+  required_checks:
+    - "fmt"
+    - "check"
+  auto_merge: true
+  # Every author's PR is reviewed, babysat and merged on green, except what `escalate` holds for a
+  # human and what `non_goals` declines. Whether an author is outside is the platform's read of
+  # their real repo permission, never `author_association`.
+  auto_merge_scope: any
   require_review: true
   large_threshold_lines: 660
-  # Close a contributor pull request that has waited on its author this long, after
-  # two reminders. false turns it off. See /docs/stale-work.
   close_awaiting_author_after_days: 21
-  # Close a pull request with no activity this long; a comment, a push or a reopen
-  # restarts the clock. false turns it off. See /docs/maintainer-yml.
   close_inactive_after_days: 30
 
-# branches: a branch with no new commit this long is tagged
-# archive/<branch>/<date> at its last commit, then deleted.
-# false keeps every branch. See /docs/maintainer-yml.
 branches:
   close_inactive_after_days: 30
 
-# release: derived from the detected mechanism. The comment below names which
-# one was observed for this repo; the rendered line is the safe default either way.
-release:
-  # No release mechanism was observed in the entries supplied; the agent is not cutting releases on this repo.
-  manager: none
-  channels: []
-
-# review: the developerz.ai reviewer, alongside any review bot already installed.
-# `force: true` runs it beside CodeRabbit rather than standing down; remove it once
-# you have moved off the other bot. `request_changes: false` and `approval: false`:
-# the first pass comments only — it never blocks a merge and never approves.
 review:
   enabled: true
-  force: true
+  force: true                 # CodeRabbit is active here; without this the native review defers forever
   depth: inline
-  request_changes: false
-  approval: false
+  profile: chill
+  request_changes: true       # a finding that must be fixed is a change request, as a maintainer's would be
+  approval: false             # the review never APPROVES; CI green and the ruleset gate the merge
+  high_level_summary: true
+  learnings: false            # no KB write-back on a public repo yet
+  chat_auto_reply: true
+  # No `human_merge`: the paths below get a mandatory security pass instead, and a finding against
+  # a NEVER entry is a must-fix change request that blocks the merge until resolved.
+  mandatory_passes: [correctness, security, tests]
+  auto_review:
+    enabled: true
+    incremental: true
+    drafts: false
+    base_branches: [main]
+    ignore_title_keywords: [WIP, "DO NOT MERGE"]
+  anti_noise:
+    severity_floor: minor
+    max_comments: 10
+    dedupe: true
+  path_filters: []
+  path_instructions:
+    - path: "src/auth.rs"
+      instructions: &security_review >-
+        Security path: auth, OAuth, credentials, command execution or process signalling. Look
+        for a password or token in a response, error, log or Debug output; a bypass of the bearer
+        check or the Host allowlist; a token stored unhashed; a kill that reads "unknown" as
+        "gone" or signals a pgid from another boot. Any such finding is must-fix. Never weaken a
+        CLAUDE.md NEVER entry.
+    - path: "src/oauth/**"
+      instructions: *security_review
+    - path: "src/config.rs"
+      instructions: *security_review
+    - path: "src/config/**"
+      instructions: *security_review
+    - path: "src/app.rs"
+      instructions: *security_review
+    - path: "src/jobs/**"
+      instructions: *security_review
+    - path: "src/tools/**"
+      instructions: *security_review
+    - path: "src/**"
+      instructions: >-
+        A user-visible change adds its line to docs/changelog/unreleased.md in the same PR, and a
+        new or removed src file updates CLAUDE.md's module map (tests/module_map.rs enforces it).
 
-# triage: ask reporters for repro before dispatching coding — keeps the coding
-# queue honest about which issues are dispatch-ready.
-triage:
-  ask_for_repro: true
-  # Nobody reads this tracker by hand: below this confidence the bot stops and
-  # waits for a person, so it is set under the 0.6 default.
-  confidence_threshold: 0.4
-  # An issue quiet this long gets a comment naming the window, then is closed.
-  stale_after_days: 30
-  stale_action: comment_then_close
-  # Close a report whose repro request the reporter never answered, after one
-  # reminder. false turns it off. See /docs/stale-work.
-  close_unanswered_repro_after_days: 14
-  # Close an issue with no activity this long; a comment or a reopen restarts the
-  # clock. false turns it off. See /docs/maintainer-yml.
-  close_inactive_after_days: 30
-
-# escalate: what stays with a human.
-#   - `always` is the schema default, written out so you can see it.
-#   - `ask_before_acting` is empty by default: no pull request waits on a human
-#     ack. Write categories (e.g. [large_pr, breaking_change]) to opt in.
-#     `pr.human_merge` paths still hold; security, license and CLA still escalate.
-escalate:
-  always: [hostile_tone, direct_mention]
-
-# scout: the platform's daily survey of this repo files only what is already BROKEN
-# (red CI, failing tests, a security advisory, a broken build or link) — never an
-# improvement idea. `full` lets it file ideas too; `off` stops the survey.
 scout:
   survey: broken_only
 
-# devops: match first-tier security advisories (KEV, NVD, GitHub, OSV) against what
-# this repo runs, so a vulnerable dependency becomes work without anyone looking.
 devops:
   watch: advisories
 
-# Proactive checkups, each a scout reading a brief you commit. Kept OFF on purpose:
-# improvements here are wanted monthly at most, and a schedule is `days` + `hours_utc`,
-# so once a week is the slowest it can fire. Enable these only when the platform
-# grows a monthly cadence.
-# schedules:
-#   # A weekly hygiene checkup: resource leaks, slow algorithms, duplicated helpers and
-#   # indexes, docs that drifted from the code, oversized or dead code. It reads the
-#   # brief at .dz/schedules/hygiene.md — edit that file to steer it, delete this entry to stop it.
-#   # It runs on your boxes and your key, and files what it finds as asks.
-#   - name: hygiene
-#     days: [sun]
-#     hours_utc: [23]
-#     brief_file: .dz/schedules/hygiene.md
-#   # A weekly devops checkup: a score on five axes (reliable, secure, fast, efficient,
-#   # cheap) and a list of findings, each with its evidence. It reads the brief at
-#   # .dz/schedules/devops.md — edit that file to steer it, delete this entry to stop it.
-#   # It runs on your boxes and your key, and files what it finds as asks.
-#   - name: devops
-#     days: [sat]
-#     hours_utc: [11]
-#     brief_file: .dz/schedules/devops.md
+release:
+  # `none`: there is no release manager. Empty channels: the agent publishes nothing itself.
+  # The release is a `chore(release): <next>` PR (Cargo.toml, Cargo.lock, changelog); once it
+  # merges, an annotated `v<next>` tag on the merge commit runs ci.yml, which pushes the image to
+  # GHCR and attaches the .deb files to the GitHub Release. See `.dz/briefs/release-due.md`.
+  manager: none
+  channels: []
+
+escalate:
+  always: [hostile_tone, direct_mention]
+  # `breaking_change`: a human decides a change to the tool surface, CLI, config, auth flow or DB
+  # schema that a running install must react to. Security, license and CLA are the platform's
+  # hardcoded asks, which this list cannot remove.
+  ask_before_acting: [breaking_change]
+
+# The checkups nothing else triggers. One weekday per repo, so the fleet is not hit at once.
+schedules:
+  # Weekly and judged, so a merge never cuts a release.
+  - name: release-due
+    days: [tue]
+    hours_utc: [3]
+    brief_file: .dz/briefs/release-due.md
+  # The one exception, so a confirmed security fix does not wait up to a week for the slot above.
+  - name: security-release
+    days: [mon, wed, thu, fri, sat, sun]
+    hours_utc: [6]
+    brief_file: .dz/briefs/security-release.md
+  # Weekly: the failures nothing announces.
+  - name: health
+    days: [tue]
+    hours_utc: [7]
+    brief_file: .dz/briefs/health.md
+  # Monthly: fires every Tuesday and the brief acts only on the first Tuesday of the month.
+  - name: improve
+    days: [tue]
+    hours_utc: [8]
+    brief_file: .dz/briefs/improve.md

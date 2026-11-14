@@ -4,6 +4,18 @@
 
 <h1 align="center">mcp-ssh</h1>
 
+<div align="center">
+
+[![Maintained by developerz.ai](https://img.shields.io/badge/maintained%20by-developerz.ai-8a2be2.svg)](#-ai-maintained)
+[![CI](https://github.com/developerz-ai/mcp-ssh/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/developerz-ai/mcp-ssh/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/developerz-ai/mcp-ssh?sort=semver)](https://github.com/developerz-ai/mcp-ssh/releases/latest)
+[![Image](https://img.shields.io/badge/image-ghcr.io-2496ED?logo=docker&logoColor=white)](https://github.com/developerz-ai/mcp-ssh/pkgs/container/mcp-ssh)
+[![Rust](https://img.shields.io/badge/rust-1.100-CE422B?logo=rust&logoColor=white)](https://www.rust-lang.org)
+[![GitHub stars](https://img.shields.io/github/stars/developerz-ai/mcp-ssh?style=flat&logo=github)](https://github.com/developerz-ai/mcp-ssh/stargazers)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+</div>
+
 > **ssh, but you talk to it over `/mcp` from any MCP client.**
 > A single Rust binary that gives an AI agent a remote shell + file access to **one host — the box it runs on.** No SSH client, no multi-server fan-out, no gateway. It runs commands **locally**, as the service user, and speaks MCP over HTTP.
 
@@ -142,6 +154,30 @@ Treat it accordingly:
 ## 🧬 Stack
 
 Rust 2024 · tokio · axum 0.8 · [rmcp](https://github.com/modelcontextprotocol/rust-sdk) 3.9 (MCP Streamable HTTP) · [rusqlite](https://github.com/rusqlite/rusqlite) (bundled SQLite — durable state, no system libsqlite).
+
+## 🤖 AI-maintained
+
+mcp-ssh is maintained by AI: by [developerz.ai](https://developerz.ai), the way a human maintainer looks after an open-source project. The agent works publicly as `developerz-ai[bot]` and marks every comment it posts as bot-made. Its policy is committed in [`.dz/maintainer/maintainer.yml`](.dz/maintainer/maintainer.yml), and [`CLAUDE.md`](CLAUDE.md) binds it.
+
+| What arrives | What happens |
+|---|---|
+| an issue | triaged; asked for a reproduction when one is missing; a real bug is fixed and released |
+| a pull request | reviewed (CodeRabbit and the developerz.ai reviewer, with a mandatory security pass), driven to green, merged |
+| Dependabot | driven to green and merged; every bump waits 14 days after upstream publishes it (security updates excepted) |
+| an outside change to CI, release or publish automation | declined: members maintain the pipeline that publishes the image and the `.deb` |
+| a change that breaks a NEVER rule (secrets in output, root, no TLS, a fourth tool…) | declined with the rule quoted |
+| a breaking change or a new feature | a human decides |
+
+Scheduled checkups, briefs in [`.dz/briefs/`](.dz/briefs/): weekly `release-due` judges whether a release is needed, daily `security-release` ships a confirmed security fix off-cycle, weekly `health` catches the failures nothing announces, and monthly `improve` lands at most three small, evidenced improvements, the Rust toolchain bump included.
+
+## ⭐ Star history
+
+<a href="https://star-history.com/#developerz-ai/mcp-ssh&Date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=developerz-ai/mcp-ssh&type=Date&theme=dark">
+    <img alt="Star history of developerz-ai/mcp-ssh" src="https://api.star-history.com/svg?repos=developerz-ai/mcp-ssh&type=Date" width="600">
+  </picture>
+</a>
 
 ## 📄 License
 
