@@ -6,86 +6,260 @@ on:
     tags: ["v*"]
   pull_request:
 
+# Least privilege by default; jobs that publish elevate their own scope.
+permissions:
+  contents: read
+
 concurrency:
-  group: ${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Superseded PR pushes are cancelled; a `main` or tag run always finishes.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_INCREMENTAL: 0
   CARGO_TERM_COLOR: always
 
+# Every action is pinned to a commit SHA (Dependabot's github-actions ecosystem
+# keeps them fresh). The Rust toolchain comes from rust-toolchain.toml.
 jobs:
   fmt:
     # GitHub-hosted runner (org rule: private repos on Ubicloud, public on GitHub-hosted).
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install
       - run: cargo fmt --check
 
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      # Includes tests/e2e/: boots the real binary and drives it over HTTP.
+      - run: cargo test --locked
 
-  release:
-    needs: [fmt, check]
-    if: startsWith(github.ref, 'refs/tags/v')
+  audit:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    permissions:
-      contents: write
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
-          tool: cargo-deb
-      - run: cargo deb
-      - uses: softprops/action-gh-release@v3
-        with:
-          files: target/debian/*.deb
+          tool: cargo-audit
+      # Ignored: rmcp 2.2 advisories in its OAuth/Streamable-HTTP *client*; this
+      # binary only builds rmcp's server transport. Drop once rmcp is bumped.
+      - run: cargo audit --ignore RUSTSEC-2026-0457 --ignore RUSTSEC-2026-0462
 
-  docker:
-    needs: [fmt, check]
+  shellcheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The installer runs as root via `curl | sudo bash`.
+      - run: >-
+          shellcheck bin/* deploy/install.sh deploy/debian/postinst
+          .githooks/pre-commit .claude/hooks/*.sh .github/scripts/*.sh
+
+  version:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Tag matches Cargo.toml version
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version v$version"
+            exit 1
+          fi
+
+  # Build the image natively per arch and smoke it (healthz, OAuth, bash, job
+  # kill) on every run, PRs included. On a tag, the smoked image is pushed by
+  # digest; `image-publish` stitches the digests into one multi-arch tag.
+  image:
+    needs: [fmt, check, audit, shellcheck]
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
     permissions:
       contents: read
       packages: write
+    env:
+      IMAGE: ghcr.io/developerz-ai/mcp-ssh
     steps:
-      - uses: actions/checkout@v7
-      - uses: docker/setup-buildx-action@v4
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build (local)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          load: true
+          tags: mcp-ssh:smoke
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+      - name: Smoke test
+        env:
+          MCP_SSH_USER: smoke
+          MCP_SSH_PASS: smoke-pass
+        run: |
+          docker run -d --name mcp-ssh -p 127.0.0.1:1337:1337 \
+            -e MCP_SSH_USER -e MCP_SSH_PASS \
+            -e MCP_SSH_ALLOWED_HOSTS=localhost,127.0.0.1 \
+            -v mcp-ssh-state:/var/lib/mcp-ssh mcp-ssh:smoke
+          .github/scripts/smoke.sh http://127.0.0.1:1337 || { docker logs mcp-ssh; exit 1; }
+          docker rm -f mcp-ssh
+      - if: startsWith(github.ref, 'refs/tags/v')
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/metadata-action@v6
+      # OCI labels (source, version, revision) ride on each per-arch image.
+      - if: startsWith(github.ref, 'refs/tags/v')
         id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
-          images: ghcr.io/developerz-ai/mcp-ssh
+          images: ${{ env.IMAGE }}
+      - if: startsWith(github.ref, 'refs/tags/v')
+        id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.arch }}
+      - if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          mkdir -p digests
+          touch "digests/${DIGEST#sha256:}"
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+      - if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digest-${{ matrix.arch }}
+          path: digests/*
+          if-no-files-found: error
+
+  # Built and smoke-tested on every run (PRs too) so a broken package is caught
+  # before a tag; only `release` publishes it.
+  deb:
+    needs: [fmt, check, audit, shellcheck]
+    strategy:
+      matrix:
+        # 22.04 (glibc 2.35): cargo-deb's `$auto` depends on the build host's
+        # glibc, so a 24.04 build (2.39) won't install on Debian 12 / Ubuntu 22.04.
+        include:
+          - arch: amd64
+            runner: ubuntu-22.04
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        with:
+          tool: cargo-deb
+      - run: cargo deb --locked
+      # Install into a clean Debian, then prove the packaged user, config dir and
+      # binary work: serve as `mcp-ssh` (no systemd in the container) + smoke.
+      - name: Smoke test
+        run: |
+          docker run --rm -v "$PWD:/src:ro" -w /src debian:bookworm bash -euo pipefail -c '
+            apt-get update -qq
+            apt-get install -y -qq ./target/debian/*.deb curl openssl >/dev/null
+            id mcp-ssh
+            [ "$(stat -c %a:%U /etc/mcp-ssh)" = 750:mcp-ssh ]
+            mcp-ssh --version
+            install -d -o mcp-ssh -g mcp-ssh -m 700 /var/lib/mcp-ssh
+            su -s /bin/bash mcp-ssh -c \
+              "MCP_SSH_USER=smoke MCP_SSH_PASS=smoke-pass mcp-ssh serve >/tmp/serve.log 2>&1 &"
+            MCP_SSH_USER=smoke MCP_SSH_PASS=smoke-pass \
+              .github/scripts/smoke.sh http://127.0.0.1:1337 || { cat /tmp/serve.log; exit 1; }
+          '
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: deb-${{ matrix.arch }}
+          path: target/debian/*.deb
+          if-no-files-found: error
+
+  release:
+    needs: [version, deb, image]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: deb-*
+          path: dist
+          merge-multiple: true
+      # install.sh refuses a .deb it can't verify against this file.
+      - run: cd dist && sha256sum -- *.deb > SHA256SUMS && cat SHA256SUMS
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          files: |
+            dist/*.deb
+            dist/SHA256SUMS
+
+  image-publish:
+    needs: [version, deb, image]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/developerz-ai/mcp-ssh
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: digest-*
+          path: digests
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        id: meta
+        env:
+          # The multi-arch index gets the OCI annotations (labels live per image).
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: index
+        with:
+          images: ${{ env.IMAGE }}
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
-      - uses: docker/build-push-action@v7
-        with:
-          context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Publish multi-arch manifest
+        working-directory: digests
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          ANNOTATIONS: ${{ steps.meta.outputs.annotations }}
+        run: |
+          args=()
+          while IFS= read -r tag; do [ -n "$tag" ] && args+=(-t "$tag"); done <<<"$TAGS"
+          while IFS= read -r a; do [ -n "$a" ] && args+=(--annotation "$a"); done <<<"$ANNOTATIONS"
+          for digest in *; do args+=("$IMAGE@sha256:$digest"); done
+          docker buildx imagetools create "${args[@]}"

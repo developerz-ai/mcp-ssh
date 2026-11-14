@@ -1,0 +1,25 @@
+#!/bin/sh
+# mcp-ssh postinst: the unit runs as `mcp-ssh`, so the package must provide
+# that user and a config dir it can read. Idempotent — safe on upgrade.
+set -e
+
+if [ "$1" = "configure" ]; then
+    if ! getent group mcp-ssh >/dev/null; then
+        addgroup --system mcp-ssh
+    fi
+    if ! getent passwd mcp-ssh >/dev/null; then
+        # Real home + bash: `interactive=true` commands source ~/.bashrc.
+        adduser --system --ingroup mcp-ssh --home /home/mcp-ssh \
+            --shell /bin/bash mcp-ssh
+    fi
+    # Holds config.toml (0600, written by `sudo mcp-ssh set-auth`); readable by
+    # the service user only. Created once: an upgrade must not re-own a dir the
+    # installer handed to a different run-as user.
+    if [ ! -d /etc/mcp-ssh ]; then
+        install -d -o mcp-ssh -g mcp-ssh -m 750 /etc/mcp-ssh
+    fi
+fi
+
+#DEBHELPER#
+
+exit 0

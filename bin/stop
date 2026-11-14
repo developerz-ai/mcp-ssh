@@ -1,5 +1,30 @@
 #!/usr/bin/env bash
 # one-command stop, run by developerz.ai when a session ends — established by the developerz.ai maintainer agent for the maintainers of this repository. One command; adjust as the repo grows.
+# Stops only the server bin/dev started (pid in .local/dev.pid), never any other
+# `mcp-ssh serve` on the machine.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-pkill -f '[m]cp-ssh serve' || true
+
+PID_FILE=.local/dev.pid
+[ -f "$PID_FILE" ] || { echo "bin/dev is not running (no $PID_FILE)"; exit 0; }
+pid="$(cat "$PID_FILE")"
+rm -f "$PID_FILE"
+
+# A recycled pid must not take down an unrelated process.
+case "$(ps -o args= -p "$pid" 2>/dev/null || true)" in
+  *cargo*) ;;
+  *) echo "bin/dev is not running (stale pid $pid)"; exit 0 ;;
+esac
+
+# cargo watch → cargo run → mcp-ssh: signal the leaves first so the server gets
+# its SIGTERM rather than being orphaned by its parent's exit.
+descendants() {
+  local child
+  for child in $(pgrep -P "$1" || true); do
+    descendants "$child"
+    echo "$child"
+  done
+}
+# shellcheck disable=SC2046 # word-splitting the pid list is intended
+kill -TERM $(descendants "$pid") "$pid" 2>/dev/null || true
+echo "stopped bin/dev (pid $pid)"

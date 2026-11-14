@@ -7,9 +7,14 @@ Type=simple
 User=mcp-ssh
 Group=mcp-ssh
 ExecStart=/usr/bin/mcp-ssh serve
-# Writes job dir `/var/lib/mcp-ssh/logs/jobs`. StateDirectory creates the dir
-# writable by the service user even with ProtectSystem=full.
+# Writes the DB + job dir under `/var/lib/mcp-ssh`. StateDirectory creates it
+# owned by the service user; 0700 keeps tokens and job output private.
 StateDirectory=mcp-ssh
+StateDirectoryMode=0700
+# No UMask= on purpose: it is inherited by every agent command, `sudo` children
+# included, so files the agent creates in /etc or elsewhere would come out
+# owner-only and break other services. The server sets its own modes
+# explicitly instead (DB/WAL and job logs 0600, its dirs 0700).
 # Optional env overrides. Config credentials live at `/etc/mcp-ssh/config.toml`
 # (written by `mcp-ssh set-auth`); this file is for ephemeral knobs.
 # GlitchTip error tracking (SENTRY_DSN / SENTRY_ENVIRONMENT) is injected via
@@ -17,6 +22,11 @@ StateDirectory=mcp-ssh
 EnvironmentFile=-/etc/mcp-ssh/mcp-ssh.env
 Restart=on-failure
 RestartSec=5
+# Stopping the service kills every process in its cgroup — background jobs
+# included. They do not outlive a stop/restart. The server drains in-flight
+# requests for up to 10 s before exiting; 20 s leaves headroom before SIGKILL.
+KillMode=control-group
+TimeoutStopSec=20
 
 # Hardening. NOTE: this tool intentionally shells out to run arbitrary
 # commands as the service user, so sandboxing is necessarily loose -- these
@@ -27,8 +37,12 @@ RestartSec=5
 # is setuid and blocked by NoNewPrivileges=true. The service user is granted
 # sudo by the installer. To lock the box down instead, set this back to true and
 # remove /etc/sudoers.d/mcp-ssh -- see docs/deploy.md.
+#
+# ProtectSystem is deliberately unset for the same reason: it mounts /usr,
+# /boot and /etc read-only in the service's namespace, and `sudo` children
+# inherit that namespace — so `sudo apt install` or editing /etc from the tool
+# would fail even as root. The lockdown drop-in in docs/deploy.md re-adds it.
 NoNewPrivileges=false
-ProtectSystem=full
 PrivateTmp=true
 
 [Install]

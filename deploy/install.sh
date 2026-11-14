@@ -3,9 +3,10 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/developerz-ai/mcp-ssh/main/deploy/install.sh | sudo bash
 #
-# Downloads the latest .deb from GitHub releases, installs it, prompts for the
-# username + password, runs it as a systemd service, and prints how to verify.
-# Re-runnable: it just updates the binary and re-applies your settings.
+# Downloads the latest .deb from GitHub releases, verifies it against the
+# release's SHA256SUMS, installs it, prompts for the username + password, runs
+# it as a systemd service, and prints how to verify.
+# Re-runnable: it updates the binary, re-applies your settings and restarts.
 set -euo pipefail
 
 REPO="developerz-ai/mcp-ssh"
@@ -36,18 +37,31 @@ toml_escape() {
 
 echo "==> mcp-ssh installer"
 
-# 1. Download the latest release .deb for this architecture.
-ARCH="$(dpkg --print-architecture)"   # amd64 / arm64
+# 1. Download the latest release .deb for this architecture and verify it.
+ARCH="$(dpkg --print-architecture)"
+case "$ARCH" in
+  amd64|arm64) ;;
+  *) die "unsupported architecture '$ARCH' (releases ship amd64 and arm64 only)" ;;
+esac
 echo "==> Fetching latest release for $ARCH …"
 API="https://api.github.com/repos/$REPO/releases/latest"
-URL="$(curl -fsSL "$API" | grep -oE "https://[^\"]*_${ARCH}\.deb" | head -n1)" \
-  || die "could not query GitHub releases"
+RELEASE_JSON="$(curl -fsSL "$API")" || die "could not query GitHub releases"
+URL="$(grep -oE "https://[^\"]*_${ARCH}\.deb" <<<"$RELEASE_JSON" | head -n1 || true)"
 [ -n "$URL" ] || die "no .deb asset for $ARCH in the latest release"
+SUMS_URL="$(grep -oE 'https://[^"]*/SHA256SUMS' <<<"$RELEASE_JSON" | head -n1 || true)"
+[ -n "$SUMS_URL" ] || die "latest release has no SHA256SUMS asset; refusing to install unverified"
 
-DEB="$(mktemp --suffix=.deb)"
-trap 'rm -f "$DEB"' EXIT
-echo "==> Downloading $(basename "$URL") …"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+DEB_NAME="$(basename "$URL")"
+DEB="$WORK/$DEB_NAME"
+echo "==> Downloading $DEB_NAME …"
 curl -fSL --progress-bar "$URL" -o "$DEB"
+curl -fsSL "$SUMS_URL" -o "$WORK/SHA256SUMS"
+echo "==> Verifying checksum …"
+grep -E "  ${DEB_NAME//./\\.}\$" "$WORK/SHA256SUMS" >"$WORK/expected" \
+  || die "$DEB_NAME is not listed in SHA256SUMS"
+(cd "$WORK" && sha256sum --quiet -c expected) || die "checksum mismatch for $DEB_NAME"
 
 # 2. Install (apt resolves the .deb's own dependencies).
 echo "==> Installing the package …"
@@ -78,11 +92,15 @@ if ! id "$RUN_USER" >/dev/null 2>&1; then
 fi
 RUN_GROUP="$(id -gn "$RUN_USER")"
 
-# 5. Public hostname for the DNS-rebinding guard (optional; loopback default).
+# 5. Public hostname for the DNS-rebinding guard + OAuth issuer URL (optional;
+#    loopback default). Validated: it is written into a systemd env file.
 PUBLIC_HOST="$(ask 'Public hostname for TLS proxy (blank = localhost only): ')"
+if [ -n "$PUBLIC_HOST" ] && ! [[ "$PUBLIC_HOST" =~ ^[A-Za-z0-9.-]+(:[0-9]+)?$ ]]; then
+  die "invalid hostname '$PUBLIC_HOST' (expected host or host:port)"
+fi
 
 # 6. Write config (chmod 600, owned by the run-as user so the service reads it).
-install -d -m 755 "$CONF_DIR"
+install -d -m 750 -o "$RUN_USER" -g "$RUN_GROUP" "$CONF_DIR"
 umask 077
 cat >"$CONF" <<EOF
 user = "$(toml_escape "$USER_NAME")"
@@ -94,6 +112,7 @@ chmod 600 "$CONF"
 if [ -n "$PUBLIC_HOST" ]; then
   cat >"$ENV_FILE" <<EOF
 MCP_SSH_ALLOWED_HOSTS=localhost,127.0.0.1,$PUBLIC_HOST
+MCP_SSH_PUBLIC_URL=https://$PUBLIC_HOST
 EOF
 else
   # Blank on a rerun must drop any prior allowlist, else a stale public host
@@ -120,15 +139,17 @@ printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$RUN_USER" >"$SUDOERS"
 chmod 440 "$SUDOERS"
 visudo -cf "$SUDOERS" >/dev/null || { rm -f "$SUDOERS"; die "invalid sudoers entry for '$RUN_USER'"; }
 
-# 8. Start it.
-echo "==> Enabling + starting the service …"
+# 8. Start it. `restart`, not `enable --now`: a rerun must pick up new
+#    credentials, hosts and the upgraded binary on an already-running service.
+echo "==> Enabling + (re)starting the service …"
 systemctl daemon-reload
-systemctl enable --now mcp-ssh
+systemctl enable mcp-ssh
+systemctl restart mcp-ssh
 sleep 1
 
 # 9. Verify on loopback.
 echo "==> Verifying …"
-if curl -fsS http://127.0.0.1:1337/.well-known/oauth-authorization-server >/dev/null; then
+if curl -fsS http://127.0.0.1:1337/healthz >/dev/null; then
   echo "✅ mcp-ssh is up on 127.0.0.1:1337 (running as $RUN_USER)."
 else
   echo "⚠️  Service did not answer yet — check: journalctl -u mcp-ssh -e" >&2

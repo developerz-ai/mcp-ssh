@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# End-to-end suite: boots the real `mcp-ssh serve` binary on an ephemeral port
+# with tempdir state and drives it over HTTP (tests/e2e/). bin/check runs it
+# too; this is the focused entry point.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+exec cargo test --locked --test e2e -- --test-threads=1 "$@"
