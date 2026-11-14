@@ -8,6 +8,15 @@ if ! command -v cargo >/dev/null 2>&1; then
   exit 1
 fi
 
+# Fresh checkout: seed .env from the example — never overwrite real credentials.
+if [ -f .env ]; then
+  echo ".env already present — left untouched"
+else
+  cp .env.example .env
+  chmod 600 .env
+  echo "seeded .env from .env.example (mode 600) — edit MCP_SSH_USER/MCP_SSH_PASS before serving"
+fi
+
 # One pre-commit gate: .githooks/pre-commit runs bin/check.
 git config core.hooksPath .githooks
 
@@ -18,7 +27,6 @@ cat <<'MSG'
 Build complete. Pre-commit hook active (.githooks/pre-commit → bin/check).
 
 Next steps:
-  cp .env.example .env   # then edit credentials
   bin/dev                # run the server locally (state in .local/)
   bin/stop               # stop it
   bin/check              # run the fmt/clippy/test gate

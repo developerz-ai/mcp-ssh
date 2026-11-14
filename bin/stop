@@ -10,9 +10,11 @@ PID_FILE=.local/dev.pid
 pid="$(cat "$PID_FILE")"
 rm -f "$PID_FILE"
 
-# A recycled pid must not take down an unrelated process.
+# A recycled pid must not take down an unrelated process. bin/dev execs, so the
+# recorded pid is cargo — or the server itself, once `cargo run` execs the built
+# binary in place (args `target/debug/mcp-ssh serve` identify our serve alone).
 case "$(ps -o args= -p "$pid" 2>/dev/null || true)" in
-  *cargo*) ;;
+  *cargo*|*mcp-ssh*serve*) ;;
   *) echo "bin/dev is not running (stale pid $pid)"; exit 0 ;;
 esac
 
