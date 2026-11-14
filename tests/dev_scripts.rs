@@ -10,11 +10,15 @@
 //! - `bin/stop` kills the pid `bin/dev` recorded even when that pid is the
 //!   server itself: without cargo-watch, `exec cargo run -- serve` execs the
 //!   built binary in place, leaving ps args `target/debug/mcp-ssh serve`.
+//! - `bin/check` runs ci.yml's two non-cargo gates beside the cargo three:
+//!   `shellcheck` over exactly the file list parsed out of ci.yml at runtime
+//!   (a test fails if the two lists drift) and `cargo audit` — each skipped
+//!   loudly, naming the mirrored ci.yml job, when its tool is not installed.
 //!
 //! The scripts are driven for real: each test copies them into a sandbox with
-//! a stub `cargo` first on PATH that refuses to run from anywhere but the
-//! sandbox repo root — deleting any of the lines above fails a test without
-//! invoking the toolchain.
+//! a stub `cargo` that refuses to run from anywhere but the sandbox repo root
+//! and a stub `shellcheck`, both first on PATH — deleting any of the lines
+//! above fails a test without invoking the toolchain.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -35,17 +39,35 @@ if [ "$(pwd)" != "$CARGO_STUB_EXPECTED_ROOT" ]; then
   exit 90
 fi
 pwd >> "$CARGO_STUB_LOG"
+printf '%s\n' "$*" >> "$CARGO_STUB_ARGS_LOG"
+# CARGO_STUB_FAIL_AUDIT_PROBE (set by the audit-skip test alone): fail the
+# `audit --version` probe — bin/check's guard for an absent cargo-audit —
+# and nothing else, so the test can watch the guard short-circuit its gate.
+if [ -n "${CARGO_STUB_FAIL_AUDIT_PROBE:-}" ] && [ "$*" = "audit --version" ]; then
+  exit 91
+fi
+"#;
+
+const STUB_SHELLCHECK: &str = r#"#!/bin/sh
+# Test double for `shellcheck`: shadows any real one so bin/check's parity
+# gate behaves identically on boxes with and without the tool (the sandbox
+# carries bin/*'s expansion of the list — see the parity test below — so a
+# real shellcheck would fail on the files it lacks). Logs its args
+# space-joined, one line per call, for the ci.yml parity test to assert on.
+printf '%s\n' "$*" >> "$SHELLCHECK_STUB_LOG"
 "#;
 
 /// A throwaway repo: `bin/{setup,check,stop}` + `.env.example` copied from the
-/// real checkout, a stub `cargo` on PATH, and a directory that is
-/// deliberately not the repo root to run the scripts from.
+/// real checkout, stub `cargo` and `shellcheck` on PATH, and a directory that
+/// is deliberately not the repo root to run the scripts from.
 struct Sandbox {
     _temp: TempDir, // owns sandbox cleanup
     repo: PathBuf,
     foreign: PathBuf,
     stub_dir: PathBuf,
     cargo_log: PathBuf,
+    cargo_args_log: PathBuf,
+    shellcheck_log: PathBuf,
 }
 
 impl Sandbox {
@@ -55,6 +77,8 @@ impl Sandbox {
         let foreign = temp.path().join("foreign");
         let stub_dir = temp.path().join("stub-bin");
         let cargo_log = temp.path().join("cargo-calls.log");
+        let cargo_args_log = temp.path().join("cargo-args.log");
+        let shellcheck_log = temp.path().join("shellcheck-calls.log");
         fs::create_dir_all(repo.join("bin")).expect("create sandbox bin/");
         fs::create_dir_all(&foreign).expect("create foreign CWD dir");
         fs::create_dir_all(&stub_dir).expect("create stub PATH dir");
@@ -86,29 +110,53 @@ impl Sandbox {
         fs::write(stub_dir.join("cargo"), STUB_CARGO).expect("write cargo stub");
         fs::set_permissions(stub_dir.join("cargo"), fs::Permissions::from_mode(0o755))
             .expect("make cargo stub executable");
+        fs::write(stub_dir.join("shellcheck"), STUB_SHELLCHECK).expect("write shellcheck stub");
+        fs::set_permissions(
+            stub_dir.join("shellcheck"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .expect("make shellcheck stub executable");
         Self {
             _temp: temp,
             repo,
             foreign,
             stub_dir,
             cargo_log,
+            cargo_args_log,
+            shellcheck_log,
+        }
+    }
+
+    /// Stub dir first, system PATH after: the stubs shadow any real
+    /// cargo/shellcheck while bash/dirname/cp/chmod still resolve.
+    fn stubbed_path(&self) -> String {
+        match std::env::var("PATH") {
+            Ok(system) => format!("{}:{system}", self.stub_dir.display()),
+            Err(_) => format!("{}:/usr/bin:/bin", self.stub_dir.display()),
         }
     }
 
     /// Run `bin/<script>` from the foreign CWD with the stub first on PATH.
     fn run(&self, script: &str) -> Output {
-        // System PATH kept after the stub so bash/dirname/cp/chmod still resolve.
-        let path = match std::env::var("PATH") {
-            Ok(system) => format!("{}:{system}", self.stub_dir.display()),
-            Err(_) => format!("{}:/usr/bin:/bin", self.stub_dir.display()),
-        };
-        Command::new(self.repo.join("bin").join(script))
-            .current_dir(&self.foreign)
+        self.run_with(script, Path::new(&self.stubbed_path()), &[])
+    }
+
+    /// `run` with the PATH and the child env under the caller's control: the
+    /// shellcheck-skip test passes the stub dir alone — so a real shellcheck
+    /// anywhere on the system PATH cannot mask the absence it exercises — and
+    /// the audit-skip test carries its failure flag into the stub cargo.
+    fn run_with(&self, script: &str, path: &Path, extra_env: &[(&str, &str)]) -> Output {
+        let mut cmd = Command::new(self.repo.join("bin").join(script));
+        cmd.current_dir(&self.foreign)
             .env("PATH", path)
             .env("CARGO_STUB_EXPECTED_ROOT", &self.repo)
             .env("CARGO_STUB_LOG", &self.cargo_log)
-            .output()
-            .expect("spawn script")
+            .env("CARGO_STUB_ARGS_LOG", &self.cargo_args_log)
+            .env("SHELLCHECK_STUB_LOG", &self.shellcheck_log);
+        for (key, value) in extra_env {
+            cmd.env(key, value);
+        }
+        cmd.output().expect("spawn script")
     }
 
     /// Fails unless the stub `cargo` ran — and ran only inside the sandbox
@@ -222,6 +270,190 @@ fn check_runs_the_gate_from_the_repo_root() {
         output.status.success(),
         "bin/check failed from a foreign CWD:\n{}",
         String::from_utf8_lossy(&output.stderr)
+    );
+    sandbox.assert_cargo_ran_from_repo_root();
+}
+
+/// ci.yml's shellcheck job's file list, parsed at runtime from the real
+/// workflow — never a copy in this file — so bin/check's list is pinned to
+/// CI's mechanically: either side drifting fails the parity test below.
+fn ci_shellcheck_files() -> String {
+    let ci = fs::read_to_string(Path::new(REPO_ROOT).join(".github/workflows/ci.yml"))
+        .expect("read .github/workflows/ci.yml");
+    let lines: Vec<&str> = ci.lines().collect();
+    let start = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("shellcheck "))
+        .expect("ci.yml: shellcheck job's file list not found");
+    // The job runs `shellcheck` as a folded (`>-`) step: the first line names
+    // the tool, its continuations are the following lines indented at least
+    // as deep, until a blank line or the next job ends the block.
+    let first = lines[start].trim_start();
+    let indent = lines[start].len() - first.len();
+    let mut list = first["shellcheck ".len()..].trim().to_string();
+    for line in &lines[start + 1..] {
+        let trimmed = line.trim_start();
+        let continuation = !trimmed.is_empty()
+            && line.len() - trimmed.len() >= indent
+            && !trimmed.starts_with('#')
+            && !trimmed.starts_with('-');
+        if !continuation {
+            break;
+        }
+        list.push(' ');
+        list.push_str(trimmed);
+    }
+    list
+}
+
+#[test]
+fn check_matches_ci_shellcheck_list_and_runs_audit() {
+    let sandbox = Sandbox::new();
+    let output = sandbox.run("check");
+    assert!(
+        output.status.success(),
+        "bin/check failed from a foreign CWD:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The sandbox stubs exist so neither parity gate is skipped here.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("SKIP:"),
+        "bin/check skipped a gate in the sandbox, where both tools are stubbed: {stderr}"
+    );
+
+    // The audit gate ran through the stub cargo, not just its guard probe.
+    let args = fs::read_to_string(&sandbox.cargo_args_log)
+        .expect("cargo stub logged no args — bin/check bypassed the stub");
+    assert!(
+        args.lines().any(|call| call == "audit"),
+        "bin/check must run a plain `cargo audit` (ci.yml's audit job), got {args:?}"
+    );
+    sandbox.assert_cargo_ran_from_repo_root();
+
+    // bin/* expands in the sandbox (to bin/{check,setup,stop}) where ci.yml
+    // keeps it literal, so compare in two halves: the stub's recorded args
+    // must open with that expansion — bin/check itself included — and then
+    // continue with exactly ci.yml's remaining file list.
+    let ci = ci_shellcheck_files();
+    assert!(
+        ci.starts_with("bin/* "),
+        "ci.yml's shellcheck list must start with bin/* for this comparison, got {ci:?}"
+    );
+    let shellchecked =
+        fs::read_to_string(&sandbox.shellcheck_log).expect("shellcheck stub never invoked");
+    let checked: Vec<&str> = shellchecked.split_whitespace().collect();
+    let expanded = checked
+        .iter()
+        .take_while(|arg| arg.starts_with("bin/"))
+        .count();
+    assert!(
+        expanded > 0 && checked[..expanded].contains(&"bin/check"),
+        "bin/check must shellcheck its own bin/* — the stub saw {checked:?}"
+    );
+    assert_eq!(
+        checked[expanded..].to_vec(),
+        ci["bin/* ".len()..]
+            .split_whitespace()
+            .collect::<Vec<&str>>(),
+        "bin/check's shellcheck file list drifted from ci.yml's shellcheck job"
+    );
+}
+
+/// Symlink one system tool into `dir`: the shellcheck-skip test runs
+/// bin/check against a PATH of just the stub dir, which then has to carry
+/// the external commands bin/check needs besides cargo — bash, for the
+/// `#!/usr/bin/env bash` shebang, and dirname.
+fn link_system_tool(tool: &str, dir: &Path) {
+    let found = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|search_dir| search_dir.join(tool))
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| panic!("no {tool} on the test process's PATH"))
+        .canonicalize()
+        .expect("resolve the tool's real path");
+    std::os::unix::fs::symlink(found, dir.join(tool))
+        .unwrap_or_else(|e| panic!("symlink {tool} into the stub PATH dir: {e}"));
+}
+
+/// The skip branch bin/check guards shellcheck with: without the tool the
+/// gate must neither fail nor pass silently — it prints a SKIP notice naming
+/// the mirrored ci.yml job and carries on with the audit gate. Deleting the
+/// else-arm makes the skip silent; making the skip abort the gate makes
+/// bin/check fail: either breaks this test.
+#[test]
+fn check_skips_shellcheck_loudly_when_it_is_absent() {
+    let sandbox = Sandbox::new();
+    fs::remove_file(sandbox.stub_dir.join("shellcheck")).expect("remove the shellcheck stub");
+    // Pin the absence against the box: a real shellcheck later on the system
+    // PATH would answer the guard's `command -v` and run — and fail, on the
+    // sandbox's file list — so this run sees the stub dir alone.
+    link_system_tool("bash", &sandbox.stub_dir);
+    link_system_tool("dirname", &sandbox.stub_dir);
+    let output = sandbox.run_with("check", &sandbox.stub_dir, &[]);
+    assert!(
+        output.status.success(),
+        "bin/check must exit 0 when shellcheck is absent:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("SKIP:") && stderr.contains("ci.yml shellcheck job"),
+        "bin/check must skip loudly, naming the mirrored ci.yml shellcheck job: {stderr:?}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("SKIP:"),
+        "the SKIP notice belongs on stderr, not stdout"
+    );
+    assert!(
+        !sandbox.shellcheck_log.exists(),
+        "nothing may shellcheck when the tool is absent"
+    );
+    // Skipping one gate must not end the run: the audit gate follows it.
+    let args = fs::read_to_string(&sandbox.cargo_args_log).expect("cargo stub never invoked");
+    assert!(
+        args.lines().any(|call| call == "audit"),
+        "bin/check must still run `cargo audit` after the skipped shellcheck gate, got {args:?}"
+    );
+    sandbox.assert_cargo_ran_from_repo_root();
+}
+
+/// The audit gate's skip branch, driven through the guard bin/check itself
+/// uses: `cargo audit --version`. The stub fails exactly that probe when
+/// CARGO_STUB_FAIL_AUDIT_PROBE is set — a box without cargo-audit — so the
+/// gate must skip loudly (naming the mirrored ci.yml audit job), exit 0,
+/// and leave the real `cargo audit` unrun.
+#[test]
+fn check_skips_audit_loudly_when_cargo_audit_is_absent() {
+    let sandbox = Sandbox::new();
+    let output = sandbox.run_with(
+        "check",
+        Path::new(&sandbox.stubbed_path()),
+        &[("CARGO_STUB_FAIL_AUDIT_PROBE", "1")],
+    );
+    assert!(
+        output.status.success(),
+        "bin/check must exit 0 when cargo-audit is absent (the failing probe runs inside an if):\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("SKIP:") && stderr.contains("ci.yml audit job"),
+        "bin/check must skip loudly, naming the mirrored ci.yml audit job: {stderr:?}"
+    );
+    // The probe ran and failed, so the gate behind it never did — and the
+    // shellcheck gate ahead of it is unaffected.
+    let args = fs::read_to_string(&sandbox.cargo_args_log).expect("cargo stub never invoked");
+    assert!(
+        args.lines().any(|call| call == "audit --version"),
+        "bin/check must probe for cargo-audit before skipping, got {args:?}"
+    );
+    assert!(
+        !args.lines().any(|call| call == "audit"),
+        "a failed probe must skip the `cargo audit` gate itself, got {args:?}"
+    );
+    assert!(
+        sandbox.shellcheck_log.exists(),
+        "the shellcheck gate ahead of the skipped audit gate must still run"
     );
     sandbox.assert_cargo_ran_from_repo_root();
 }

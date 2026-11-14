@@ -36,7 +36,7 @@ Deps pinned to latest stable at implementation time.
 |---|---|
 | Build | `cargo build` |
 | Run locally (watch + reload, loads `.env`) | `bin/dev` |
-| Full gate (fmt --check + clippy -D warnings + test, e2e included; all `--locked`) | `bin/check` |
+| Full gate — all four ci.yml gates (fmt --check + clippy -D warnings + test + shellcheck + cargo audit; e2e included; cargo steps `--locked`; the last two skip loudly when the tool is not installed) | `bin/check` |
 | End-to-end suite only (real binary over HTTP) | `bin/e2e` |
 | Test | `cargo test` |
 | Single test by pattern | `cargo test <pattern>` |

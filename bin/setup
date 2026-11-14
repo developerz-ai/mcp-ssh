@@ -29,6 +29,6 @@ Build complete. Pre-commit hook active (.githooks/pre-commit → bin/check).
 Next steps:
   bin/dev                # run the server locally (state in .local/)
   bin/stop               # stop it
-  bin/check              # run the fmt/clippy/test gate
+  bin/check              # run the CI gate: fmt/clippy/test + shellcheck/audit
   bin/e2e                # boot the real binary and drive it over HTTP
 MSG

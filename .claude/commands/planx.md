@@ -56,7 +56,7 @@ $ARGUMENTS
 1. Ordered, concrete actions. Reference `Type#method` / `file:line`, don't restate.
 
 ## Tests
-- What to add/run. Tests written with the code — `#[cfg(test)]` for logic (in the sibling `tests.rs` once a file nears the limit), `tests/e2e/` for the real binary over HTTP (`bin/e2e`). Gate: `bin/check` (fmt --check + clippy -D warnings + test, e2e included).
+- What to add/run. Tests written with the code — `#[cfg(test)]` for logic (in the sibling `tests.rs` once a file nears the limit), `tests/e2e/` for the real binary over HTTP (`bin/e2e`). Gate: `bin/check` (fmt --check + clippy -D warnings + test, e2e included, + shellcheck + cargo audit — CI-parity; missing tool → loud `SKIP:`, still exit 0).
 
 ## Done when
 - Verifiable acceptance criteria for this slice.

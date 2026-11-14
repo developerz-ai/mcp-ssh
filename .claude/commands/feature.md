@@ -47,7 +47,7 @@ Exceed it → split **even if the user asked for one PR**, and say why. Agent fi
 |---|---|---|
 | format | `rustfmt --edition 2024 <files it edited>` | `cargo fmt --check` |
 | tests | `cargo test <its own module path>` — `cargo test jobs::signal`, `cargo test oauth::store`. Tests are colocated `#[cfg(test)]`, so the module path *is* the filter | `cargo test` |
-| lint | `cargo clippy --all-targets -- -D warnings` **once when otherwise done** — crate-wide by nature on a single-binary crate, a floor not a scoped check. Expect to wait on the build lock | covered by `bin/check` (`fmt --check` + `clippy` + `test`) |
+| lint | `cargo clippy --all-targets -- -D warnings` **once when otherwise done** — crate-wide by nature on a single-binary crate, a floor not a scoped check. Expect to wait on the build lock | covered by `bin/check` (`fmt --check` + `clippy` + `test` + `shellcheck` + `cargo audit`) |
 
 Whole-crate green is the coordinator's, once, **in the background**, after every agent finishes. No changed/affected cargo mode exists, and **no `--all-features`** — this crate declares no `[features]`, so `--all-targets` (what CI runs) is the ceiling; don't invent a stronger-looking flag. Agents booting the server in a test share **one SQLite file and one bind port** (`MCP_SSH_BIND`, default `127.0.0.1:1337`) — give a hand-run server a `tempfile` DB dir and a distinct port, or you'll read a neighbour's `EADDRINUSE`/locked-DB as a real defect. `bin/dev` holds that port; one agent only.
 

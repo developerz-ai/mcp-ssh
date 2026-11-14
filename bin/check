@@ -6,3 +6,20 @@ cd "$(dirname "$0")/.."
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
+
+# CI parity: ci.yml gates every push and PR on two more always-on jobs than
+# the cargo steps above cover (shellcheck, audit). Run them here too; a box
+# without the tool skips loudly — naming the mirrored ci.yml job — instead
+# of failing, and a tool that is present and fails fails this gate as usual.
+if command -v shellcheck >/dev/null 2>&1; then
+  shellcheck bin/* deploy/install.sh deploy/debian/postinst \
+    .githooks/pre-commit .claude/hooks/*.sh .github/scripts/*.sh
+else
+  echo "SKIP: shellcheck not installed — CI runs this gate (ci.yml shellcheck job)" >&2
+fi
+
+if cargo audit --version >/dev/null 2>&1; then
+  cargo audit
+else
+  echo "SKIP: cargo-audit not installed — CI runs this gate (ci.yml audit job); install it with: cargo install cargo-audit --locked" >&2
+fi

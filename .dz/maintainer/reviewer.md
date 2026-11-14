@@ -7,7 +7,7 @@
 
 ## Stack
 
-Rust 2024 + Cargo, toolchain pinned in `rust-toolchain.toml`. The gate is `bin/check` (`cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked`, the e2e suite included): a change that does not pass it is not proven, whatever its description says.
+Rust 2024 + Cargo, toolchain pinned in `rust-toolchain.toml`. The gate is `bin/check` (`cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked`, plus CI's `shellcheck` and `cargo audit` gates (skipped loudly when the tool is missing locally), the e2e suite included): a change that does not pass it is not proven, whatever its description says.
 
 ## Review conventions
 
