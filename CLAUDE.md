@@ -88,7 +88,7 @@ Keep this accurate — it's the navigation aid. One row per non-test file (`test
 | `src/jobs/status.rs` | `JobStatus`: the bare `jobs.status` word (`running`/`exited`/`failed`); the one place the on-disk strings are spelled |
 | `src/jobs/store.rs` | `JobRepo`: the `jobs` repository the engine, reaper and admin CLI call (insert, finish with the saved tail — 500 lines, ≤256 KiB — find, paged summaries, listing). No `cmd` text reaches a query or a log line |
 | `src/jobs/store/row.rs` | row⇄domain mapping: typed rows, `JobState` onto `(status, code, error)` and back |
-| `src/jobs/store/fail.rs` | recording `failed` for a job this writer may not own (kill, reconcile) — only while the row still reads `running` |
+| `src/jobs/store/fail.rs` | recording `failed` for a job this writer may not own (kill, reconcile) — only while the row still reads `running`, or replacing a bare `killed by signal N` the engine recorded |
 | `src/jobs/store/reap.rs` | the reaper's and reconcile's queries: untracked `running` rows, compaction/eviction candidates, deleting aged-out rows |
 | `src/tools/mod.rs` | MCP tool surface (`#[tool_router]`/`#[tool]` from rmcp): 3 tools (`bash`/`job`/`file`) dispatching on `action`, their descriptions, one tracing span per dispatch. Thin adapters over jobs + files |
 | `src/tools/args.rs` | arg structs for the 3 tools (`BashArgs`/`JobArgs`/`FileArgs`, all `deny_unknown_fields`; `JobAction`/`FileAction`) + `lenient_action` (non-string/missing `action` → `list`, unknown string → error) — schema shape only |
@@ -122,7 +122,7 @@ One implementation, `src/jobs/signal/kill.rs` over `src/jobs/signal.rs`, behind 
 - Tri-state probe: delivered or `EPERM` = alive, `ESRCH` = gone, any other errno = **unknown**. Unknown is never read as gone.
 - Escalation: `SIGTERM`, 2s grace, `SIGKILL`, then probe; an interactive job's leader is `SIGSTOP`ped first. Success = the group probed gone, never "the leader exited".
 - A persisted pgid outside `2..=i32::MAX` is refused; one recorded under another boot id is never signalled.
-- Every path returns a `KillOutcome` — `Killed`, `KilledLeftovers`, `NotRunning`, `Unknown`, `NoProcessGroup`, `CorruptProcessGroup`, `Survived`, `NotSignalled` — that callers only render (`src/tools/job_render.rs`, `src/admin.rs`). `kill_persisted` writes `failed` only on `Killed`, and only while the row still reads `running` (a real exit recorded meanwhile wins).
+- Every path returns a `KillOutcome` — `Killed`, `KilledLeftovers`, `NotRunning`, `Unknown`, `NoProcessGroup`, `CorruptProcessGroup`, `Survived`, `NotSignalled` — that callers only render (`src/tools/job_render.rs`, `src/admin.rs`). `kill_persisted` writes `failed` only on `Killed`, and only while the row still reads `running` (a real exit recorded meanwhile wins) — except that a bare `killed by signal N` the engine recorded is replaced by the kill's reason, so the waiter/kill race can't decide whether the row says why.
 
 ## MCP tool design
 
