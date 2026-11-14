@@ -1,19 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+cd "$(dirname "$0")/.."
+
 if ! command -v cargo >/dev/null 2>&1; then
   echo "error: cargo not found. Install Rust from https://rustup.rs" >&2
   exit 1
 fi
 
-cargo build
+# One pre-commit gate: .githooks/pre-commit runs bin/check.
+git config core.hooksPath .githooks
 
-cat <<'EOF'
+cargo build --locked
 
-Build complete.
+cat <<'MSG'
+
+Build complete. Pre-commit hook active (.githooks/pre-commit → bin/check).
 
 Next steps:
   cp .env.example .env   # then edit credentials
-  bin/dev                # run the server locally
+  bin/dev                # run the server locally (state in .local/)
+  bin/stop               # stop it
   bin/check              # run the fmt/clippy/test gate
-EOF
+  bin/e2e                # boot the real binary and drive it over HTTP
+MSG

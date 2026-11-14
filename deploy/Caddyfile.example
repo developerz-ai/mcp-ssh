@@ -1,3 +1,7 @@
+# Caddy only answers for the site address below, so a stray Host never reaches
+# mcp-ssh. Rate limiting the login endpoints (/authorize, /token, /register)
+# needs a plugin (github.com/mholt/caddy-ratelimit, via xcaddy); stock Caddy
+# has none. nginx-mcp-ssh.conf.example is the reference form.
 your-host.example.com {
 	reverse_proxy 127.0.0.1:1337
 }

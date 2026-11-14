@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use regex::{Captures, Regex};
-use sentry::protocol::Event;
+use sentry::protocol::{Context, Event};
 use sentry::types::Dsn;
 use sentry::{BeforeCallback, ClientOptions};
 use serde_json::Value;
@@ -128,8 +128,53 @@ fn scrub_value(value: Value, scrubbers: &Scrubbers) -> Value {
     }
 }
 
-/// Redact the human-readable + JSON fields of an outbound event in place.
+/// Redact the human-readable + JSON fields of an outbound event in place, and drop
+/// the fields that only ever identify the host or a client (request, user,
+/// hostname, template, non-system contexts). Fail closed: anything not known to be
+/// harmless is removed rather than scrubbed.
 fn scrub_event(event: &mut Event<'_>, scrubbers: &Scrubbers) {
+    event.request = None;
+    event.user = None;
+    event.server_name = None;
+    event.template = None;
+    event
+        .contexts
+        .retain(|_, c| matches!(c, Context::Os(_) | Context::Runtime(_) | Context::Device(_)));
+
+    for (k, v) in event.tags.iter_mut() {
+        *v = if is_secret_key(k) {
+            REDACTED.to_string()
+        } else {
+            scrubbers.scrub(v)
+        };
+    }
+
+    if let Some(entry) = event.logentry.as_mut() {
+        entry.message = scrubbers.scrub(&entry.message);
+        for p in entry.params.iter_mut() {
+            *p = scrub_value(std::mem::take(p), scrubbers);
+        }
+    }
+
+    let traces = event
+        .exception
+        .values
+        .iter_mut()
+        .flat_map(|ex| ex.stacktrace.as_mut())
+        .chain(event.stacktrace.as_mut())
+        .chain(
+            event
+                .threads
+                .values
+                .iter_mut()
+                .flat_map(|t| t.stacktrace.as_mut()),
+        );
+    for trace in traces {
+        for frame in trace.frames.iter_mut() {
+            frame.vars.clear();
+        }
+    }
+
     event.message = event.message.take().map(|m| scrubbers.scrub(&m));
 
     for ex in event.exception.values.iter_mut() {
@@ -428,6 +473,71 @@ mod tests {
         );
         assert_eq!(crumb.data["pass"], Value::String(REDACTED.to_string()));
         assert_eq!(event.extra["password"], Value::String(REDACTED.to_string()));
+    }
+
+    #[test]
+    fn scrub_event_drops_identifying_fields() {
+        use sentry::protocol::{Frame, LogEntry, Request, Stacktrace, User};
+
+        let mut headers = sentry::protocol::Map::new();
+        headers.insert("Authorization".into(), "Bearer tok123".into());
+        let mut other = sentry::protocol::Map::new();
+        other.insert("note".into(), Value::String("pass=ctx-secret".into()));
+        let mut frame = Frame::default();
+        frame
+            .vars
+            .insert("token".into(), Value::String("frame-secret".into()));
+        let mut event = Event {
+            request: Some(Request {
+                headers,
+                ..Default::default()
+            }),
+            user: Some(User {
+                ip_address: Some(sentry::protocol::IpAddress::Auto),
+                ..Default::default()
+            }),
+            server_name: Some("box.internal".into()),
+            logentry: Some(LogEntry {
+                message: "token=log-secret".into(),
+                params: vec![Value::String("pass=param-secret".into())],
+            }),
+            stacktrace: Some(Stacktrace {
+                frames: vec![frame],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        event.tags.insert("api_token".into(), "tag-secret".into());
+        event
+            .tags
+            .insert("note".into(), "password=tag2-secret".into());
+        event
+            .contexts
+            .insert("custom".into(), Context::Other(other));
+        event
+            .contexts
+            .insert("os".into(), Context::Os(Box::default()));
+
+        scrub_event(&mut event, &Scrubbers::build());
+
+        assert!(event.request.is_none());
+        assert!(event.user.is_none());
+        assert!(event.server_name.is_none());
+        assert!(event.contexts.contains_key("os"), "system context kept");
+        assert!(!event.contexts.contains_key("custom"));
+        let out = serde_json::to_string(&event).expect("serialize");
+        for secret in [
+            "tok123",
+            "box.internal",
+            "log-secret",
+            "param-secret",
+            "frame-secret",
+            "tag-secret",
+            "tag2-secret",
+            "ctx-secret",
+        ] {
+            assert!(!out.contains(secret), "{secret} leaked: {out}");
+        }
     }
 
     #[test]

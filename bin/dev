@@ -10,6 +10,11 @@ if [ -f .env ]; then
   set +a
 fi
 
+# Dev state (DB, job logs — see .env.example) and the pid bin/stop targets.
+mkdir -p .local
+# `exec` keeps this pid, so it names the cargo process tree bin/stop tears down.
+echo $$ > .local/dev.pid
+
 if command -v cargo-watch >/dev/null 2>&1; then
   exec cargo watch -x 'run -- serve'
 else

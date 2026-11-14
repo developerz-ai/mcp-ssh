@@ -23,6 +23,10 @@ updates:
       time: "10:00"
     cooldown:
       default-days: 14
+    # The builder's Rust version must equal rust-toolchain.toml and Cargo.toml
+    # `rust-version`; Dependabot can't bump those, so toolchain bumps are manual.
+    ignore:
+      - dependency-name: "lukemathwalker/cargo-chef"
     groups:
       docker-minor-and-patch:
         patterns: ["*"]

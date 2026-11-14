@@ -1,10 +1,7 @@
 #!/usr/bin/env bash
-set -e
-
-cargo fmt
-cargo clippy --all-targets -- -D warnings
-
-# Stage any files cargo fmt rewrote so the commit includes them.
-if ! git diff --quiet; then
-  git add -u
-fi
+# Agent pre-commit gate. When the git hook is active (bin/setup), it already runs
+# bin/check on this commit — don't run the suite twice.
+set -euo pipefail
+cd "$(dirname "$0")/../.."
+[ "$(git config core.hooksPath || true)" = ".githooks" ] && exit 0
+exec bin/check
