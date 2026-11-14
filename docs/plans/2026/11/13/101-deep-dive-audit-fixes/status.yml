@@ -31,7 +31,7 @@ slices:
   - file: 08-docs-structure.md
     status: complete
     percent: 100
-evidence: ["#61", "#62", "#63", "#64", "v2.0.0"]   # #61 (572dd85): slices 01–05 code; #62 (5db496b): 06–07 ops/CI/e2e; #63: 08 splits + module-map guard; #64: 08 docs + release notes
+evidence: ["#61", "#62", "#63", "#68", "v2.0.0"]   # #61 (572dd85): slices 01–05 code; #62 (5db496b): 06–07 ops/CI/e2e; #63: 08 splits + module-map guard; #68: 08 docs + release notes
 notes: |
   Owner decisions taken: delete of a non-empty dir needs recursive=true; unknown job action string -> error, deny_unknown_fields on all args; reaper ages from finish and never kills; atomic write; consent page; no argon2 (redacted Debug + parse-error scrub only); SHA-256 token hashing (one-time logout); 90-day refresh family; 256 MiB live log cap; ProtectSystem only in the lockdown drop-in; LOC rule = <=300 non-test LOC, tests in a sibling tests.rs.
   Deferred (not fixed by 01–07; each needs its own change):
