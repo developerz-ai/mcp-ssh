@@ -41,13 +41,13 @@ pr:
   close_awaiting_author_after_days: 21
   # Close a pull request with no activity this long; a comment, a push or a reopen
   # restarts the clock. false turns it off. See /docs/maintainer-yml.
-  close_inactive_after_days: 60
+  close_inactive_after_days: 30
 
-# branches: on at 60 because this file exists. A branch with no new commit
-# this long is tagged archive/<branch>/<date> at its last commit, then deleted.
+# branches: a branch with no new commit this long is tagged
+# archive/<branch>/<date> at its last commit, then deleted.
 # false keeps every branch. See /docs/maintainer-yml.
 branches:
-  close_inactive_after_days: 60
+  close_inactive_after_days: 30
 
 # release: derived from the detected mechanism. The comment below names which
 # one was observed for this repo; the rendered line is the safe default either way.
@@ -71,12 +71,18 @@ review:
 # queue honest about which issues are dispatch-ready.
 triage:
   ask_for_repro: true
+  # Nobody reads this tracker by hand: below this confidence the bot stops and
+  # waits for a person, so it is set under the 0.6 default.
+  confidence_threshold: 0.4
+  # An issue quiet this long gets a comment naming the window, then is closed.
+  stale_after_days: 30
+  stale_action: comment_then_close
   # Close a report whose repro request the reporter never answered, after one
   # reminder. false turns it off. See /docs/stale-work.
   close_unanswered_repro_after_days: 14
   # Close an issue with no activity this long; a comment or a reopen restarts the
   # clock. false turns it off. See /docs/maintainer-yml.
-  close_inactive_after_days: 60
+  close_inactive_after_days: 30
 
 # escalate: what stays with a human.
 #   - `always` is the schema default, written out so you can see it.
@@ -92,9 +98,15 @@ escalate:
 scout:
   survey: broken_only
 
-# Proactive checkups, each a scout reading a brief you commit. Off by default: the
-# platform maintains this repo, it does not hunt for improvements. Uncomment `schedules:`
-# and the entries you want (drop the leading `# ` on each line) to run them weekly.
+# devops: match first-tier security advisories (KEV, NVD, GitHub, OSV) against what
+# this repo runs, so a vulnerable dependency becomes work without anyone looking.
+devops:
+  watch: advisories
+
+# Proactive checkups, each a scout reading a brief you commit. Kept OFF on purpose:
+# improvements here are wanted monthly at most, and a schedule is `days` + `hours_utc`,
+# so once a week is the slowest it can fire. Enable these only when the platform
+# grows a monthly cadence.
 # schedules:
 #   # A weekly hygiene checkup: resource leaks, slow algorithms, duplicated helpers and
 #   # indexes, docs that drifted from the code, oversized or dead code. It reads the
