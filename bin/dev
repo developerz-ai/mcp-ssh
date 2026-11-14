@@ -12,7 +12,8 @@ fi
 
 # Dev state (DB, job logs — see .env.example) and the pid bin/stop targets.
 mkdir -p .local
-# `exec` keeps this pid, so it names the cargo process tree bin/stop tears down.
+# `exec` keeps this pid: the cargo tree — or, once `cargo run` execs the built
+# binary in place, the server itself — that bin/stop tears down.
 echo $$ > .local/dev.pid
 
 if command -v cargo-watch >/dev/null 2>&1; then
