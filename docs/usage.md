@@ -191,4 +191,4 @@ mcp-ssh set-auth admin     # prompts for the password
 3. mcp-ssh's **login page** shows where the client will be sent. Check it's the client you started, then log in with the username/password you set via `mcp-ssh set-auth`.
 4. The client receives an access token (24h) plus a refresh token (30 days, rotated on use) and renews silently; after 90 days it logs in again.
 
-`mcp-ssh sessions --revoke` (or changing the password with `set-auth`) logs every client out.
+`mcp-ssh sessions --revoke` (or changing the password with `set-auth`) logs every client out. A stream that is already open closes within 30 seconds.

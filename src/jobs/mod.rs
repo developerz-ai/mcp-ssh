@@ -5,7 +5,7 @@ use std::{
     collections::HashMap,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock, atomic::AtomicU64},
+    sync::{Arc, atomic::AtomicU64},
     time::Duration,
 };
 
@@ -55,7 +55,9 @@ struct Job {
     state: Arc<Mutex<JobState>>,
     /// Why this job is being killed, set before the first signal. The waiter
     /// records it as the job's final error instead of a bare "killed by signal".
-    kill_reason: OnceLock<String>,
+    /// Withdrawn again by a kill the group outlived (see `signal::kill`), so it
+    /// never names a kill that did not end the job.
+    kill_reason: Mutex<Option<&'static str>>,
 }
 
 /// Result of starting a command.

@@ -3,9 +3,15 @@
 //! into *parameters*. Three tools — `bash`, `job`, `file`. Real work lives in
 //! `crate::jobs` and `files`.
 use rmcp::{
-    ErrorData as McpError, ServerHandler,
-    handler::server::{common::RequestId, router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, ContentBlock, ServerCapabilities, ServerConfig},
+    ErrorData as McpError, RoleServer, ServerHandler,
+    handler::server::{
+        common::RequestId, router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters,
+    },
+    model::{
+        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ServerCapabilities,
+        ServerConfig,
+    },
+    service::RequestContext,
     tool, tool_handler, tool_router,
 };
 // `RequestId` above is rmcp's extractor for the per-call JSON-RPC request id.
@@ -16,6 +22,7 @@ use crate::jobs::{JobId, JobStore};
 mod args;
 mod files;
 mod job_render;
+mod reject;
 mod render;
 
 use args::{BashArgs, FileAction, FileArgs, JobAction, JobArgs};
@@ -24,8 +31,6 @@ use render::{render_file, render_file_error};
 #[derive(Clone)]
 pub struct Tools {
     jobs: JobStore,
-    // Read by the rmcp `#[tool_handler]` macro; dead-code analysis can't see it.
-    #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
 
@@ -210,6 +215,19 @@ impl ServerHandler for Tools {
              monitors jobs with paginated output; `file` (action=read/write/append/delete/list/grep/move) \
              operates locally as the service user.",
         )
+    }
+
+    /// The router's own dispatch, plus the one thing it can't do: tell the
+    /// operator about a call it refuses before any tool body (and its span) runs.
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        reject::log_if_rejected(&request, &context.id);
+        self.tool_router
+            .call(ToolCallContext::new(self, request, context))
+            .await
     }
 }
 

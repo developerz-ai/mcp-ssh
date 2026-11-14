@@ -34,8 +34,8 @@ pub(crate) enum KillOutcome {
 }
 
 /// Kill a job this process tracks. A running job's group is escalated (its
-/// `reason` becomes the job's final error once the waiter sees it die); a finished
-/// one is probed for leftovers and those are killed.
+/// `reason` becomes the job's final error once the waiter sees it die — see
+/// [`blamed`]); a finished one is probed for leftovers and those are killed.
 pub(in crate::jobs) async fn kill_job(job: &Job, reason: &'static str) -> KillOutcome {
     let state = job.state.lock().await.clone();
     let Some(pgid) = job.pgid else {
@@ -46,23 +46,49 @@ pub(in crate::jobs) async fn kill_job(job: &Job, reason: &'static str) -> KillOu
             },
         };
     };
-    let how = if job.interactive {
-        Kill::GracefulStopLeader
-    } else {
-        Kill::Graceful
-    };
+    let how = how_to_kill(job.interactive);
     match state {
-        JobState::Running => {
-            // First reason wins: a cap breach already recorded stays the cause.
-            let _ = job.kill_reason.set(reason.to_string());
-            running_outcome(escalate(pgid, how).await, pgid)
-        }
+        JobState::Running => running_outcome(blamed(job, reason, escalate(pgid, how)).await, pgid),
         finished => leftovers(pgid, how, status_word(&finished)).await,
     }
 }
 
+/// Run `escalation` with `reason` standing as the job's cause of death, for the
+/// waiter to record when the leader dies under it. If the group outlives the
+/// kill, the reason is withdrawn: whatever ends the job later was not this kill,
+/// and must be recorded as what it was (an exit code, another signal).
+pub(super) async fn blamed(
+    job: &Job,
+    reason: &'static str,
+    escalation: impl Future<Output = Escalation>,
+) -> Escalation {
+    let claimed = {
+        let mut cause = job.kill_reason.lock().await;
+        // First reason wins: a cap breach already recorded stays the cause.
+        let free = cause.is_none();
+        if free {
+            *cause = Some(reason);
+        }
+        free
+    };
+    let escalation = escalation.await;
+    if claimed && !matches!(escalation, Escalation::Gone) {
+        *job.kill_reason.lock().await = None;
+    }
+    escalation
+}
+
+fn how_to_kill(interactive: bool) -> Kill {
+    if interactive {
+        Kill::GracefulStopLeader
+    } else {
+        Kill::Graceful
+    }
+}
+
 /// Kill a job from its persisted row — for every caller that holds no in-process
-/// [`Job`]. Only [`persisted_group`] turns a row into a signal target. The
+/// [`Job`]. Only [`persisted_group`] turns a row into a signal target, and the row
+/// says whether the job is interactive, so it is escalated as [`kill_job`] would. The
 /// `failed` transition (with `reason` in the `error` column) is written only once
 /// the group is gone and only while the row still reads `running`, so a real exit
 /// recorded meanwhile wins. That write is best effort — the kill has happened.
@@ -94,9 +120,10 @@ pub(crate) async fn kill_persisted(
         });
     }
     let group = persisted_group(Some(raw), target.boot_id.as_deref());
+    let how = how_to_kill(target.interactive);
     if !running {
         return Ok(match group {
-            Some(pgid) => leftovers(pgid, Kill::Graceful, &target.status).await,
+            Some(pgid) => leftovers(pgid, how, &target.status).await,
             None => KillOutcome::NotRunning {
                 status: target.status,
             },
@@ -104,7 +131,7 @@ pub(crate) async fn kill_persisted(
     }
     // A running row from a previous boot: its group cannot exist any more.
     let outcome = match group {
-        Some(pgid) => running_outcome(escalate(pgid, Kill::Graceful).await, pgid),
+        Some(pgid) => running_outcome(escalate(pgid, how).await, pgid),
         None => KillOutcome::Killed,
     };
     if matches!(outcome, KillOutcome::Killed)

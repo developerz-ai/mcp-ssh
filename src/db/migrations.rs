@@ -16,6 +16,7 @@ const MIGRATIONS: &[Migration] = &[
     add_job_finished_unix,
     constrain_jobs,
     hash_and_bind_tokens,
+    add_job_interactive,
 ];
 
 /// The newest schema version this binary understands.
@@ -163,6 +164,13 @@ fn hash_and_bind_tokens(tx: &Transaction) -> rusqlite::Result<()> {
     // them the full grace period to log in again rather than dropping them at once.
     tx.execute("UPDATE clients SET created_unix = ?1", [now_unix()])?;
     Ok(())
+}
+
+/// v6: whether a job was launched through the interactive bash, so a kill that has
+/// only the row to go on stops its leader first, as a kill of a tracked job does.
+/// Rows from before this step read as not interactive.
+fn add_job_interactive(tx: &Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch("ALTER TABLE jobs ADD COLUMN interactive INTEGER NOT NULL DEFAULT 0;")
 }
 
 /// `table`/`column` are compile-time constants (never user input), so

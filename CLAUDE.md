@@ -59,9 +59,10 @@ Keep this accurate — it's the navigation aid. One row per non-test file (`test
 | `src/config.rs` | env + TOML file config; fails fast on missing/empty creds or a non-loopback bind without `MCP_SSH_ALLOWED_HOSTS`; clamps `inline_timeout` ≤60s; `Password` with redacted `Debug`; TOML parse errors scrubbed of the file's text. `db_path()` resolves the DB path alone for the cred-free admin commands |
 | `src/config/set_auth.rs` | `set-auth`'s config write: atomic replace, 0600 from the first byte, owner adopted from the config dir |
 | `src/db.rs` | SQLite connection (`rusqlite`, `bundled`): open/create (file 0600, WAL), `open_existing` for the admin CLI, one serialized connection driven via `spawn_blocking`, typed `DbError`. DB at `/var/lib/mcp-ssh/mcp-ssh.db`. Queries live in the repositories (`src/jobs/store.rs`, `src/oauth/store.rs`) |
-| `src/db/migrations.rs` | the schema (`jobs`, hashed `access_tokens`/`refresh_tokens`/`refresh_tombstones`, `clients`) as ordered forward-only steps versioned by `PRAGMA user_version`, each in its own `BEGIN IMMEDIATE` transaction. Append only |
-| `src/auth.rs` | bearer-only guard for `/mcp` (`require_auth`; store outage → 503, not 401) and `check_login`, the constant-time credential check the consent form uses. No HTTP Basic |
-| `src/oauth/mod.rs` | minimal OAuth 2.1 server wiring: `AuthState`, the public routes (discovery, `/authorize` GET+POST, `/token`, `/register`) with a 64 KiB body limit |
+| `src/db/migrations.rs` | the schema (`jobs` incl. `interactive`, hashed `access_tokens`/`refresh_tokens`/`refresh_tombstones`, `clients`) as ordered forward-only steps versioned by `PRAGMA user_version`, each in its own `BEGIN IMMEDIATE` transaction. Append only |
+| `src/auth.rs` | bearer-only guard for `/mcp` (`require_auth`; store outage → 503, not 401; a streaming response keeps re-checking its token — see `src/auth/revalidate.rs`) and `check_login`, the constant-time credential check the consent form uses. No HTTP Basic |
+| `src/auth/revalidate.rs` | re-checks an open `/mcp` stream's token on an interval (`STREAM_REVALIDATE`, 30s) and ends the body once it is revoked or expired; holds the token hash, never the bearer; a store outage keeps the stream |
+| `src/oauth/mod.rs` | minimal OAuth 2.1 server wiring: `AuthState` (creds, store, public URL, the stream re-check interval), the public routes (discovery, `/authorize` GET+POST, `/token`, `/register`) with a 64 KiB body limit |
 | `src/oauth/metadata.rs` | RFC 8414 / RFC 9728 discovery documents; `base_url` from `MCP_SSH_PUBLIC_URL` else the allow-listed `Host` |
 | `src/oauth/flow.rs` | `/authorize`: GET validates (registered `client_id` + exact `redirect_uri`, else `invalid_request`; PKCE S256) and renders the consent page — never a code; POST takes the single-use CSRF nonce + credentials and only then redirects with a code. Flat delay on a failed login; redirect-URI rule |
 | `src/oauth/flow/token.rs` | `/token`: `authorization_code` (code + PKCE verifier) and `refresh_token` grants; `no-store`; store outage → 503 |
@@ -75,7 +76,7 @@ Keep this accurate — it's the navigation aid. One row per non-test file (`test
 | `src/oauth/store/sweep.rs` | `revoke_all` (`sessions --revoke`, `set-auth`) and the reaper's `sweep_expired_access`/`sweep_expired_refresh`/`sweep_stale_clients` — counts only, never a token value |
 | `src/jobs/mod.rs` | job engine facade: `JobStore` wiring (`new` spawns the reaper), public types (`JobState`, `RunResult`, `JobSummary`, `JobList`, `JobError`), `list` (paged, ≤200) and `kill` |
 | `src/jobs/run.rs` | launching: reserve id + 0600 log (`create_new`), spawn in its own process group (`sh -c` or `bash -ic`), hand to the supervisor, wait out the inline window |
-| `src/jobs/supervise.rs` | the supervisor task: owns a job from spawn to its recorded final state (survives request cancellation), enforces the 256 MiB live log cap (`LOG_CAP`; `SIGKILL` past it), maps exit/signal to `JobState` |
+| `src/jobs/supervise.rs` | the supervisor task: owns a job from spawn to its recorded final state (survives request cancellation), enforces the 256 MiB live log cap (`LOG_CAP`; `SIGKILL` past it) — on leftovers too, until the group is gone — maps exit/signal to `JobState` |
 | `src/jobs/poll.rs` | poll: status + one newest-first page from the live log, else the tail saved in the row |
 | `src/jobs/id.rs` | `JobId` newtype: `<title>-HH-MM-SS` (normalized agent `title`, else `job`; `-<seq>` on collision); free of command text so secrets can't leak into an id, log line, or filename |
 | `src/jobs/log.rs` | bounded backward log reads: `read_tail`/`tail_of_text` → `TailPage { lines, older }` (byte-offset cursor), under line/byte/scan budgets; long lines clamped to 8 KiB |
@@ -88,11 +89,12 @@ Keep this accurate — it's the navigation aid. One row per non-test file (`test
 | `src/jobs/status.rs` | `JobStatus`: the bare `jobs.status` word (`running`/`exited`/`failed`); the one place the on-disk strings are spelled |
 | `src/jobs/store.rs` | `JobRepo`: the `jobs` repository the engine, reaper and admin CLI call (insert, finish with the saved tail — 500 lines, ≤256 KiB — find, paged summaries, listing). No `cmd` text reaches a query or a log line |
 | `src/jobs/store/row.rs` | row⇄domain mapping: typed rows, `JobState` onto `(status, code, error)` and back |
-| `src/jobs/store/fail.rs` | recording `failed` for a job this writer may not own (kill, reconcile) — only while the row still reads `running`, or replacing a bare `killed by signal N` the engine recorded |
+| `src/jobs/store/fail.rs` | recording `failed` for a job this writer may not own (kill, reconcile) — only while the row still reads `running`, or replacing a bare `killed by signal N` the engine recorded; plus re-recording a finished job `failed` when the supervisor killed its leftovers over the log cap |
 | `src/jobs/store/reap.rs` | the reaper's and reconcile's queries: untracked `running` rows, compaction/eviction candidates, deleting aged-out rows |
 | `src/tools/mod.rs` | MCP tool surface (`#[tool_router]`/`#[tool]` from rmcp): 3 tools (`bash`/`job`/`file`) dispatching on `action`, their descriptions, one tracing span per dispatch. Thin adapters over jobs + files |
 | `src/tools/args.rs` | arg structs for the 3 tools (`BashArgs`/`JobArgs`/`FileArgs`, all `deny_unknown_fields`; `JobAction`/`FileAction`) + `lenient_action` (non-string/missing `action` → `list`, unknown string → error) — schema shape only |
 | `src/tools/render.rs` | agent-facing wording for `file`: `render_file`/`render_file_error` turn `FileOutcome`/`FileError` into sentences, markers and next-step hints |
+| `src/tools/reject.rs` | the operator's log line for a `tools/call` refused before dispatch (args `Parameters<T>` rejects, or an unknown tool): tool + fixed reason word + `request_id` — never a key, value or serde message |
 | `src/tools/job_render.rs` | agent-facing wording for `bash`/`job`: run/poll replies + the newest-first paging footer, list page + cursor, each `KillOutcome`, `JobError` |
 | `src/tools/files.rs` | file operations' shared types (`FileOutcome`, typed `FileError` — a failed shell op keeps its `ShError`) + `list`/`grep` (shelled-out `ls`/`find -maxdepth 20`/`grep`). Returns facts, never a sentence |
 | `src/tools/files/read.rs` | `read`: regular files only, forward by line, ≤1000 lines / 64 KiB a page, 8 KiB line clamp, 30s deadline |
@@ -108,7 +110,7 @@ Files ≤300 **non-test** LOC; a module's tests go in a sibling `tests.rs` (`#[c
 
 `bash` runs a command. Finishes within `MCP_SSH_INLINE_TIMEOUT_SECS` (default 2, clamped ≤60; per-call `timeout` clamped ≤600) → output returns inline. Slower (or `bg=true`) → auto-backgrounds to a **job id**; live output streams to a per-job log file (0600). `job(action="poll")` pages that log **newest-first**: no cursor = the latest page (≤`limit` lines, default 200, ≤64 KiB); the footer `[latest N lines shown; earlier output: job(action="poll", id="…", cursor=C)]` names the older page, where `C` is the **byte offset** that page starts at (absolute, so a growing log never re-serves lines). Reads walk backwards under a line/byte/scan budget — never the whole log. When the live log is gone (e.g. a finished job after a restart), poll falls back to the output tail saved in SQLite (500 lines, ≤256 KiB). This is the whole point: bounded output, no context blowups — and no server memory blowups.
 
-A job's live log is capped at 256 MiB (const): past it the group is `SIGKILL`ed and the job finishes `failed`.
+A job's live log is capped at 256 MiB (const) for as long as its process group holds a process — the leader, or what it left running (`server &`): past it the group is `SIGKILL`ed and the job is recorded `failed`, even one that had already `exited`. The cap is the supervisor's and ends with the server process: a group that outlives a restart is not watched.
 
 **Hybrid persistence:** structured state lives in SQLite (`src/db.rs`) — OAuth tokens + job metadata + output tail, durable across restarts; the high-frequency, append-heavy live output stays a per-job log file on disk. SQLite only sees low-frequency writes (token issue/validate, job create/finish), so one serialized connection is ample.
 
@@ -120,7 +122,7 @@ One implementation, `src/jobs/signal/kill.rs` over `src/jobs/signal.rs`, behind 
 
 - Signals via `kill(2)` (`libc`) — never an external `kill` binary (the Docker image has none).
 - Tri-state probe: delivered or `EPERM` = alive, `ESRCH` = gone, any other errno = **unknown**. Unknown is never read as gone.
-- Escalation: `SIGTERM`, 2s grace, `SIGKILL`, then probe; an interactive job's leader is `SIGSTOP`ped first. Success = the group probed gone, never "the leader exited".
+- Escalation: `SIGTERM`, 2s grace, `SIGKILL`, then probe; an interactive job's leader is `SIGSTOP`ped first — on both paths; the row's `interactive` column tells `kill_persisted`. A kill that ends `Survived`/`NotSignalled` withdraws its reason, so a later exit is recorded as what it was. Success = the group probed gone, never "the leader exited".
 - A persisted pgid outside `2..=i32::MAX` is refused; one recorded under another boot id is never signalled.
 - Every path returns a `KillOutcome` — `Killed`, `KilledLeftovers`, `NotRunning`, `Unknown`, `NoProcessGroup`, `CorruptProcessGroup`, `Survived`, `NotSignalled` — that callers only render (`src/tools/job_render.rs`, `src/admin.rs`). `kill_persisted` writes `failed` only on `Killed`, and only while the row still reads `running` (a real exit recorded meanwhile wins) — except that a bare `killed by signal N` the engine recorded is replaced by the kill's reason, so the waiter/kill race can't decide whether the row says why.
 
@@ -148,7 +150,7 @@ Non-negotiable: SOLID, SRP, tested code. The bar: idiomatic, boring, readable Ru
 - Borrow by default (`&str` over `String`, `&[T]` over `Vec<T>`). `.clone()` only when ownership must move — non-obvious clone gets a one-line `// why`. `Arc<T>` for shared read-only; lock only when you mutate shared state, keep the critical section tiny.
 - Functions do one thing. Need "and" to describe it → split it. Concrete first; introduce a trait when the **second** impl arrives.
 - Async end-to-end. No `std::sync::Mutex` on the request path — use `tokio::sync`. Never hold a `std::sync` guard across `.await`. No `block_on`; offload blocking I/O with `spawn_blocking`.
-- `tracing`, not `println`. Every tool dispatch is a span with `request_id` and `tool` name.
+- `tracing`, not `println`. Every tool dispatch is a span with `request_id` and `tool` name. A call refused before dispatch logs one `rejected` WARN (tool + reason word) instead.
 - Derive, don't hand-roll (`Debug`, `Clone`, serde). Every public type derives `Debug`. Keep `pub` surface minimal.
 - Comment the non-obvious *why*, never the *what*. Rename until the code doesn't need the *what*.
 
@@ -214,6 +216,10 @@ Non-negotiable: SOLID, SRP, tested code. The bar: idiomatic, boring, readable Ru
 - Add more MCP tools to dodge a param. Parametrize the existing surface.
 - Force-push `main`.
 - `--no-verify` on commits — fix the hook.
+
+## Changelog
+
+`CHANGELOG.md` is the index; each release's notes are `docs/changelog/<version>.md`. A pull request with a user-visible change adds its line to `docs/changelog/unreleased.md`.
 
 ## Context (not in code)
 

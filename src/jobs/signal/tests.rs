@@ -222,3 +222,33 @@ async fn a_finished_row_with_live_leftovers_kills_them() {
     );
     let _ = tokio::time::timeout(Duration::from_secs(2), waiter).await;
 }
+
+/// #69: a kill the group outlived (`Survived`, `NotSignalled`) must not name
+/// itself the cause of an exit the job reaches later on its own.
+#[tokio::test]
+async fn a_kill_that_did_not_take_is_not_blamed_for_the_job_s_later_exit() {
+    use crate::jobs::{JobState, JobStore, RunResult, Shell};
+    let dir = tempfile::tempdir().unwrap().keep();
+    let store = JobStore::new(dir, Duration::from_secs(5), Shell::sh(), Db::memory()).unwrap();
+    let RunResult::Backgrounded { id } = store
+        .run("sleep 0.5; exit 3".into(), None, None, true, false, None)
+        .await
+        .unwrap()
+    else {
+        panic!("bg");
+    };
+    let job = store.jobs.lock().await.get(&id).cloned().expect("tracked");
+
+    let escalation = kill::blamed(&job, "killed", async { Escalation::Survived }).await;
+    assert!(matches!(escalation, Escalation::Survived));
+
+    for _ in 0..100 {
+        let (state, _) = store.poll(&id, None, None).await.unwrap().unwrap();
+        match state {
+            JobState::Running => tokio::time::sleep(Duration::from_millis(50)).await,
+            JobState::Exited { code: 3 } => return,
+            other => panic!("the job's own exit was not recorded: {other:?}"),
+        }
+    }
+    panic!("job never finished");
+}

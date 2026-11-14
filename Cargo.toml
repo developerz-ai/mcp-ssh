@@ -1,6 +1,6 @@
 [package]
 name = "mcp-ssh"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2024"
 rust-version = "1.100"  # = rust-toolchain.toml + Dockerfile base; bump together
 description = "Remote shell + file access for AI agents over authenticated MCP-HTTP — an ssh replacement you talk to over /mcp"
@@ -28,6 +28,9 @@ tokio = { version = "1", features = ["full"] }
 # every open SSE stream on shutdown (already in the tree via rmcp).
 tokio-util = "0.7"
 axum = "0.8"
+# `Body`/`Frame`: the SSE revalidation wrapper in `src/auth/` implements the trait
+# (already in the tree via axum).
+http-body = "1"
 
 # serialization + tool schemas
 serde = { version = "1", features = ["derive"] }

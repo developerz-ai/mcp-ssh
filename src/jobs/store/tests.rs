@@ -62,6 +62,7 @@ async fn insert_running_writes_the_columns_the_inline_sql_did() {
         1_700_000_000,
         ProcessGroupId::new(4242),
         Some("boot-a".into()),
+        true,
     )
     .await
     .unwrap();
@@ -75,6 +76,8 @@ async fn insert_running_writes_the_columns_the_inline_sql_did() {
     assert_eq!((row.code, row.error, row.tail), (None, None, None));
     assert_eq!(row.started_unix, 1_700_000_000);
     assert_eq!(row.pgid, Some(4242), "the pgid a later CLI kill signals");
+    let target = repo.kill_target(&id).await.unwrap().expect("row exists");
+    assert!(target.interactive, "how a later kill must escalate");
 }
 
 #[tokio::test]
@@ -88,7 +91,7 @@ async fn finish_records_the_final_state_and_a_bounded_tail() {
 
     let repo = repo();
     let id = JobId::from("job-10-00-01");
-    repo.insert_running(&id, None, now_unix(), None, None)
+    repo.insert_running(&id, None, now_unix(), None, None, false)
         .await
         .unwrap();
     repo.finish(&id, &log, &JobState::Exited { code: 7 }).await;
@@ -114,7 +117,7 @@ async fn finish_byte_caps_the_tail_of_one_huge_line() {
         .unwrap();
     let repo = repo();
     let id = JobId::from("job-huge");
-    repo.insert_running(&id, None, now_unix(), None, None)
+    repo.insert_running(&id, None, now_unix(), None, None, false)
         .await
         .unwrap();
     repo.finish(&id, &log, &JobState::Exited { code: 0 }).await;
@@ -134,7 +137,7 @@ async fn finish_byte_caps_the_tail_of_one_huge_line() {
 async fn finish_records_the_status_even_when_the_log_is_gone() {
     let repo = repo();
     let id = JobId::from("job-nolog");
-    repo.insert_running(&id, None, now_unix(), None, None)
+    repo.insert_running(&id, None, now_unix(), None, None, false)
         .await
         .unwrap();
     repo.finish(
@@ -153,7 +156,7 @@ async fn finish_records_the_status_even_when_the_log_is_gone() {
 async fn a_recorded_kill_reason_survives_the_waiter_s_exit() {
     let repo = repo();
     let id = JobId::from("job-cli-killed");
-    repo.insert_running(&id, None, now_unix(), None, None)
+    repo.insert_running(&id, None, now_unix(), None, None, false)
         .await
         .unwrap();
     repo.mark_killed(&id, "killed via mcp-ssh kill")
@@ -173,7 +176,7 @@ async fn a_recorded_kill_reason_survives_the_waiter_s_exit() {
     // The other order: the waiter recorded the bare signal death first. The
     // kill's reason still lands — it is what that signal was.
     let id = JobId::from("job-waiter-first");
-    repo.insert_running(&id, None, now_unix(), None, None)
+    repo.insert_running(&id, None, now_unix(), None, None, false)
         .await
         .unwrap();
     let died = JobState::Failed {
@@ -191,7 +194,7 @@ async fn a_recorded_kill_reason_survives_the_waiter_s_exit() {
 async fn find_maps_rows_back_onto_job_state() {
     let repo = repo();
     let failed = JobId::from("job-b");
-    repo.insert_running(&failed, None, now_unix(), None, None)
+    repo.insert_running(&failed, None, now_unix(), None, None, false)
         .await
         .unwrap();
     repo.finish(
@@ -214,7 +217,7 @@ async fn find_maps_rows_back_onto_job_state() {
 async fn summaries_page_newest_first() {
     let repo = repo();
     for (id, started) in [("b-late", 30), ("a-early", 10), ("z-mid", 20)] {
-        repo.insert_running(&JobId::from(id), None, started, None, None)
+        repo.insert_running(&JobId::from(id), None, started, None, None, false)
             .await
             .unwrap();
     }
@@ -232,7 +235,7 @@ async fn summaries_page_newest_first() {
 #[tokio::test]
 async fn summaries_skip_a_corrupt_row() {
     let repo = repo();
-    repo.insert_running(&JobId::from("good"), None, 10, None, None)
+    repo.insert_running(&JobId::from("good"), None, 10, None, None, false)
         .await
         .unwrap();
     // A blob where the id text should be: the row can't be mapped.
@@ -257,10 +260,11 @@ async fn untracked_running_skips_live_ids() {
         boot - 3600,
         ProcessGroupId::new(2_000_000_000),
         Some("boot-a".into()),
+        false,
     )
     .await
     .unwrap();
-    repo.insert_running(&mine, None, boot, None, None)
+    repo.insert_running(&mine, None, boot, None, None, false)
         .await
         .unwrap();
 
@@ -284,7 +288,7 @@ async fn untracked_running_skips_live_ids() {
 async fn a_finished_row_keeps_its_own_state_when_a_kill_is_recorded() {
     let repo = repo();
     let id = JobId::from("job-done");
-    repo.insert_running(&id, None, now_unix(), None, None)
+    repo.insert_running(&id, None, now_unix(), None, None, false)
         .await
         .unwrap();
     repo.finish(
@@ -299,6 +303,36 @@ async fn a_finished_row_keeps_its_own_state_when_a_kill_is_recorded() {
         (row.status.as_str(), row.code, row.error),
         ("exited", Some(0), None)
     );
+}
+
+/// #69: a finished job whose leftovers the supervisor killed is re-recorded
+/// `failed` with the reason; a row still `running` is left alone.
+#[tokio::test]
+async fn leftovers_killed_re_records_a_finished_row_only() {
+    let repo = repo();
+    let (done, live) = (JobId::from("job-done"), JobId::from("job-live"));
+    for id in [&done, &live] {
+        repo.insert_running(id, None, now_unix(), None, None, false)
+            .await
+            .unwrap();
+    }
+    repo.finish(
+        &done,
+        Path::new("/nonexistent.log"),
+        &JobState::Exited { code: 0 },
+    )
+    .await;
+    for id in [&done, &live] {
+        repo.mark_leftovers_killed(id, "leftovers killed")
+            .await
+            .unwrap();
+    }
+    let row = columns(&repo, done.as_ref()).await;
+    assert_eq!(
+        (row.status.as_str(), row.code, row.error.as_deref()),
+        ("failed", None, Some("leftovers killed"))
+    );
+    assert_eq!(columns(&repo, live.as_ref()).await.status, "running");
 }
 
 #[tokio::test]
@@ -320,6 +354,7 @@ async fn kill_target_reads_status_pgid_and_boot_verbatim() {
     assert_eq!(target.status, "exited");
     assert_eq!(target.pgid, Some(0));
     assert_eq!(target.boot_id.as_deref(), Some("b1"));
+    assert!(!target.interactive, "a row that never said so is not");
     assert!(
         repo.kill_target(&JobId::from("ghost"))
             .await
@@ -334,10 +369,10 @@ async fn kill_target_reads_status_pgid_and_boot_verbatim() {
 async fn reap_rows_age_from_the_finish() {
     let repo = repo();
     let (old, fresh) = (JobId::from("job-old"), JobId::from("job-fresh"));
-    repo.insert_running(&old, None, 100, ProcessGroupId::new(7), None)
+    repo.insert_running(&old, None, 100, ProcessGroupId::new(7), None, false)
         .await
         .unwrap();
-    repo.insert_running(&fresh, None, 300, None, None)
+    repo.insert_running(&fresh, None, 300, None, None, false)
         .await
         .unwrap();
     repo.finish(
@@ -372,10 +407,12 @@ async fn reap_rows_age_from_the_finish() {
 async fn listing_filters_active_unless_all() {
     let repo = repo();
     let (a, b) = (JobId::from("a"), JobId::from("b"));
-    repo.insert_running(&a, Some("first".into()), 10, None, None)
+    repo.insert_running(&a, Some("first".into()), 10, None, None, false)
         .await
         .unwrap();
-    repo.insert_running(&b, None, 20, None, None).await.unwrap();
+    repo.insert_running(&b, None, 20, None, None, false)
+        .await
+        .unwrap();
     repo.finish(
         &b,
         Path::new("/nonexistent.log"),

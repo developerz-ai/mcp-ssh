@@ -598,3 +598,182 @@ async fn bash_dispatch_emits_event_with_tool_and_request_id() {
         "span must carry the request id: {out}"
     );
 }
+
+fn rejected(name: &str, arguments: serde_json::Value) -> Option<(&'static str, &'static str)> {
+    let serde_json::Value::Object(arguments) = arguments else {
+        panic!("arguments must be an object");
+    };
+    reject::rejection(name, Some(&arguments)).map(|r| (r.tool, r.reason))
+}
+
+/// Each way rmcp refuses a call before dispatch maps to a fixed reason word; a
+/// call the tool body will see (incl. `job`'s lenient `action`) is no rejection.
+#[test]
+fn rejection_names_the_tool_and_a_fixed_reason() {
+    use serde_json::json;
+    for (name, arguments, expected) in [
+        (
+            "bash",
+            json!({ "cmd": "x", "timout": 5 }),
+            Some(("bash", "unknown_field")),
+        ),
+        (
+            "bash",
+            json!({ "cwd": "/" }),
+            Some(("bash", "missing_field")),
+        ),
+        (
+            "bash",
+            json!({ "cmd": "x", "timeout": "5" }),
+            Some(("bash", "invalid_type")),
+        ),
+        (
+            "job",
+            json!({ "action": "list", "job": "a" }),
+            Some(("job", "unknown_field")),
+        ),
+        (
+            "file",
+            json!({ "action": "remove", "path": "/x" }),
+            Some(("file", "unknown_variant")),
+        ),
+        (
+            "file",
+            json!({ "path": "/x" }),
+            Some(("file", "missing_field")),
+        ),
+        (
+            "shell",
+            json!({ "cmd": "x" }),
+            Some(("unknown", "unknown_tool")),
+        ),
+        ("bash", json!({ "cmd": "x" }), None),
+        ("job", json!({ "action": null }), None),
+        ("job", json!({ "action": "stop" }), None),
+        ("file", json!({ "action": "read", "path": "/x" }), None),
+    ] {
+        assert_eq!(
+            rejected(name, arguments.clone()),
+            expected,
+            "{name} {arguments}"
+        );
+    }
+    assert_eq!(
+        reject::rejection("job", None),
+        None,
+        "absent arguments are an empty object, as rmcp reads them"
+    );
+}
+
+/// The check must agree with what rmcp's `Parameters<T>` does to the same
+/// arguments, or a call could be logged as rejected and still run (or the reverse).
+#[test]
+fn rejection_agrees_with_parameters_deserialization() {
+    use serde_json::json;
+    fn refused<T: serde::de::DeserializeOwned>(arguments: &serde_json::Value) -> bool {
+        serde_json::from_value::<Parameters<T>>(arguments.clone()).is_err()
+    }
+    for (tool, arguments) in [
+        (
+            "file",
+            json!({ "action": "delete", "path": "/x", "recurse": true }),
+        ),
+        (
+            "file",
+            json!({ "action": "delete", "path": "/x", "recursive": true }),
+        ),
+        (
+            "file",
+            json!({ "action": "read", "path": "/x", "cursor": -1 }),
+        ),
+        ("file", json!({ "action": "read", "path": 7 })),
+        // `job`'s lenient `action`: a placeholder or a missing key runs as `list`.
+        ("job", json!({})),
+        ("job", json!({ "action": null })),
+        ("job", json!({ "action": 1 })),
+        ("job", json!({ "action": "poll", "id": "job-01-02-03" })),
+        ("job", json!({ "action": "restart" })),
+        ("job", json!({ "action": "list", "limit": "ten" })),
+        ("job", json!({ "action": "list", "page": 2 })),
+        ("bash", json!({ "cmd": "true" })),
+        ("bash", json!({ "cmd": "true", "bg": true, "timeout": 5 })),
+        ("bash", json!({})),
+        ("bash", json!({ "cmd": "true", "timout": 5 })),
+        ("bash", json!({ "cmd": "true", "timeout": "5" })),
+    ] {
+        let refused = match tool {
+            "file" => refused::<FileArgs>(&arguments),
+            "job" => refused::<JobArgs>(&arguments),
+            _ => refused::<BashArgs>(&arguments),
+        };
+        assert_eq!(
+            rejected(tool, arguments.clone()).is_some(),
+            refused,
+            "{tool} {arguments}"
+        );
+    }
+}
+
+/// The line names the tool, the reason and the request — and nothing the agent
+/// sent: serde's own message would quote the offending value and key.
+#[test]
+fn rejected_call_logs_tool_and_reason_never_an_argument() {
+    let logs = crate::log_capture_tests::capture();
+    for arguments in [
+        serde_json::json!({ "cmd": "echo s3cret-cmd", "timeout": "s3cret-value" }),
+        serde_json::json!({ "cmd": "echo s3cret-cmd", "s3cret-key": 1 }),
+    ] {
+        let serde_json::Value::Object(arguments) = arguments else {
+            unreachable!()
+        };
+        let request = rmcp::model::CallToolRequestParams::new("bash").with_arguments(arguments);
+        reject::log_if_rejected(&request, &NumberOrString::Number(7));
+    }
+    let request = rmcp::model::CallToolRequestParams::new("s3cret-tool");
+    reject::log_if_rejected(&request, &NumberOrString::Number(8));
+
+    let out = logs.text();
+    assert!(out.contains("WARN"), "{out}");
+    assert!(out.contains("rejected"), "{out}");
+    assert!(out.contains("tool=\"bash\""), "{out}");
+    assert!(out.contains("reason=\"invalid_type\""), "{out}");
+    assert!(out.contains("reason=\"unknown_field\""), "{out}");
+    assert!(out.contains("reason=\"unknown_tool\""), "{out}");
+    assert!(out.contains("request_id=7"), "{out}");
+    assert!(!out.contains("s3cret"), "{out}");
+}
+
+/// A call the tool body will run is not logged as rejected.
+#[test]
+fn accepted_call_logs_no_rejection() {
+    let logs = crate::log_capture_tests::capture();
+    let mut arguments = rmcp::model::JsonObject::new();
+    arguments.insert("cmd".into(), "true".into());
+    let request = rmcp::model::CallToolRequestParams::new("bash").with_arguments(arguments);
+    reject::log_if_rejected(&request, &NumberOrString::Number(1));
+    assert!(!logs.text().contains("rejected"), "{}", logs.text());
+}
+
+/// The advertised surface is still the three tools with the input schema derived
+/// from their arg structs — the rejection log sits beside the router, it must
+/// never replace `Parameters<T>` (and with it the schema) with raw JSON.
+#[test]
+fn advertised_input_schemas_are_the_arg_structs() {
+    use rmcp::handler::server::common::schema_for_input;
+    let router = Tools::tool_router();
+    let names: Vec<_> = router.list_all().into_iter().map(|t| t.name).collect();
+    assert_eq!(names, ["bash", "file", "job"]);
+    for (name, expected) in [
+        ("bash", schema_for_input::<Parameters<BashArgs>>()),
+        ("job", schema_for_input::<Parameters<JobArgs>>()),
+        ("file", schema_for_input::<Parameters<FileArgs>>()),
+    ] {
+        let tool = router.get(name).expect("tool registered");
+        assert_eq!(tool.input_schema, expected.unwrap(), "{name}");
+        assert_eq!(
+            tool.input_schema.get("additionalProperties"),
+            Some(&serde_json::Value::Bool(false)),
+            "{name} must stay deny_unknown_fields"
+        );
+    }
+}

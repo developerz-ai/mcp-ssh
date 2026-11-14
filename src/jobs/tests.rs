@@ -1,5 +1,5 @@
 use super::log::DEFAULT_PAGE;
-use super::supervise::LOG_CAP_REASON;
+use super::supervise::{LEFTOVERS_LOG_CAP_REASON, LOG_CAP_REASON};
 use super::*;
 use crate::db::Db;
 use rusqlite::OptionalExtension;
@@ -152,6 +152,20 @@ async fn fast_command_returns_inline() {
     assert!(matches!(state, JobState::Exited { code: 0 }));
     assert_eq!(page.lines, ["hello"]);
     assert_eq!(page.older, None);
+}
+
+/// #69: every directory the engine creates on the way to the job dir is
+/// owner-only from creation — `logs/` in the default `…/logs/jobs` included.
+#[test]
+fn the_job_dir_s_missing_parents_are_created_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let base = tempfile::tempdir().unwrap();
+    let logs = base.path().join("logs");
+    create_private_dir(&logs.join("jobs")).unwrap();
+    for dir in [logs.join("jobs"), logs] {
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "{}", dir.display());
+    }
 }
 
 /// D1: job output may hold secrets — the dir is 0700, each log 0600.
@@ -378,10 +392,9 @@ async fn kill_reaches_descendants_and_records_the_kill() {
     );
 }
 
-/// K2: an interactive bash ignores `SIGTERM`. Killing the job must not let
-/// it go on to run the next command once its foreground child dies.
-#[tokio::test]
-async fn killing_an_interactive_job_never_runs_its_next_command() {
+/// A backgrounded interactive job that has printed `started` and is now in its
+/// `sleep`, with `echo AFTER` still to run.
+async fn started_interactive_job() -> (JobStore, JobId) {
     let dir = tempfile::tempdir().unwrap().keep();
     let rc = dir.join("rc");
     std::fs::write(&rc, "").unwrap();
@@ -413,14 +426,41 @@ async fn killing_an_interactive_job_never_runs_its_next_command() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    (store, id)
+}
+
+async fn assert_never_ran_after(store: &JobStore, id: &JobId) {
+    await_state(store, id).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (_, page) = store.poll(id, None, None).await.unwrap().unwrap();
+    assert!(!page.lines.iter().any(|l| l == "AFTER"), "{:?}", page.lines);
+}
+
+/// K2: an interactive bash ignores `SIGTERM`. Killing the job must not let
+/// it go on to run the next command once its foreground child dies.
+#[tokio::test]
+async fn killing_an_interactive_job_never_runs_its_next_command() {
+    let (store, id) = started_interactive_job().await;
     assert!(matches!(
         store.kill(&id).await.unwrap(),
         KillOutcome::Killed
     ));
-    await_state(&store, &id).await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let (_, page) = store.poll(&id, None, None).await.unwrap().unwrap();
-    assert!(!page.lines.iter().any(|l| l == "AFTER"), "{:?}", page.lines);
+    assert_never_ran_after(&store, &id).await;
+}
+
+/// #69: the same holds for a kill that has only the row to go on (`mcp-ssh job
+/// kill`, or `job(action="kill")` after a restart) — the row says the job is
+/// interactive, so its leader is stopped first there too.
+#[tokio::test]
+async fn a_persisted_kill_of_an_interactive_job_never_runs_its_next_command() {
+    let (store, id) = started_interactive_job().await;
+    assert!(matches!(
+        kill_persisted(&store.repo, &id, "killed via mcp-ssh kill")
+            .await
+            .unwrap(),
+        KillOutcome::Killed
+    ));
+    assert_never_ran_after(&store, &id).await;
 }
 
 /// K12: a CLI kill of a job this server tracks records its reason; the
@@ -612,6 +652,49 @@ async fn a_job_past_the_log_cap_is_killed_and_says_why() {
         .len();
     assert!(size < 400 * 4097, "stopped early: {size}");
     assert!(size <= store.log_cap + 256 * 1024, "near the cap: {size}");
+}
+
+/// #69: the cap outlives the leader. What a finished job left running (`server
+/// &`) still appends to its log, so past the cap that group is killed too and the
+/// job says why. The growth is sparse — no real writer.
+#[tokio::test]
+async fn leftovers_past_the_log_cap_are_killed_and_the_job_says_why() {
+    let mut store = store(Duration::from_secs(5));
+    store.log_cap = 64 * 1024;
+    let RunResult::Inline { id, state, page } = store
+        .run(
+            "sleep 300 & echo \"pid:$!\"".into(),
+            None,
+            None,
+            false,
+            false,
+            None,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("the leader exits at once");
+    };
+    assert!(matches!(state, JobState::Exited { code: 0 }));
+    let pid = page.lines[0].strip_prefix("pid:").unwrap().to_string();
+    assert!(alive(&pid));
+
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(store.dir.join(format!("{id}.log")))
+        .unwrap()
+        .set_len(store.log_cap + 1)
+        .unwrap();
+    assert!(gone_soon(&pid).await, "the leftover outlived the cap");
+    let expected = |state: &JobState| matches!(state, JobState::Failed { error } if error == LEFTOVERS_LOG_CAP_REASON);
+    for _ in 0..100 {
+        let (state, _) = store.poll(&id, None, None).await.unwrap().unwrap();
+        if expected(&state) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the job never said why its leftovers died");
 }
 
 /// K6: a request cancelled after the spawn — here while the row insert waits
@@ -876,7 +959,7 @@ async fn poll_surfaces_read_error_while_job_is_tracked() {
         pgid: None,
         interactive: false,
         state: Arc::new(Mutex::new(JobState::Running)),
-        kill_reason: OnceLock::new(),
+        kill_reason: Mutex::new(None),
     });
     let id = JobId::from("gone");
     store.jobs.lock().await.insert(id.clone(), job);

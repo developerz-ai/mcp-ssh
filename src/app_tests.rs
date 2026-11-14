@@ -42,6 +42,7 @@ fn test_app_with(public_url: Option<&str>) -> Router {
         },
         store: Arc::new(oauth::Store::new(database)),
         public_url: public_url.map(Into::into),
+        revalidate_every: crate::auth::STREAM_REVALIDATE,
     };
     build(
         state,
@@ -72,6 +73,7 @@ async fn test_app_with_token() -> (Router, String) {
         },
         store: oauth_store,
         public_url: None,
+        revalidate_every: crate::auth::STREAM_REVALIDATE,
     };
     let app = build(
         state,
@@ -280,6 +282,7 @@ async fn mcp_with_an_unavailable_token_store_is_503() {
         },
         store: Arc::new(oauth::Store::new(database.clone())),
         public_url: None,
+        revalidate_every: crate::auth::STREAM_REVALIDATE,
     };
     let app = build(
         state,
@@ -304,6 +307,111 @@ async fn mcp_with_an_unavailable_token_store_is_503() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// A router whose open streams re-check their token every 20ms, a live bearer,
+/// and the database behind both.
+async fn revalidating_app() -> (Router, String, crate::db::Db) {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let database = crate::db::Db::memory();
+    let jobs = JobStore::new(
+        dir,
+        std::time::Duration::from_secs(2),
+        crate::jobs::Shell::sh(),
+        database.clone(),
+    )
+    .unwrap();
+    let oauth_store = Arc::new(oauth::Store::new(database.clone()));
+    let token = "stream-bearer-token".to_string();
+    oauth_store.insert_token(&token).await;
+    let state = oauth::AuthState {
+        creds: auth::Credentials {
+            user: "admin".into(),
+            pass: crate::config::Password::new("secret"),
+        },
+        store: oauth_store,
+        public_url: None,
+        revalidate_every: std::time::Duration::from_millis(20),
+    };
+    let app = build(
+        state,
+        jobs,
+        vec!["localhost".into()],
+        tokio_util::sync::CancellationToken::new(),
+    );
+    (app, token, database)
+}
+
+/// Open the session's standalone SSE stream (GET `/mcp`) and return its body.
+async fn open_stream(app: Router, token: &str, session_id: &str) -> Body {
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/mcp")
+                .header(header::HOST, "localhost")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(header::ACCEPT, "text/event-stream")
+                .header("mcp-session-id", session_id)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "no SSE stream opened");
+    res.into_body()
+}
+
+/// True if `body` ends within `wait`; false if it is still open then.
+async fn ends_within(body: &mut Body, wait: std::time::Duration) -> bool {
+    use axum::body::HttpBody;
+    let drained = async {
+        while std::future::poll_fn(|cx| std::pin::Pin::new(&mut *body).poll_frame(cx))
+            .await
+            .is_some()
+        {}
+    };
+    tokio::time::timeout(wait, drained).await.is_ok()
+}
+
+/// A16: the bearer used to be checked only when the request started, so a stream
+/// opened before `sessions --revoke` stayed open. It now ends within one interval
+/// of the token going away — and not before.
+#[tokio::test]
+async fn an_open_stream_ends_once_its_token_is_revoked() {
+    let (app, token, database) = revalidating_app().await;
+    let session_id = open_session(app.clone(), &token).await;
+    let mut stream = open_stream(app, &token, &session_id).await;
+    assert!(
+        !ends_within(&mut stream, std::time::Duration::from_millis(100)).await,
+        "a stream with a live token must stay open across re-checks"
+    );
+
+    oauth::revoke_all(&database).await.unwrap();
+
+    assert!(
+        ends_within(&mut stream, std::time::Duration::from_secs(5)).await,
+        "stream outlived its revoked token"
+    );
+}
+
+/// A store that can't answer is not a revocation: the stream stays open and the
+/// next tick asks again (the stream-side twin of "outage is a 503, not a 401").
+#[tokio::test]
+async fn an_open_stream_survives_a_token_store_outage() {
+    let (app, token, database) = revalidating_app().await;
+    let session_id = open_session(app.clone(), &token).await;
+    let mut stream = open_stream(app, &token, &session_id).await;
+
+    database
+        .call(|c| c.execute_batch("DROP TABLE access_tokens"))
+        .await
+        .unwrap();
+
+    assert!(
+        !ends_within(&mut stream, std::time::Duration::from_millis(200)).await,
+        "a store outage must not end the stream"
+    );
 }
 
 /// A valid OAuth bearer token passes the `/mcp` guard — but only under an
@@ -531,6 +639,50 @@ async fn tools_call_exercises_bash_file_and_job() {
         .as_str()
         .expect("job list result must have text content");
     serde_json::from_str::<serde_json::Value>(job_text).expect("job list must return valid JSON");
+}
+
+/// A call rmcp refuses before dispatch (here a misspelt param) used to leave the
+/// journal silent. The client's reply is rmcp's, untouched; the operator gets one
+/// line naming the tool and the reason — and none of the arguments.
+#[tokio::test]
+async fn a_call_rejected_before_dispatch_is_logged_without_its_arguments() {
+    let logs = crate::log_capture_tests::capture();
+    let (app, token) = test_app_with_token().await;
+    let session_id = open_session(app.clone(), &token).await;
+
+    let msg = call_tool(
+        app,
+        &token,
+        &session_id,
+        5,
+        "bash",
+        serde_json::json!({ "cmd": "echo s3cret-arg", "timout": 5 }),
+    )
+    .await;
+    assert_eq!(msg["result"]["isError"], true, "{msg}");
+    let text = msg["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.starts_with("failed to deserialize parameters: unknown field `timout`"),
+        "the agent still gets rmcp's own explanation: {text}"
+    );
+
+    let out = logs.text();
+    let line = out
+        .lines()
+        .find(|l| l.contains("rejected"))
+        .unwrap_or_else(|| panic!("no rejection logged: {out}"));
+    assert!(line.contains("WARN"), "{line}");
+    assert!(line.contains("tool=\"bash\""), "{line}");
+    assert!(line.contains("reason=\"unknown_field\""), "{line}");
+    assert!(line.contains("request_id=5"), "{line}");
+    // rmcp's own DEBUG lines (below prod's default filter) print the request;
+    // ours must not.
+    for ours in out.lines().filter(|l| l.contains(" mcp_ssh::")) {
+        assert!(
+            !ours.contains("s3cret-arg") && !ours.contains("timout"),
+            "{ours}"
+        );
+    }
 }
 
 /// tools/list must return exactly the three tools: bash, job, file — never more.
