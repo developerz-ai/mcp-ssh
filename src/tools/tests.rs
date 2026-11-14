@@ -670,17 +670,46 @@ fn rejection_names_the_tool_and_a_fixed_reason() {
 #[test]
 fn rejection_agrees_with_parameters_deserialization() {
     use serde_json::json;
-    for arguments in [
-        json!({ "action": "delete", "path": "/x", "recurse": true }),
-        json!({ "action": "delete", "path": "/x", "recursive": true }),
-        json!({ "action": "read", "path": "/x", "cursor": -1 }),
-        json!({ "action": "read", "path": 7 }),
+    fn refused<T: serde::de::DeserializeOwned>(arguments: &serde_json::Value) -> bool {
+        serde_json::from_value::<Parameters<T>>(arguments.clone()).is_err()
+    }
+    for (tool, arguments) in [
+        (
+            "file",
+            json!({ "action": "delete", "path": "/x", "recurse": true }),
+        ),
+        (
+            "file",
+            json!({ "action": "delete", "path": "/x", "recursive": true }),
+        ),
+        (
+            "file",
+            json!({ "action": "read", "path": "/x", "cursor": -1 }),
+        ),
+        ("file", json!({ "action": "read", "path": 7 })),
+        // `job`'s lenient `action`: a placeholder or a missing key runs as `list`.
+        ("job", json!({})),
+        ("job", json!({ "action": null })),
+        ("job", json!({ "action": 1 })),
+        ("job", json!({ "action": "poll", "id": "job-01-02-03" })),
+        ("job", json!({ "action": "restart" })),
+        ("job", json!({ "action": "list", "limit": "ten" })),
+        ("job", json!({ "action": "list", "page": 2 })),
+        ("bash", json!({ "cmd": "true" })),
+        ("bash", json!({ "cmd": "true", "bg": true, "timeout": 5 })),
+        ("bash", json!({})),
+        ("bash", json!({ "cmd": "true", "timout": 5 })),
+        ("bash", json!({ "cmd": "true", "timeout": "5" })),
     ] {
-        let refused = serde_json::from_value::<Parameters<FileArgs>>(arguments.clone()).is_err();
+        let refused = match tool {
+            "file" => refused::<FileArgs>(&arguments),
+            "job" => refused::<JobArgs>(&arguments),
+            _ => refused::<BashArgs>(&arguments),
+        };
         assert_eq!(
-            rejected("file", arguments.clone()).is_some(),
+            rejected(tool, arguments.clone()).is_some(),
             refused,
-            "{arguments}"
+            "{tool} {arguments}"
         );
     }
 }
