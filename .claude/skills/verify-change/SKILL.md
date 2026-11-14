@@ -15,10 +15,11 @@ passes it locally passes everywhere.
 
 | Step | Command | What it is |
 |------|---------|------------|
-| install | `bin/setup` | (dpkg -s build-essential ca-certificates >/dev/null 2>&1 \|\| (sudo -n apt-get update && sudo -n apt-get install -y --no-install-recommends build-essential ca-certificates)) && (command -v cargo >/dev/null 2>&1 \|\| mise use -g rust@stable) && cargo build |
-| run | `bin/dev` | if [ -f .env ]; then set -a; . ./.env; set +a; fi; exec cargo run -- serve — on developerz.ai runs, start it with code_bash_background when you need a running stack |
-| prove | `bin/check` | cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test |
-| stop | `bin/stop` | pkill -f '[m]cp-ssh serve' \|\| true — on developerz.ai runs, the platform runs this when your session ends — do not stop the stack yourself |
+| install | `bin/setup` | cd to the repo root, require cargo, seed .env from .env.example only when .env is absent (chmod 600, never overwrite real credentials), point git at `.githooks` (pre-commit runs `bin/check`), then `cargo build --locked` |
+| run | `bin/dev` | loads `.env`, writes `.local/dev.pid`, then `cargo watch -x 'run -- serve'` (or `exec cargo run -- serve`) — state under `.local/` per `.env.example`; on developerz.ai runs, start it with code_bash_background when you need a running stack |
+| prove | `bin/check` | `cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked` (unit + the `tests/e2e` suite) |
+| e2e | `bin/e2e` | just the end-to-end suite: boots the real binary per test and drives it over HTTP |
+| stop | `bin/stop` | stops only the server `bin/dev` started (pid in `.local/dev.pid`) — on developerz.ai runs, the platform runs this when your session ends — do not stop the stack yourself |
 
 ## Rules
 

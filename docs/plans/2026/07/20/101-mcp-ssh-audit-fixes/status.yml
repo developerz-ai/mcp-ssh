@@ -1,30 +1,36 @@
 plan: 101-mcp-ssh-audit-fixes
 title: mcp-ssh — Audit Fixes
-status: not_started        # not_started | in_progress | blocked | complete | superseded
+status: complete           # not_started | in_progress | blocked | complete | superseded
 created_by: sebi
-worked_by: ""              # executor fills with their git user.name
+worked_by: sebi            # executor fills with their git user.name
 owner: sebi
-percent: 0
-current_focus: ""          # next: 01-file-op-bounds.md (HIGH DoS)
+percent: 100
+current_focus: ""
 slices:
   - file: 01-file-op-bounds.md
-    status: not_started
-    percent: 0
+    status: complete
+    percent: 100
+    evidence: ["#18"]      # 0a5103f: capped+timed shell runner (src/tools/files/shell.rs MAX_SHELL_RUN_SECS), find -maxdepth (MAX_FIND_DEPTH), early-stop read with ≥n total, no-clobber move (FileError::DestinationExists), long-line marker
   - file: 02-detached-jobs.md
-    status: not_started
-    percent: 0
+    status: complete
+    percent: 100
+    evidence: ["#19"]      # 29852cf (squash of the detached-jobs group, +551 in jobs/mod.rs + reaper.rs): pgid-probed reconcile, kill of untracked jobs from the persisted pgid, compaction skips live groups, TERM-race fix
   - file: 03-token-gc-and-db.md
-    status: not_started
-    percent: 0
+    status: complete
+    percent: 100
+    evidence: ["#20"]      # 979b970: sweep_expired_access/refresh on the reaper pass, atomic issue(), legacy-column migration (ensure_column, since replaced by versioned migrations in #61)
   - file: 04-auth-hardening.md
-    status: not_started
-    percent: 0
+    status: complete
+    percent: 100
+    evidence: ["#21"]      # 2965eed: empty-host https redirect rejected, client_id→redirect_uri binding (clients table), non-loopback bind requires MCP_SSH_ALLOWED_HOSTS
   - file: 05-architecture-refactor.md
-    status: not_started
-    percent: 0
+    status: complete
+    percent: 100
+    evidence: ["#23", "#24"]  # 764d65c: JobStatus, signal.rs, JobRepo (store.rs), shell.rs, one kill semantics; fc1ac5e: FileError, tools/args.rs, GrantError, CLAUDE.md map
   - file: 06-tests-and-ops.md
-    status: not_started
-    percent: 0
-evidence: []
-notes: "From a 5-agent deep-dive audit. Priority order: 01-03 are user-impacting bugs (OOM/hang, jobs lying, unbounded DB growth); 04 is defense-in-depth (has open decisions); 05 is the architecture refactor — run LAST and rebase onto fixed code; 06 covers untested destructive paths + ops drift. Open decisions in 04 (redirect_uri binding, non-loopback fail-fast) and 06 (/healthz) need owner sign-off."
-last_updated: 2026-07-20
+    status: complete
+    percent: 100
+    evidence: ["#22", "#20"]  # aa18056: /healthz, job-dir path fix, admin kill + db-path tests; legacy-DB migration test landed with #20
+evidence: ["#18", "#19", "#20", "#21", "#22", "#23", "#24"]
+notes: "Verified slice by slice against git log and the code on 2026-11-13 (tracker had never been updated; see 2026/11/13/101-deep-dive-audit-fixes 08 X16). All six slices merged 2026-07-20..21 and shipped in v1.4.0. Later work rewrote parts of what these slices built — the kill/reconcile paths (kill(2) tri-state, KillOutcome on both paths), the ensure_column migrations (now PRAGMA user_version), the Basic login on /authorize (now a consent page) and the plaintext token rows (now hashed) — under 2026/11/13/101-deep-dive-audit-fixes (#61, #62), which supersedes these slices' implementations, not their completion."
+last_updated: 2026-11-13

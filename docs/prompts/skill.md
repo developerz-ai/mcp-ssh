@@ -25,14 +25,26 @@ commands auto-background to a job id.
 
 ```
 # fast / reads:    bash  cmd="..."
-# long-running:    bash  bg=true  cmd="cd <repo> && ..."     then:  job action="poll" id="<job-id>"
+# long-running:    bash  bg=true  title="build"  cmd="cd <repo> && ..."   then:  job action="poll" id="<job-id>"
 ```
 
-- Anything >2s ⇒ `bg=true`, poll with `job action="poll"` (byte/line-capped, paginated via
-  `cursor`/`limit` — chatty output never floods context).
+- Anything >2s ⇒ `bg=true`, poll with `job action="poll"`.
+- **Paging is newest-first.** No `cursor` ⇒ the latest page (≤200 lines, ≤64 KiB) — what the job is
+  doing now. Older output exists ⇒ the reply ends
+  `[latest N lines shown; earlier output: job(action="poll", id="…", cursor=C)]`; make that exact
+  call to page back. `C` is a byte offset — copy it, never invent one.
+- First line of a poll = state JSON: `running`, `exited` + `code`, or `failed` + `error`.
+- `job action="list"`: newest first, 200 per page; `[older jobs: job(action="list", cursor=N)]` ⇒ more.
+- `job action="kill"` reports what really happened: only `killed <id>` (or "killed the processes it
+  left running") means gone. "survived TERM then KILL" / "may still be running" ⇒ not confirmed —
+  verify before moving on.
 - `interactive=true` sources `~/.bashrc` (aliases, mise/nvm/rbenv); default is faster `sh -c`.
 - `title="deploy-check"` labels the job id (`deploy-check-HH-MM-SS`). Keep titles secret-free.
-- Use `file` for reads/edits/search (`grep` with `recursive=true`), not shelling out.
+- Output past 256 MiB kills the job — redirect huge output to a file. Finished jobs are kept 24h.
+- Strict params: an unknown param or `action` is an error, never silently ignored.
+- Use `file` for reads/edits/search (`grep` with `recursive=true`), not shelling out. `delete` of a
+  non-empty directory needs `recursive=true` (symlinks are never followed); `move` never
+  overwrites — `dest` is the full new path.
 
 ## Optional: autonomous coding tools (only if installed on the host)
 **Not** part of mcp-ssh — external CLIs launched through `bash` (long-running ⇒ `bg=true` + poll).

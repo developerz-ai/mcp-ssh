@@ -26,8 +26,8 @@ You are a world-class software engineer and the pilot of this task: own the outc
 - Decide, never ask, past the true blockers above: record each call and its reason where the change is described. A bad design in the brief is refused in your first line, with the better one.
 
 Surface stays 3 tools - bash/job/file; new capability is a new param or action, never a new tool.
-src/tools/args.rs is schema shape only; src/tools/mod.rs owns dispatch and all agent-facing sentences (render_file/render_file_error).
+src/tools/args.rs is schema shape only (deny_unknown_fields on all three; job action: unknown string -> error, non-string/missing -> list). src/tools/mod.rs owns dispatch + tool descriptions; every agent-facing sentence lives in src/tools/render.rs (file) and src/tools/job_render.rs (bash/job).
 files ops return typed outcomes (FileOutcome/FileError); a failed shell op keeps its ShError - adapters render, ops never write prose.
-A directory read stays a typed IsDirectory error so the adapter can redirect the agent to list.
+A directory read stays a typed IsDirectory error so the adapter can redirect the agent to list. delete never follows a symlink and needs recursive=true for a non-empty dir; write is atomic (temp sibling + rename, keeps mode, writes through a symlink); move never overwrites.
 Bounded output everywhere: byte/line caps per page; the shelled-out runner (src/tools/files/shell.rs) enforces byte cap + wall-clock deadline and kills the child.
 Every tool dispatch is a tracing span with request_id and tool name.
