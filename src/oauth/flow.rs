@@ -1,15 +1,30 @@
-//! Authorization Code + PKCE flow: `/authorize`, `/token`, `/register`.
+//! Authorization Code + PKCE flow: `/authorize` (GET renders the consent form,
+//! POST logs in and issues the code), `/token`, `/register`.
+//!
+//! A code is only ever issued by the POST, after the operator typed the
+//! credentials into the form: nothing ambient (cached Basic auth, a cookie) can
+//! make a page load mint one, so a link alone can't steal a login.
+use std::time::Duration;
+
 use axum::{
     Json,
     extract::{Form, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{AuthState, store};
+use super::store::{ConsentRequest, GrantError, RegisterError};
+use super::{AuthState, consent, secret, store};
 use crate::auth;
+
+/// Most redirect URIs one client may register, and the longest one accepted.
+const MAX_REDIRECT_URIS: usize = 5;
+const MAX_REDIRECT_URI_LEN: usize = 2048;
+/// Flat delay on a failed login: slows a password guesser without per-client
+/// state. Real rate limiting belongs to the reverse proxy.
+const LOGIN_FAILURE_DELAY: Duration = Duration::from_millis(500);
 
 #[derive(Deserialize)]
 pub struct AuthorizeParams {
@@ -29,48 +44,28 @@ pub struct AuthorizeParams {
     resource: Option<String>,
 }
 
-/// `/authorize` — authenticate the resource owner with HTTP Basic (browser shows
-/// the native prompt), then issue an auth code and redirect back to the client.
-pub async fn authorize(
-    State(st): State<AuthState>,
-    headers: HeaderMap,
-    Query(p): Query<AuthorizeParams>,
-) -> Response {
-    if !auth::check_basic(&headers, &st.creds) {
-        // 401 with a Basic challenge → the browser pops a login dialog.
-        return (
-            StatusCode::UNAUTHORIZED,
-            [("WWW-Authenticate", "Basic realm=\"mcp-ssh\"")],
-            "authentication required",
-        )
-            .into_response();
-    }
-
-    // Open-redirect guard (OAuth 2.1 §4.1.1 / MCP spec MUST): this URI is about to
-    // receive an auth code, so validate it *before* any redirect. Reject inline with
-    // 400 — never bounce the user-agent to an unvalidated `redirect_uri`.
+/// `GET /authorize` — validate the request and render the consent form. Never
+/// issues a code.
+pub async fn authorize(State(st): State<AuthState>, Query(p): Query<AuthorizeParams>) -> Response {
+    // Open-redirect guard (OAuth 2.1 §4.1.1 / MCP spec MUST): validate the URI
+    // *before* any redirect to it. Reject inline — never bounce the user-agent to
+    // an unvalidated `redirect_uri`.
     if !is_allowed_redirect(&p.redirect_uri) {
-        return bad_request("invalid_request");
+        return json_error(StatusCode::BAD_REQUEST, "invalid_request");
     }
-
-    // Client binding (OAuth 2.1 §4.1.2.1): the code may only be delivered to a URI
-    // this client registered. Without it, an `/authorize` link naming a real
-    // `client_id` could carry an attacker's `redirect_uri` + PKCE challenge and hand
-    // the victim's code over the moment they complete the Basic login. Unknown client
-    // or unregistered URI → 400 inline, never a redirect to the unbound URI.
-    //
-    // Defense in depth, not a complete anti-phishing control: `/register` is
-    // unauthenticated (it bootstraps auth), so an attacker can still register their
-    // own id for their own callback and lure a victim to a self-consistent link. The
-    // Basic prompt is the last line of defense there.
-    if !st
+    // Client binding (OAuth 2.1 §4.1.2.1): the code may only go to a URI this
+    // client registered. `/register` is open, so an attacker can still register
+    // their own callback — the consent form, showing where the code will go and
+    // demanding the password, is the defence there.
+    match st
         .store
         .client_allows_redirect(&p.client_id, &p.redirect_uri)
         .await
     {
-        return bad_request("invalid_request");
+        Ok(true) => {}
+        Ok(false) => return json_error(StatusCode::BAD_REQUEST, "invalid_request"),
+        Err(_) => return json_error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable"),
     }
-
     if p.response_type != "code" {
         return redirect_error(
             &p.redirect_uri,
@@ -79,29 +74,109 @@ pub async fn authorize(
         );
     }
     // PKCE S256 is mandatory for MCP clients.
-    let Some(challenge) = p
-        .code_challenge
-        .filter(|_| p.code_challenge_method.as_deref() == Some("S256"))
-    else {
+    let Some(challenge) = p.code_challenge.filter(|c| {
+        p.code_challenge_method.as_deref() == Some("S256") && secret::is_valid_challenge(c)
+    }) else {
         return redirect_error(&p.redirect_uri, "invalid_request", p.state.as_deref());
     };
 
-    let code = st.store.new_code(challenge, p.redirect_uri.clone()).await;
-    let sep = if p.redirect_uri.contains('?') {
-        '&'
-    } else {
-        '?'
+    let request = ConsentRequest {
+        client_id: p.client_id,
+        redirect_uri: p.redirect_uri,
+        challenge,
+        state: p.state,
     };
+    render_consent(&st, request, StatusCode::OK, None).await
+}
+
+/// The consent form's fields. Hand-written `Debug`: it carries the password.
+#[derive(Deserialize)]
+pub struct ConsentForm {
+    csrf_token: String,
+    username: String,
+    password: String,
+}
+
+impl std::fmt::Debug for ConsentForm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ConsentForm(<redacted>)")
+    }
+}
+
+/// `POST /authorize` — the consent form. The `csrf_token` names the request the
+/// GET validated (held server-side, single use, 10 minutes), so nothing in the
+/// posted form can change where the code goes. Wrong credentials re-render the
+/// form with a fresh token; right ones redirect to the client with the code.
+pub async fn approve(
+    State(st): State<AuthState>,
+    headers: HeaderMap,
+    Form(form): Form<ConsentForm>,
+) -> Response {
+    let Some(request) = st.store.take_consent(&form.csrf_token).await else {
+        return consent::refused(
+            StatusCode::FORBIDDEN,
+            "This login request expired or was already used. Start again from your MCP client.",
+        );
+    };
+    if !auth::check_login(&form.username, &form.password, &st.creds) {
+        tracing::warn!(
+            event = "login_failed",
+            forwarded_for = ?forwarded_for(&headers),
+            "failed login on /authorize"
+        );
+        tokio::time::sleep(LOGIN_FAILURE_DELAY).await;
+        return render_consent(
+            &st,
+            request,
+            StatusCode::UNAUTHORIZED,
+            Some("Wrong username or password."),
+        )
+        .await;
+    }
+    let (redirect_uri, state) = (request.redirect_uri.clone(), request.state.clone());
+    let Some(code) = st.store.new_code(request).await else {
+        return json_error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable");
+    };
+    tracing::info!(event = "login_succeeded", "authorization code issued");
     let mut location = format!(
-        "{}{}code={}",
-        p.redirect_uri,
-        sep,
+        "{redirect_uri}{}code={}",
+        query_separator(&redirect_uri),
         urlencoding::encode(&code)
     );
-    if let Some(s) = p.state {
+    if let Some(s) = state {
         location.push_str(&format!("&state={}", urlencoding::encode(&s)));
     }
-    (StatusCode::FOUND, [("Location", location)]).into_response()
+    (
+        StatusCode::FOUND,
+        [
+            (header::LOCATION, location),
+            (header::CACHE_CONTROL, "no-store".into()),
+        ],
+    )
+        .into_response()
+}
+
+/// Park `request` and render its form.
+async fn render_consent(
+    st: &AuthState,
+    request: ConsentRequest,
+    status: StatusCode,
+    error: Option<&str>,
+) -> Response {
+    let destination = request.redirect_uri.clone();
+    match st.store.begin_consent(request).await {
+        Some(nonce) => consent::page(status, &nonce, &destination, error),
+        None => json_error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable"),
+    }
+}
+
+/// The client address a proxy reported, for the failed-login journal line only:
+/// the first `X-Forwarded-For` hop, capped, and logged with `Debug` so control
+/// characters are escaped.
+fn forwarded_for(headers: &HeaderMap) -> Option<String> {
+    let value = headers.get("x-forwarded-for")?.to_str().ok()?;
+    let first = value.split(',').next()?.trim();
+    Some(first.chars().take(64).collect())
 }
 
 #[derive(Deserialize)]
@@ -117,33 +192,41 @@ pub struct TokenParams {
     // Present for `refresh_token`.
     #[serde(default)]
     refresh_token: Option<String>,
+    /// Public clients send it (RFC 6749 §4.1.3); when present it must match the
+    /// client the code or refresh token was issued to.
+    #[serde(default)]
+    client_id: Option<String>,
 }
 
 /// `/token` — issue an access + refresh pair. Two grants: `authorization_code`
 /// (code + PKCE verifier, first login) and `refresh_token` (silent renewal once
 /// the access token expires, so the client doesn't re-run the browser flow).
+/// Every response is `no-store`; a store failure is a 503, so a client keeps its
+/// refresh token and retries instead of discarding a valid login.
 pub async fn token(State(st): State<AuthState>, Form(p): Form<TokenParams>) -> Response {
+    let client_id = p.client_id.as_deref();
     let issued = match p.grant_type.as_str() {
         "authorization_code" => {
             let (Some(code), Some(verifier), Some(redirect_uri)) =
-                (p.code, p.code_verifier, p.redirect_uri)
+                (&p.code, &p.code_verifier, &p.redirect_uri)
             else {
-                return bad_request("invalid_request");
+                return token_error(StatusCode::BAD_REQUEST, "invalid_request");
             };
-            st.store.redeem(&code, &verifier, &redirect_uri).await
+            st.store
+                .redeem(code, verifier, redirect_uri, client_id)
+                .await
         }
         "refresh_token" => {
-            let Some(refresh_token) = p.refresh_token else {
-                return bad_request("invalid_request");
+            let Some(refresh_token) = &p.refresh_token else {
+                return token_error(StatusCode::BAD_REQUEST, "invalid_request");
             };
-            st.store.refresh(&refresh_token).await
+            st.store.refresh(refresh_token, client_id).await
         }
-        _ => return bad_request("unsupported_grant_type"),
+        _ => return token_error(StatusCode::BAD_REQUEST, "unsupported_grant_type"),
     };
     match issued {
         Ok(tokens) => (
-            // RFC 6749 §5.1 — token responses MUST NOT be cached.
-            [("Cache-Control", "no-store")],
+            [(header::CACHE_CONTROL, "no-store")],
             Json(json!({
                 "access_token": tokens.access,
                 "token_type": "Bearer",
@@ -152,28 +235,38 @@ pub async fn token(State(st): State<AuthState>, Form(p): Form<TokenParams>) -> R
             })),
         )
             .into_response(),
-        Err(e) => bad_request(&e.to_string()),
+        Err(e @ GrantError::InvalidGrant) => token_error(StatusCode::BAD_REQUEST, &e.to_string()),
+        Err(e @ GrantError::ServerError) => {
+            token_error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string())
+        }
     }
+}
+
+fn token_error(status: StatusCode, error: &str) -> Response {
+    (
+        status,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(json!({ "error": error })),
+    )
+        .into_response()
 }
 
 /// `/register` — minimal Dynamic Client Registration (RFC 7591). Clients are
 /// public (PKCE, no secret), so the only thing persisted is the `client_id` →
-/// `redirect_uri` binding that `/authorize` then enforces.
+/// `redirect_uri` binding that `/authorize` then enforces. Bounded: a few short
+/// URIs per client, and a cap on clients overall.
 pub async fn register(
     State(st): State<AuthState>,
     body: Option<Json<serde_json::Value>>,
 ) -> Response {
-    let Some(redirect_uris) = registered_redirect_uris(body) else {
-        return bad_request("invalid_redirect_uri");
+    let redirect_uris = match registered_redirect_uris(body) {
+        Ok(uris) => uris,
+        Err(error) => return json_error(StatusCode::BAD_REQUEST, error),
     };
     let client_id = match st.store.register_client(&redirect_uris).await {
         Ok(id) => id,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": e.to_string() })),
-            )
-                .into_response();
+        Err(RegisterError::Full | RegisterError::Unavailable) => {
+            return json_error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable");
         }
     };
     (
@@ -187,489 +280,75 @@ pub async fn register(
         .into_response()
 }
 
-/// The `redirect_uris` a DCR body is asking to bind, or `None` if the request
-/// can't be honoured (→ `invalid_redirect_uri`, RFC 7591 §3.2.2). Rejects a
-/// missing/non-array/non-string value, an empty list — REQUIRED for the
-/// authorization-code grant, the only one we support, and a client bound to no
-/// URI could never authorize — and any URI failing the same open-redirect rule
-/// `/authorize` applies.
-fn registered_redirect_uris(body: Option<Json<serde_json::Value>>) -> Option<Vec<String>> {
-    let Json(body) = body?;
+/// The `redirect_uris` a DCR body is asking to bind, or the RFC 7591 §3.2.2 error.
+/// Rejects a missing/non-array/non-string value, an empty list (a client bound to
+/// no URI could never authorize), more than [`MAX_REDIRECT_URIS`], and any URI
+/// failing the same rule `/authorize` applies.
+fn registered_redirect_uris(
+    body: Option<Json<serde_json::Value>>,
+) -> Result<Vec<String>, &'static str> {
+    const BAD_URI: &str = "invalid_redirect_uri";
+    let Json(body) = body.ok_or(BAD_URI)?;
     let uris: Vec<String> = body
-        .get("redirect_uris")?
-        .as_array()?
+        .get("redirect_uris")
+        .and_then(|v| v.as_array())
+        .ok_or(BAD_URI)?
         .iter()
         .map(|u| u.as_str().map(str::to_owned))
-        .collect::<Option<_>>()?;
-    (!uris.is_empty() && uris.iter().all(|u| is_allowed_redirect(u))).then_some(uris)
+        .collect::<Option<_>>()
+        .ok_or(BAD_URI)?;
+    if uris.len() > MAX_REDIRECT_URIS {
+        return Err("invalid_client_metadata");
+    }
+    if uris.is_empty() || !uris.iter().all(|u| is_allowed_redirect(u)) {
+        return Err(BAD_URI);
+    }
+    Ok(uris)
 }
 
-fn bad_request(error: &str) -> Response {
-    (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))).into_response()
+fn json_error(status: StatusCode, error: &str) -> Response {
+    (status, Json(json!({ "error": error }))).into_response()
+}
+
+fn query_separator(uri: &str) -> char {
+    if uri.contains('?') { '&' } else { '?' }
 }
 
 fn redirect_error(redirect_uri: &str, error: &str, state: Option<&str>) -> Response {
-    let sep = if redirect_uri.contains('?') { '&' } else { '?' };
-    let mut location = format!("{redirect_uri}{sep}error={error}");
+    let mut location = format!(
+        "{redirect_uri}{}error={error}",
+        query_separator(redirect_uri)
+    );
     if let Some(s) = state {
         location.push_str(&format!("&state={}", urlencoding::encode(s)));
     }
-    (StatusCode::FOUND, [("Location", location)]).into_response()
+    (StatusCode::FOUND, [(header::LOCATION, location)]).into_response()
 }
 
-/// OAuth 2.1 redirect-URI safety rule: only `https` (anywhere) or a loopback
-/// (`localhost`/`127.0.0.1`) HTTP address may receive an auth code — everything
-/// else is an open-redirect vector. Hand-rolled (no `url` dep) and fails closed:
-/// anything it can't confidently classify as loopback is rejected.
-fn is_allowed_redirect(uri: &str) -> bool {
-    if let Some(rest) = uri.strip_prefix("https://") {
-        let host = rest.split(['/', '?', '#']).next().unwrap_or("");
-        return !host.trim().is_empty();
+/// OAuth 2.1 redirect-URI rule: `https` to any host, or plain `http` only to a
+/// loopback host (`localhost`, `127.0.0.1`, `[::1]`). Parsed as a URI, never
+/// prefix-matched; anything with userinfo, a backslash or a fragment is refused —
+/// those are how a URI says one host to a naive check and another to a browser.
+fn is_allowed_redirect(raw: &str) -> bool {
+    if raw.len() > MAX_REDIRECT_URI_LEN || raw.contains(['#', '\\']) {
+        return false;
     }
-    if let Some(rest) = uri.strip_prefix("http://") {
-        // Host is everything before the first `/`, `?`, `#`, then strip an optional
-        // `:port`. Any userinfo (`user@host`) keeps the `@` in the slice, so spoofs
-        // like `http://localhost@evil.com` never equal a bare loopback host.
-        let host = rest
-            .split(['/', '?', '#'])
-            .next()
-            .unwrap_or("")
-            .split(':')
-            .next()
-            .unwrap_or("");
-        return host == "localhost" || host == "127.0.0.1";
+    let Ok(uri) = raw.parse::<axum::http::Uri>() else {
+        return false;
+    };
+    let Some(authority) = uri.authority() else {
+        return false;
+    };
+    if authority.as_str().contains('@') {
+        return false;
     }
-    false
+    let host = authority.host();
+    match uri.scheme_str() {
+        Some("https") => !host.trim().is_empty(),
+        Some("http") => matches!(host, "localhost" | "127.0.0.1" | "[::1]"),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use axum::http::{HeaderValue, header};
-    use base64::Engine;
-
-    use super::*;
-    use store::Store;
-
-    const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
-    const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
-
-    fn test_state(store: Store) -> AuthState {
-        AuthState {
-            creds: crate::auth::Credentials {
-                user: "u".into(),
-                pass: "p".into(),
-            },
-            store: Arc::new(store),
-            public_url: None,
-        }
-    }
-
-    fn basic_headers(user: &str, pass: &str) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        let enc = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
-        headers.insert(
-            header::AUTHORIZATION,
-            HeaderValue::from_str(&format!("Basic {enc}")).unwrap(),
-        );
-        headers
-    }
-
-    /// Deserialize a response body as JSON.
-    async fn body_json(resp: Response) -> serde_json::Value {
-        let bytes = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
-        serde_json::from_slice(&bytes).unwrap()
-    }
-
-    /// Register a client for `redirect_uri` through the real `/register` handler
-    /// and return its `client_id` — `/authorize` now needs one.
-    async fn register_client(st: &AuthState, redirect_uri: &str) -> String {
-        let body = Json(json!({ "redirect_uris": [redirect_uri] }));
-        let resp = register(State(st.clone()), Some(body)).await;
-        assert_eq!(resp.status(), StatusCode::CREATED);
-        body_json(resp).await["client_id"]
-            .as_str()
-            .unwrap()
-            .to_string()
-    }
-
-    /// A valid `/authorize` request (correct PKCE, no state); tests tweak one field
-    /// to exercise the branch they're about.
-    fn authorize_params(client_id: &str, redirect_uri: &str) -> AuthorizeParams {
-        AuthorizeParams {
-            response_type: "code".into(),
-            client_id: client_id.into(),
-            redirect_uri: redirect_uri.into(),
-            code_challenge: Some(CHALLENGE.into()),
-            code_challenge_method: Some("S256".into()),
-            state: None,
-            resource: None,
-        }
-    }
-
-    // --- /token ---
-
-    fn auth_code_params(code: String) -> TokenParams {
-        TokenParams {
-            grant_type: "authorization_code".into(),
-            code: Some(code),
-            code_verifier: Some(VERIFIER.into()),
-            redirect_uri: Some("http://cb".into()),
-            refresh_token: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn token_response_sets_cache_control_no_store() {
-        let store = Store::new(crate::db::Db::memory());
-        let code = store.new_code(CHALLENGE.into(), "http://cb".into()).await;
-        let resp = token(State(test_state(store)), Form(auth_code_params(code))).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(
-            resp.headers()
-                .get(header::CACHE_CONTROL)
-                .and_then(|v| v.to_str().ok()),
-            Some("no-store"),
-        );
-    }
-
-    #[tokio::test]
-    async fn authorization_code_grant_returns_access_and_refresh() {
-        let store = Store::new(crate::db::Db::memory());
-        let code = store.new_code(CHALLENGE.into(), "http://cb".into()).await;
-        let resp = token(State(test_state(store)), Form(auth_code_params(code))).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = body_json(resp).await;
-        assert!(body["access_token"].is_string());
-        assert!(
-            body["refresh_token"].is_string(),
-            "must issue a refresh token"
-        );
-        assert_eq!(body["token_type"], "Bearer");
-        assert_eq!(body["expires_in"], store::TOKEN_TTL.as_secs());
-    }
-
-    #[tokio::test]
-    async fn refresh_token_grant_renews_silently() {
-        let st = test_state(Store::new(crate::db::Db::memory()));
-        // First login.
-        let code = st
-            .store
-            .new_code(CHALLENGE.into(), "http://cb".into())
-            .await;
-        let first = body_json(token(State(st.clone()), Form(auth_code_params(code))).await).await;
-        let refresh = first["refresh_token"].as_str().unwrap().to_string();
-
-        // Exchange the refresh token — no code, no browser.
-        let params = TokenParams {
-            grant_type: "refresh_token".into(),
-            code: None,
-            code_verifier: None,
-            redirect_uri: None,
-            refresh_token: Some(refresh),
-        };
-        let resp = token(State(st.clone()), Form(params)).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = body_json(resp).await;
-        let new_access = body["access_token"].as_str().unwrap();
-        assert!(
-            st.store.validate(new_access).await,
-            "renewed token is valid"
-        );
-        assert_ne!(new_access, first["access_token"].as_str().unwrap());
-    }
-
-    #[tokio::test]
-    async fn refresh_token_grant_rejects_unknown_token() {
-        let params = TokenParams {
-            grant_type: "refresh_token".into(),
-            code: None,
-            code_verifier: None,
-            redirect_uri: None,
-            refresh_token: Some("not-a-real-refresh-token".into()),
-        };
-        let resp = token(
-            State(test_state(Store::new(crate::db::Db::memory()))),
-            Form(params),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(body_json(resp).await["error"], "invalid_grant");
-    }
-
-    #[tokio::test]
-    async fn token_rejects_unsupported_grant_type() {
-        let params = TokenParams {
-            grant_type: "client_credentials".into(),
-            code: Some("irrelevant".into()),
-            code_verifier: Some("irrelevant".into()),
-            redirect_uri: Some("http://cb".into()),
-            refresh_token: None,
-        };
-        let resp = token(
-            State(test_state(Store::new(crate::db::Db::memory()))),
-            Form(params),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(body_json(resp).await["error"], "unsupported_grant_type");
-    }
-
-    // --- /authorize ---
-
-    const CB: &str = "http://localhost/cb";
-
-    #[tokio::test]
-    async fn authorize_rejects_missing_pkce_s256() {
-        // Valid Basic creds and a registered client, but no PKCE challenge →
-        // invalid_request redirect.
-        let st = test_state(Store::new(crate::db::Db::memory()));
-        let client_id = register_client(&st, CB).await;
-        let mut params = authorize_params(&client_id, CB);
-        params.code_challenge = None;
-        params.code_challenge_method = None;
-
-        let resp = authorize(State(st), basic_headers("u", "p"), Query(params)).await;
-        assert_eq!(resp.status(), StatusCode::FOUND);
-        let location = resp.headers().get("Location").unwrap().to_str().unwrap();
-        assert!(
-            location.contains("error=invalid_request"),
-            "location={location}"
-        );
-    }
-
-    #[tokio::test]
-    async fn authorize_rejects_plain_challenge_method() {
-        // challenge present but method != S256 → invalid_request.
-        let st = test_state(Store::new(crate::db::Db::memory()));
-        let client_id = register_client(&st, CB).await;
-        let mut params = authorize_params(&client_id, CB);
-        params.code_challenge = Some("abc".into());
-        params.code_challenge_method = Some("plain".into());
-
-        let resp = authorize(State(st), basic_headers("u", "p"), Query(params)).await;
-        assert_eq!(resp.status(), StatusCode::FOUND);
-        let location = resp.headers().get("Location").unwrap().to_str().unwrap();
-        assert!(
-            location.contains("error=invalid_request"),
-            "location={location}"
-        );
-    }
-
-    #[tokio::test]
-    async fn authorize_redirects_with_code_on_valid_basic_and_pkce() {
-        let st = test_state(Store::new(crate::db::Db::memory()));
-        let client_id = register_client(&st, CB).await;
-
-        let resp = authorize(
-            State(st),
-            basic_headers("u", "p"),
-            Query(authorize_params(&client_id, CB)),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::FOUND);
-        let location = resp.headers().get("Location").unwrap().to_str().unwrap();
-        assert!(
-            location.starts_with("http://localhost/cb?code="),
-            "location={location}"
-        );
-    }
-
-    #[tokio::test]
-    async fn authorize_returns_401_on_bad_credentials() {
-        let st = test_state(Store::new(crate::db::Db::memory()));
-        let client_id = register_client(&st, CB).await;
-
-        let resp = authorize(
-            State(st),
-            basic_headers("u", "wrong"),
-            Query(authorize_params(&client_id, CB)),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn authorize_rejects_open_redirect_without_redirecting() {
-        // Valid creds + PKCE, but a non-loopback http redirect_uri → 400, NOT a
-        // redirect. The auth code must never leak to an attacker-controlled URI.
-        let st = test_state(Store::new(crate::db::Db::memory()));
-        let client_id = register_client(&st, CB).await;
-
-        let resp = authorize(
-            State(st),
-            basic_headers("u", "p"),
-            Query(authorize_params(&client_id, "http://evil.com/cb")),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        assert!(
-            resp.headers().get("Location").is_none(),
-            "must not redirect to an unvalidated URI"
-        );
-    }
-
-    #[tokio::test]
-    async fn authorize_rejects_a_redirect_uri_the_client_did_not_register() {
-        // The phishing case: everything is valid — Basic login, PKCE, and an https
-        // redirect_uri that passes `is_allowed_redirect` — but the client never
-        // registered that URI, so the code must not be issued or redirected.
-        let st = test_state(Store::new(crate::db::Db::memory()));
-        let client_id = register_client(&st, CB).await;
-
-        let resp = authorize(
-            State(st),
-            basic_headers("u", "p"),
-            Query(authorize_params(&client_id, "https://attacker.example/cb")),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(body_json(resp).await["error"], "invalid_request");
-    }
-
-    #[tokio::test]
-    async fn authorize_rejects_an_unregistered_client_id() {
-        // No registration at all → nothing to bind the redirect_uri to. Fails
-        // closed rather than falling back to "any allowed URI".
-        let st = test_state(Store::new(crate::db::Db::memory()));
-
-        let resp = authorize(
-            State(st),
-            basic_headers("u", "p"),
-            Query(authorize_params("never-registered", CB)),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        assert!(resp.headers().get("Location").is_none());
-    }
-
-    #[tokio::test]
-    async fn authorize_rejects_another_clients_redirect_uri() {
-        // Two registered clients: one may not borrow the other's callback.
-        let st = test_state(Store::new(crate::db::Db::memory()));
-        let victim = register_client(&st, CB).await;
-        let attacker = register_client(&st, "https://attacker.example/cb").await;
-        assert_ne!(victim, attacker);
-
-        let resp = authorize(
-            State(st),
-            basic_headers("u", "p"),
-            Query(authorize_params(&victim, "https://attacker.example/cb")),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(body_json(resp).await["error"], "invalid_request");
-    }
-
-    #[tokio::test]
-    async fn a_registered_client_completes_register_authorize_token() {
-        // End to end over the bound URI: the single-use code + PKCE guards still
-        // hold, and the code redeems for a token pair.
-        let st = test_state(Store::new(crate::db::Db::memory()));
-        let client_id = register_client(&st, CB).await;
-
-        let resp = authorize(
-            State(st.clone()),
-            basic_headers("u", "p"),
-            Query(authorize_params(&client_id, CB)),
-        )
-        .await;
-        let location = resp.headers().get("Location").unwrap().to_str().unwrap();
-        let code = location
-            .strip_prefix("http://localhost/cb?code=")
-            .expect("code on the registered redirect_uri")
-            .to_string();
-
-        let params = || TokenParams {
-            grant_type: "authorization_code".into(),
-            code: Some(code.clone()),
-            code_verifier: Some(VERIFIER.into()),
-            redirect_uri: Some(CB.into()),
-            refresh_token: None,
-        };
-        let resp = token(State(st.clone()), Form(params())).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert!(body_json(resp).await["access_token"].is_string());
-
-        // Still single-use.
-        let resp = token(State(st), Form(params())).await;
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(body_json(resp).await["error"], "invalid_grant");
-    }
-
-    // --- /register ---
-
-    #[tokio::test]
-    async fn register_echoes_redirect_uris_and_binds_them() {
-        let st = test_state(Store::new(crate::db::Db::memory()));
-        let body = Json(json!({ "redirect_uris": [CB] }));
-
-        let resp = register(State(st.clone()), Some(body)).await;
-        assert_eq!(resp.status(), StatusCode::CREATED);
-        let json = body_json(resp).await;
-        assert_eq!(json["redirect_uris"][0], CB);
-        let client_id = json["client_id"].as_str().unwrap();
-
-        assert!(
-            st.store.client_allows_redirect(client_id, CB).await,
-            "the echoed id must be bound to the URI it registered"
-        );
-    }
-
-    #[tokio::test]
-    async fn register_rejects_open_redirect_uri() {
-        let st = test_state(Store::new(crate::db::Db::memory()));
-        let body = Json(json!({ "redirect_uris": ["http://evil.com/cb"] }));
-        let resp = register(State(st), Some(body)).await;
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(body_json(resp).await["error"], "invalid_redirect_uri");
-    }
-
-    #[tokio::test]
-    async fn register_rejects_a_body_without_usable_redirect_uris() {
-        // RFC 7591 §2 makes redirect_uris REQUIRED for the authorization-code
-        // grant; a client bound to nothing could never authorize, so 201 would be
-        // a lie. Missing body, missing key, empty list, and non-strings all fail.
-        let st = test_state(Store::new(crate::db::Db::memory()));
-        for body in [
-            None,
-            Some(Json(json!({}))),
-            Some(Json(json!({ "redirect_uris": [] }))),
-            Some(Json(json!({ "redirect_uris": CB }))),
-            Some(Json(json!({ "redirect_uris": [42] }))),
-        ] {
-            let resp = register(State(st.clone()), body).await;
-            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-            assert_eq!(body_json(resp).await["error"], "invalid_redirect_uri");
-        }
-    }
-
-    // --- redirect-uri allow rules ---
-
-    #[test]
-    fn is_allowed_redirect_accepts_https_and_loopback_only() {
-        // https anywhere is fine (OAuth 2.1).
-        assert!(is_allowed_redirect("https://example.com/cb"));
-        assert!(is_allowed_redirect("https://evil.com"));
-        // loopback over http is fine, with or without a port.
-        assert!(is_allowed_redirect("http://localhost/cb"));
-        assert!(is_allowed_redirect("http://localhost:8080/cb"));
-        assert!(is_allowed_redirect("http://127.0.0.1/cb"));
-
-        // http non-loopback is the open-redirect vector → rejected.
-        assert!(!is_allowed_redirect("http://evil.com/cb"));
-        // subdomain + userinfo spoofs must not pass as loopback.
-        assert!(!is_allowed_redirect("http://localhost.evil.com/cb"));
-        assert!(!is_allowed_redirect("http://localhost@evil.com/cb"));
-        // non-http(s) schemes and junk fail closed.
-        assert!(!is_allowed_redirect("ftp://localhost/cb"));
-        assert!(!is_allowed_redirect("not a url"));
-        assert!(!is_allowed_redirect("https://"));
-        // empty/whitespace host after the scheme is still no host → rejected.
-        assert!(!is_allowed_redirect("https://?evil"));
-        assert!(!is_allowed_redirect("https:// /cb"));
-        // valid https URL with query/fragment still accepted.
-        assert!(is_allowed_redirect("https://example.com?next=/x"));
-    }
-}
+mod tests;

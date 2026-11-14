@@ -1,37 +1,34 @@
 //! Auth for `/mcp`: bearer-only. A valid access token issued by the embedded
-//! OAuth server (Claude and other MCP clients) is required. HTTP Basic is no
-//! longer accepted here — it survives solely as the human login inside
-//! `/authorize` (see `check_basic`). On failure, return a 401 that points
+//! OAuth server (Claude and other MCP clients) is required. The operator's
+//! username/password is accepted only by the `/authorize` consent form (see
+//! `check_login`), never here. On failure, return a 401 whose challenge points
 //! clients at the OAuth metadata so they can start the flow.
 use axum::{
     body::Body,
     extract::{Request, State},
     http::{
         HeaderMap, HeaderValue, StatusCode,
-        header::{AUTHORIZATION, WWW_AUTHENTICATE},
+        header::{AUTHORIZATION, RETRY_AFTER, WWW_AUTHENTICATE},
     },
     middleware::Next,
     response::Response,
 };
-use base64::Engine;
 
+use crate::config::Password;
 use crate::oauth::{AuthState, base_url};
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Credentials {
     pub user: String,
-    pub pass: String,
+    pub pass: Password,
 }
 
-/// True if the request carries valid HTTP Basic credentials.
-pub fn check_basic(headers: &HeaderMap, creds: &Credentials) -> bool {
-    let expected = format!("{}:{}", creds.user, creds.pass);
-    headers
-        .get(AUTHORIZATION)
-        .and_then(|h| h.to_str().ok())
-        .and_then(|h| h.strip_prefix("Basic "))
-        .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
-        .is_some_and(|d| constant_time_eq(&d, expected.as_bytes()))
+/// True if `user`/`pass` are the operator's credentials. Both halves are always
+/// compared, so the timing doesn't reveal which one was wrong.
+pub fn check_login(user: &str, pass: &str, creds: &Credentials) -> bool {
+    let user_ok = constant_time_eq(user.as_bytes(), creds.user.as_bytes());
+    let pass_ok = constant_time_eq(pass.as_bytes(), creds.pass.expose().as_bytes());
+    user_ok & pass_ok
 }
 
 /// Compare a candidate secret against the expected value without leaking how much
@@ -55,38 +52,42 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
 }
 
 /// Middleware guarding `/mcp`. Only a valid OAuth bearer token lets a request
-/// through; HTTP Basic is rejected here (it remains the human login for
-/// `/authorize`). Anything else gets the OAuth-pointing 401.
+/// through. A token store that can't answer is a 503 (retry), not a 401 — a 401
+/// would send every client back through the login flow during a DB blip.
 pub async fn require_auth(State(st): State<AuthState>, req: Request, next: Next) -> Response {
     let headers = req.headers();
-
     if let Some(token) = bearer(headers) {
-        if st.store.validate(token).await {
-            return next.run(req).await;
+        match st.store.validate(token).await {
+            Ok(true) => return next.run(req).await,
+            Ok(false) => {}
+            Err(_) => return unavailable(),
         }
     }
-
     unauthorized(st.public_url.as_deref(), headers)
 }
 
-/// Build the 401 that points clients at the OAuth metadata so they can start the
-/// flow. The `resource_metadata_url` is advertised only when a trusted
-/// `public_url` is configured: `/mcp` auth runs *before* the allowed-hosts gate,
-/// so an unauthenticated request's `Host` is attacker-controlled and must never
-/// be reflected into the challenge. With no `public_url`, return a bare 401. An
-/// invalid `WWW-Authenticate` value must never panic the request path, so omit
-/// the header when it won't build.
+fn unavailable() -> Response {
+    let mut response = Response::new(Body::from("token store unavailable"));
+    *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+    response
+        .headers_mut()
+        .insert(RETRY_AFTER, HeaderValue::from_static("5"));
+    response
+}
+
+/// The 401 that points clients at the protected-resource metadata (RFC 9728 §5.1,
+/// the MCP authorization spec): `Bearer resource_metadata="…"`. The base URL is
+/// the configured `public_url`, else the request's `Host` — safe to reflect here
+/// because the app's host guard has already rejected any Host not on the
+/// allowlist. A value that won't build as a header never panics the request path:
+/// the header is omitted and the 401 stands.
 fn unauthorized(public_url: Option<&str>, headers: &HeaderMap) -> Response {
     let mut response = Response::new(Body::empty());
     *response.status_mut() = StatusCode::UNAUTHORIZED;
 
-    let Some(public_url) = public_url else {
-        return response;
-    };
-
-    let base = base_url(Some(public_url), headers);
+    let base = base_url(public_url, headers);
     let challenge =
-        format!("Bearer resource_metadata_url=\"{base}/.well-known/oauth-protected-resource\"");
+        format!("Bearer resource_metadata=\"{base}/.well-known/oauth-protected-resource\"");
     if let Ok(value) = HeaderValue::try_from(challenge) {
         response.headers_mut().insert(WWW_AUTHENTICATE, value);
     }
@@ -100,72 +101,65 @@ mod tests {
     fn creds() -> Credentials {
         Credentials {
             user: "admin".into(),
-            pass: "secret".into(),
+            pass: Password::new("secret"),
         }
     }
 
-    #[test]
-    fn basic_auth_accepts_correct_and_rejects_wrong() {
-        let mut headers = HeaderMap::new();
-        let token = base64::engine::general_purpose::STANDARD.encode("admin:secret");
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Basic {token}")).unwrap(),
-        );
-        assert!(check_basic(&headers, &creds()));
-
-        let bad = base64::engine::general_purpose::STANDARD.encode("admin:nope");
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Basic {bad}")).unwrap(),
-        );
-        assert!(!check_basic(&headers, &creds()));
-    }
-
-    #[test]
-    fn malformed_or_huge_host_still_yields_401_never_panics() {
-        // Host values a hostile proxy might forward: oversized, and embedding the
-        // quote used to delimit the challenge. With no configured public_url the
-        // attacker-controlled Host must never reach the challenge: a clean 401
-        // with no WWW-Authenticate header, no panic.
-        for host in ["h".repeat(64 * 1024), "evil\"host:1\"".into()] {
-            let mut headers = HeaderMap::new();
-            headers.insert("host", HeaderValue::from_str(&host).unwrap());
-            let res = unauthorized(None, &headers);
-            assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
-            assert!(!res.headers().contains_key(WWW_AUTHENTICATE));
-        }
-    }
-
-    #[test]
-    fn challenge_advertises_configured_public_url_not_host() {
-        // A trusted public_url is the only source for the challenge; the
-        // attacker-controlled Host is ignored entirely.
-        let mut headers = HeaderMap::new();
-        headers.insert("host", HeaderValue::from_static("evil.example.com"));
-        let res = unauthorized(Some("https://mcp.example.com"), &headers);
-        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
-        let challenge = res
-            .headers()
+    fn challenge(res: &Response) -> &str {
+        res.headers()
             .get(WWW_AUTHENTICATE)
             .and_then(|v| v.to_str().ok())
-            .expect("challenge present when public_url is configured");
-        assert!(
-            challenge.contains("https://mcp.example.com/.well-known/oauth-protected-resource"),
-            "challenge must use the configured public_url: {challenge}"
-        );
-        assert!(
-            !challenge.contains("evil.example.com"),
-            "challenge must never reflect the Host header: {challenge}"
+            .expect("challenge present")
+    }
+
+    #[test]
+    fn login_accepts_correct_and_rejects_wrong() {
+        assert!(check_login("admin", "secret", &creds()));
+        assert!(!check_login("admin", "nope", &creds()));
+        assert!(!check_login("root", "secret", &creds()));
+        assert!(!check_login("", "", &creds()));
+    }
+
+    #[test]
+    fn credentials_debug_hides_the_password() {
+        assert!(!format!("{:?}", creds()).contains("secret"));
+    }
+
+    #[test]
+    fn challenge_uses_the_spec_parameter_and_the_configured_public_url() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("other.example.com"));
+        let res = unauthorized(Some("https://mcp.example.com"), &headers);
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            challenge(&res),
+            "Bearer resource_metadata=\"https://mcp.example.com/.well-known/oauth-protected-resource\""
         );
     }
 
     #[test]
-    fn invalid_challenge_value_falls_back_to_bare_401() {
-        // A configured public_url is used verbatim; a newline makes the
-        // WWW-Authenticate value invalid — omit the header, still 401, no panic.
-        let res = unauthorized(Some("http://example.com\n"), &HeaderMap::new());
+    fn without_public_url_the_challenge_derives_from_the_allowed_host() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("127.0.0.1:1337"));
+        let res = unauthorized(None, &headers);
+        assert_eq!(
+            challenge(&res),
+            "Bearer resource_metadata=\"http://127.0.0.1:1337/.well-known/oauth-protected-resource\""
+        );
+    }
+
+    #[test]
+    fn a_host_that_cannot_form_a_header_yields_a_bare_401_never_a_panic() {
+        // A quote would break out of the quoted parameter; it must not be reflected.
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("evil\"host"));
+        let res = unauthorized(None, &headers);
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
-        assert!(!res.headers().contains_key(WWW_AUTHENTICATE));
+        let shown = res
+            .headers()
+            .get(WWW_AUTHENTICATE)
+            .map(|v| v.to_str().unwrap_or_default().to_string())
+            .unwrap_or_default();
+        assert!(!shown.contains("evil\""), "{shown}");
     }
 }

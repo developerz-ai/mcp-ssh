@@ -1,12 +1,41 @@
-//! Paginated log reading for per-job output files.
+//! Bounded reading of per-job output files.
+//!
+//! A job log can be any size (a runaway command writes gigabytes before the live
+//! cap stops it), so nothing here reads a log whole: [`read_tail`] walks backwards
+//! from a byte offset in fixed chunks and stops at a line budget, a byte budget, or
+//! a scan ceiling — whichever comes first. Memory and I/O per call are bounded by
+//! the budget, never by the file size.
+use std::io;
+use std::path::{Path, PathBuf};
 
-/// One page of log lines plus a cursor to fetch the next page.
-#[derive(Debug, serde::Serialize)]
-pub struct Page {
+/// One newest-first page of a job's output: `lines` in chronological order, and
+/// `older` — the byte offset where this page starts — to pass back as the cursor
+/// for the next (older) page. An absolute offset rather than a count of lines from
+/// the end: a live job keeps appending, and a count from a moving end would
+/// re-serve lines on every page. `None` once the start of the output is reached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TailPage {
     pub lines: Vec<String>,
-    pub next_cursor: usize,
-    pub total_lines: usize,
-    pub has_more: bool,
+    pub older: Option<u64>,
+}
+
+/// How much one backward read may return: at most `lines` lines and `bytes` bytes
+/// of (already clamped) text, always at least one line so paging makes progress.
+#[derive(Debug, Clone, Copy)]
+pub struct TailBudget {
+    pub lines: usize,
+    pub bytes: usize,
+}
+
+impl TailBudget {
+    /// One `job(action="poll")` page: `limit` lines (at least one) within
+    /// [`MAX_PAGE_BYTES`].
+    pub fn page(limit: usize) -> Self {
+        Self {
+            lines: limit.max(1),
+            bytes: MAX_PAGE_BYTES,
+        }
+    }
 }
 
 pub const DEFAULT_PAGE: usize = 200;
@@ -18,165 +47,219 @@ pub const DEFAULT_PAGE: usize = 200;
 /// progress). ~64 KB is generous for reading yet safely under any context window.
 pub const MAX_PAGE_BYTES: usize = 64 * 1024;
 
-/// Longest single line returned verbatim. A line over this is truncated with a
-/// `…[+N bytes]` marker so one pathological line can't blow the byte budget on its
-/// own (and the line still counts as one cursor step, so the agent can move past it).
+/// Longest single line returned verbatim. A longer one keeps its newest
+/// `MAX_LINE_BYTES` behind a `[+N bytes]…` marker, so one pathological line can't
+/// blow the byte budget on its own.
 pub const MAX_LINE_BYTES: usize = 8 * 1024;
 
-/// Truncate a single line to `MAX_LINE_BYTES` on a UTF-8 boundary, tagging how many
-/// bytes were dropped. Short lines pass through untouched.
-fn clamp_line(line: &str) -> String {
-    if line.len() <= MAX_LINE_BYTES {
-        return line.to_string();
-    }
-    let mut end = MAX_LINE_BYTES;
-    while !line.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…[+{} bytes]", &line[..end], line.len() - end)
+/// Bytes read per backward step.
+const CHUNK: usize = 64 * 1024;
+
+/// How far past its byte budget one backward read may scan looking for a line
+/// start. A log with no newline for gigabytes (`head -c` of a binary, a progress
+/// bar that only ever writes `\r`) would otherwise be walked to the start of the
+/// file to find where its last "line" begins. Past this the line is cut and the
+/// next page resumes inside it.
+const SCAN_SLACK: u64 = 1024 * 1024;
+
+/// Prefix on a line whose earlier bytes were cut by the scan ceiling; the next
+/// (older) page continues the same line.
+const CUT_MARKER: &str = "[…]";
+
+/// The newest-first page of `path` that ends at byte `end` (`None` = the end of
+/// the file). Never reads more than the budget plus a bounded scan ceiling,
+/// whatever the file's size. A missing or unreadable log is an error, never an
+/// empty page — "log gone" must not look like "no output yet".
+pub async fn read_tail(path: &Path, end: Option<u64>, budget: TailBudget) -> io::Result<TailPage> {
+    let path: PathBuf = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        use std::os::unix::fs::FileExt;
+        let file = std::fs::File::open(&path)?;
+        let len = file.metadata()?.len();
+        tail_of(len, end, budget, |buf, offset| {
+            file.read_exact_at(buf, offset)
+        })
+    })
+    .await
+    .map_err(io::Error::other)?
 }
 
-/// A job log could not be read. Kept distinct from a legitimately empty log so
-/// `job(action="poll")` can surface "log unavailable" instead of silently
-/// returning an empty page (a missing or unreadable log must not look identical
-/// to one that simply has no output yet).
-#[derive(Debug, thiserror::Error)]
-pub enum JobLogError {
-    #[error("reading job log: {0}")]
-    Read(#[from] std::io::Error),
+/// The newest-first page of an in-memory text (a finished job's saved tail), with
+/// the same cursor semantics as [`read_tail`].
+pub fn tail_of_text(text: &str, end: Option<u64>, budget: TailBudget) -> TailPage {
+    let bytes = text.as_bytes();
+    let read = |buf: &mut [u8], offset: u64| {
+        let start = usize::try_from(offset).map_err(io::Error::other)?;
+        let src = bytes
+            .get(start..start + buf.len())
+            .ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))?;
+        buf.copy_from_slice(src);
+        Ok(())
+    };
+    // An in-memory read past the length is the only failure, and `tail_of` never
+    // asks for one — so this is an empty page only on a bug, never a panic.
+    tail_of(bytes.len() as u64, end, budget, read).unwrap_or(TailPage {
+        lines: Vec::new(),
+        older: None,
+    })
 }
 
-/// Convert back to `io::Error` at the `JobStore::run` boundary, which already
-/// reports in `std::io::Result`. The typed error matters for `poll`, which
-/// surfaces it to the caller rather than collapsing it into an empty page.
-impl From<JobLogError> for std::io::Error {
-    fn from(e: JobLogError) -> Self {
-        match e {
-            JobLogError::Read(io) => io,
-        }
-    }
-}
-
-/// Read lines `[cursor, cursor+limit)` from a log file. Re-reads the whole file
-/// each call — fine for typical logs; seek by byte offset if they get huge.
-pub async fn read_page(
-    path: &std::path::Path,
-    cursor: usize,
-    limit: usize,
-) -> Result<Page, JobLogError> {
-    // A zero limit would yield an empty page whose `next_cursor == cursor` with
-    // `has_more` still true, so a client advancing on `next_cursor` would spin
-    // forever on the same window. Clamp to at least one line.
-    let limit = limit.max(1);
-    // A failed read (missing/unreadable log) propagates as a typed error. Only
-    // non-UTF-8 *content* is rendered lossily: a command that writes raw bytes
-    // (compiled output, escape sequences) must not produce a silently-empty page.
-    let bytes = tokio::fs::read(path).await?;
-    let content = String::from_utf8_lossy(&bytes);
-    let all: Vec<&str> = content.lines().collect();
-    Ok(paginate(&all, cursor, limit))
-}
-
-/// Like [`read_page`] but indexed from the END — the newest output is the first
-/// page. Used by `job(action="poll")` so monitoring a long-running job shows its
-/// latest output without paging to the end first. `file read` keeps the forward
-/// [`read_page`].
-pub async fn read_page_tail(
-    path: &std::path::Path,
-    cursor: usize,
-    limit: usize,
-) -> Result<Page, JobLogError> {
-    let limit = limit.max(1);
-    let bytes = tokio::fs::read(path).await?;
-    let content = String::from_utf8_lossy(&bytes);
-    let all: Vec<&str> = content.lines().collect();
-    Ok(paginate_tail(&all, cursor, limit))
-}
-
-/// Read the last `keep` lines of a log file, newline-joined with a trailing
-/// newline. Used to snapshot a finished job's output into the DB so the tail
-/// survives the live log later being trimmed or reaped. A missing/unreadable log
-/// propagates as the same typed error as `read_page`.
-pub async fn tail(path: &std::path::Path, keep: usize) -> Result<String, JobLogError> {
-    let bytes = tokio::fs::read(path).await?;
-    let content = String::from_utf8_lossy(&bytes);
-    let lines: Vec<&str> = content.lines().collect();
-    let start = lines.len().saturating_sub(keep);
-    let mut out = lines[start..].join("\n");
+/// The last `budget.lines` lines of a log (within `budget.bytes`), newline-joined
+/// with a trailing newline — the snapshot a finished job saves into its row so it
+/// outlives the live log being trimmed or reaped.
+pub async fn tail(path: &Path, budget: TailBudget) -> io::Result<String> {
+    let page = read_tail(path, None, budget).await?;
+    let mut out = page.lines.join("\n");
     if !out.is_empty() {
         out.push('\n');
     }
     Ok(out)
 }
 
-/// Slice `[cursor, …)` from already-split lines, bounded by BOTH the line `limit`
-/// and `MAX_PAGE_BYTES`, with each line clamped to `MAX_LINE_BYTES`. `next_cursor`
-/// reflects exactly how many lines were returned, so byte-capping never desyncs the
-/// line cursor — the agent always resumes at the first line it hasn't seen. Shared
-/// by job-log polling and `file read` so both honor the same ceilings.
-pub fn paginate(all: &[&str], cursor: usize, limit: usize) -> Page {
-    // A zero limit would yield an empty, non-advancing page; clamp to one line.
-    let limit = limit.max(1);
-    let total = all.len();
-    let start = cursor.min(total);
-    let mut lines: Vec<String> = Vec::new();
-    let mut bytes = 0usize;
-    for raw in &all[start..] {
-        if lines.len() >= limit {
+/// The backward walk behind every tail read. `len` is the source length and
+/// `read_at` fills a buffer from an absolute offset. Lines are `\n`-terminated; a
+/// final unterminated line (output still being written) counts as a line.
+fn tail_of(
+    len: u64,
+    end: Option<u64>,
+    budget: TailBudget,
+    mut read_at: impl FnMut(&mut [u8], u64) -> io::Result<()>,
+) -> io::Result<TailPage> {
+    let end = end.map_or(len, |e| e.min(len));
+    let floor = end.saturating_sub(budget.bytes as u64 + SCAN_SLACK);
+    let mut lines: Vec<String> = Vec::new(); // newest first
+    let mut used = 0usize;
+    // Start offset of the oldest line taken so far: the next page's `end`.
+    let mut oldest = end;
+    let mut line = LineTail::default();
+
+    let mut chunk = vec![0u8; CHUNK];
+    let mut chunk_start = end; // the loaded chunk starts here and ends at its last `i`
+    let mut i = end; // the next byte examined is `i - 1`
+    // A `\n` as the very last byte terminates the newest line rather than starting
+    // an empty one after it.
+    let mut skip_newline = true;
+
+    loop {
+        if i == 0 || i == floor {
+            // Start of the source, or the scan ceiling inside one endless line.
+            let cut = i > 0;
+            let fits = lines.is_empty() || used + line.text_len(cut) <= budget.bytes;
+            if i < end && fits {
+                lines.push(line.finish(cut));
+                oldest = i;
+            }
             break;
         }
-        let line = clamp_line(raw);
-        // Always take at least one line, then stop before exceeding the budget.
-        if !lines.is_empty() && bytes + line.len() + 1 > MAX_PAGE_BYTES {
-            break;
+        if i <= chunk_start {
+            let start = i.saturating_sub(CHUNK as u64).max(floor);
+            let n = (i - start) as usize;
+            read_at(&mut chunk[..n], start)?;
+            chunk_start = start;
         }
-        bytes += line.len() + 1; // +1 for the newline the agent sees between lines
-        lines.push(line);
+        let byte = chunk[(i - 1 - chunk_start) as usize];
+        if byte == b'\n' {
+            if skip_newline {
+                skip_newline = false;
+                i -= 1;
+                continue;
+            }
+            // `[i, …)` is a complete line.
+            let fits = lines.is_empty() || used + line.text_len(false) <= budget.bytes;
+            if !fits {
+                break;
+            }
+            let text = line.finish(false);
+            used += text.len() + 1;
+            lines.push(text);
+            oldest = i;
+            if lines.len() >= budget.lines {
+                break;
+            }
+            line = LineTail::default();
+        } else {
+            skip_newline = false;
+            line.push_front(byte);
+        }
+        i -= 1;
     }
-    let end = start + lines.len();
-    Page {
+
+    lines.reverse();
+    Ok(TailPage {
         lines,
-        next_cursor: end,
-        total_lines: total,
-        has_more: end < total,
+        older: (oldest > 0).then_some(oldest),
+    })
+}
+
+/// The visible tail of one line, accumulated right to left. Keeps what a terminal
+/// would show: the text after the line's last `\r` (a progress bar redraws itself
+/// with `\r`), and of that only the last `MAX_LINE_BYTES` — the newest part of an
+/// over-long line, not its stale head.
+#[derive(Default)]
+struct LineTail {
+    /// The kept bytes, in reverse order.
+    rev: Vec<u8>,
+    /// Bytes past `MAX_LINE_BYTES` that were dropped from the line's head.
+    dropped: u64,
+    /// A `\r` was seen: everything further left was overwritten on screen.
+    overwritten: bool,
+    /// At least one byte of this line was seen (to strip a CRLF's `\r`).
+    seen: bool,
+}
+
+impl LineTail {
+    fn push_front(&mut self, byte: u8) {
+        let first = !self.seen;
+        self.seen = true;
+        if self.overwritten {
+            return;
+        }
+        if byte == b'\r' {
+            // A trailing `\r` is a CRLF line ending, not a redraw.
+            if !first {
+                self.overwritten = true;
+            }
+            return;
+        }
+        if self.rev.len() < MAX_LINE_BYTES {
+            self.rev.push(byte);
+        } else {
+            self.dropped += 1;
+        }
+    }
+
+    /// Length of the rendered line plus its newline, for the byte budget.
+    fn text_len(&self, cut: bool) -> usize {
+        self.rev.len() + marker(cut, self.dropped).len() + 1
+    }
+
+    fn finish(&mut self, cut: bool) -> String {
+        let mut bytes: Vec<u8> = self.rev.iter().rev().copied().collect();
+        if self.dropped > 0 {
+            // The head was cut mid-character: drop orphaned continuation bytes.
+            let skip = bytes
+                .iter()
+                .take(3)
+                .take_while(|&&b| b & 0xC0 == 0x80)
+                .count();
+            bytes.drain(..skip);
+            self.dropped += skip as u64;
+        }
+        format!(
+            "{}{}",
+            marker(cut, self.dropped),
+            String::from_utf8_lossy(&bytes)
+        )
     }
 }
 
-/// Like [`paginate`], but indexed from the END: `cursor` is how many of the newest
-/// lines have already been consumed, so cursor 0 returns the newest `limit` lines
-/// and `next_cursor` walks *backward* into history. Lines stay in chronological
-/// order *within* the page (a stack trace still reads top-to-bottom); only the page
-/// window moves newest-first. Same `MAX_PAGE_BYTES` / `MAX_LINE_BYTES` ceilings as
-/// `paginate`, trimmed from the OLDEST end of the window so the newest line is
-/// always kept. Used by `job(action="poll")`.
-pub fn paginate_tail(all: &[&str], cursor: usize, limit: usize) -> Page {
-    let limit = limit.max(1);
-    let total = all.len();
-    let from_end = cursor.min(total);
-    // Exclusive upper bound of this page; the window is the `limit` lines ending here.
-    let end = total - from_end;
-    let mut picked: Vec<String> = Vec::new();
-    let mut bytes = 0usize;
-    let mut i = end;
-    // Walk backward from `end`, newest first, honoring the line + byte budgets.
-    while i > 0 && picked.len() < limit {
-        let line = clamp_line(all[i - 1]);
-        // Always take at least one line, then stop before exceeding the budget.
-        if !picked.is_empty() && bytes + line.len() + 1 > MAX_PAGE_BYTES {
-            break;
-        }
-        bytes += line.len() + 1; // +1 for the newline the agent sees between lines
-        picked.push(line);
-        i -= 1;
-    }
-    // `i` is the index of the oldest line NOT included — older output remains iff > 0.
-    picked.reverse(); // back to chronological order within the page
-    let returned = picked.len();
-    Page {
-        lines: picked,
-        next_cursor: cursor + returned,
-        total_lines: total,
-        has_more: i > 0,
+/// What precedes a line's kept text: [`CUT_MARKER`] when the scan ceiling cut it
+/// (the rest is on the next page), then `[+N bytes]…` for a clamped head.
+fn marker(cut: bool, dropped: u64) -> String {
+    let cut = if cut { CUT_MARKER } else { "" };
+    match dropped {
+        0 => cut.to_string(),
+        n => format!("{cut}[+{n} bytes]…"),
     }
 }
 
@@ -184,149 +267,198 @@ pub fn paginate_tail(all: &[&str], cursor: usize, limit: usize) -> Page {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn read_page_handles_binary_log_without_empty_output() {
-        // Simulate a command that writes non-UTF-8 bytes to its log.
-        let dir = tempfile::tempdir().unwrap();
-        let log = dir.path().join("bin.log");
-        // Valid UTF-8 prefix + invalid bytes + valid suffix.
-        tokio::fs::write(&log, b"line1\nline2\xff\xfeline3\n")
-            .await
-            .unwrap();
-        let page = read_page(&log, 0, 100).await.unwrap();
-        // Must return lines, not an empty page.
-        assert!(
-            !page.lines.is_empty(),
-            "binary log must not produce empty page"
-        );
-        assert!(page.lines[0].contains("line1"));
-    }
-
-    #[tokio::test]
-    async fn read_page_clamps_zero_limit_to_avoid_infinite_loop() {
-        // limit=0 must not produce an empty, non-advancing page: a client paging
-        // on next_cursor would otherwise loop forever on the same window.
-        let dir = tempfile::tempdir().unwrap();
-        let log = dir.path().join("multi.log");
-        tokio::fs::write(&log, b"a\nb\nc\n").await.unwrap();
-        let page = read_page(&log, 0, 0).await.unwrap();
-        assert_eq!(page.lines.len(), 1, "zero limit must clamp to one line");
-        assert!(page.next_cursor > 0, "cursor must advance past the start");
-        assert!(page.has_more, "more lines remain after the clamped page");
+    fn page(text: &str, end: Option<u64>, limit: usize) -> TailPage {
+        tail_of_text(text, end, TailBudget::page(limit))
     }
 
     #[test]
-    fn paginate_caps_total_bytes_and_advances_cursor_consistently() {
-        // Many lines, each ~1 KB. A page must stop at MAX_PAGE_BYTES, and the
-        // returned line count must match next_cursor so paging stays in sync.
-        let line = "x".repeat(1024);
-        let owned: Vec<String> = (0..1000).map(|_| line.clone()).collect();
-        let all: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+    fn newest_window_first_then_older_by_absolute_offset() {
+        let text: String = (1..=10).map(|i| format!("{i}\n")).collect();
+        let p0 = page(&text, None, 3);
+        assert_eq!(p0.lines, ["8", "9", "10"], "newest window, in order");
+        let older = p0.older.expect("older lines remain");
+        assert_eq!(&text[older as usize..], "8\n9\n10\n", "cursor = page start");
 
-        let page = paginate(&all, 0, DEFAULT_PAGE);
-        let returned: usize = page.lines.iter().map(|l| l.len() + 1).sum();
-        assert!(
-            returned <= MAX_PAGE_BYTES,
-            "page exceeded byte budget: {returned}"
-        );
-        assert!(page.has_more, "a 1 MB log must report more");
+        let p1 = page(&text, Some(older), 3);
+        assert_eq!(p1.lines, ["5", "6", "7"]);
+
+        let p3 = page(&text, Some(2), 3);
+        assert_eq!(p3.lines, ["1"], "only the oldest line is left");
+        assert_eq!(p3.older, None, "nothing older remains");
+    }
+
+    /// The cursor is anchored to bytes already written, so output appended after
+    /// the first page never shifts the pages behind it (B8).
+    #[test]
+    fn appending_output_never_shifts_an_older_page() {
+        let mut text: String = (1..=10).map(|i| format!("{i}\n")).collect();
+        let older = page(&text, None, 3).older.unwrap();
+        text.push_str("11\n12\n13\n");
+        assert_eq!(page(&text, Some(older), 3).lines, ["5", "6", "7"]);
+    }
+
+    #[test]
+    fn edge_shapes() {
         assert_eq!(
-            page.next_cursor,
-            page.lines.len(),
-            "next_cursor must equal lines returned so paging doesn't skip content"
+            page("", None, 5),
+            TailPage {
+                lines: vec![],
+                older: None
+            }
+        );
+        assert_eq!(page("abc", None, 5).lines, ["abc"], "no trailing newline");
+        assert_eq!(page("\n\n", None, 5).lines, ["", ""], "two empty lines");
+        assert_eq!(page("a\r\nb\r\n", None, 5).lines, ["a", "b"], "CRLF");
+        assert_eq!(
+            page("a\nb\n", Some(999), 5).lines,
+            ["a", "b"],
+            "cursor past end"
+        );
+        assert_eq!(
+            page("a\nb\nc\n", None, 0).lines,
+            ["c"],
+            "limit 0 is one line"
+        );
+    }
+
+    /// A progress bar redraws one line with `\r`: the page shows what the
+    /// terminal would — the last frame, not the first (B7).
+    #[test]
+    fn carriage_return_keeps_the_last_frame() {
+        assert_eq!(
+            page("10%\r50%\r100%\ndone\n", None, 5).lines,
+            ["100%", "done"]
         );
     }
 
     #[test]
-    fn paginate_truncates_a_single_oversized_line() {
-        let huge = "a".repeat(MAX_LINE_BYTES * 4);
-        let all = vec![huge.as_str()];
-        let page = paginate(&all, 0, DEFAULT_PAGE);
-        assert_eq!(page.lines.len(), 1, "one line in, one line out");
+    fn an_over_long_line_keeps_its_newest_bytes() {
+        let line = format!("{}END", "x".repeat(100 * 1024));
+        let p = page(&format!("{line}\n"), None, 5);
+        assert_eq!(p.lines.len(), 1);
+        let shown = &p.lines[0];
+        assert!(shown.ends_with("END"), "the tail of the line survives");
         assert!(
-            page.lines[0].len() < huge.len(),
-            "oversized line must be truncated"
+            shown.len() <= MAX_LINE_BYTES + 32,
+            "clamped: {}",
+            shown.len()
         );
+        let want = format!("[+{} bytes]…", line.len() - MAX_LINE_BYTES);
         assert!(
-            page.lines[0].contains("[+"),
-            "truncated line must carry a dropped-bytes marker: {}",
-            &page.lines[0][page.lines[0].len().saturating_sub(40)..]
+            shown.starts_with(&want),
+            "exact dropped count: {}",
+            &shown[..30]
         );
-        assert!(!page.has_more, "single line, fully consumed");
+        assert_eq!(p.older, None, "the whole line was scanned");
+    }
+
+    /// A 5 MiB line exceeds the scan ceiling: the page shows its newest bytes,
+    /// marked cut, and the next page resumes inside it.
+    #[test]
+    fn a_line_longer_than_the_scan_ceiling_is_cut_and_continued() {
+        let text = format!("{}END\n", "x".repeat(5 * 1024 * 1024));
+        let p = page(&text, None, 5);
+        assert_eq!(p.lines.len(), 1);
+        assert!(p.lines[0].starts_with(CUT_MARKER) && p.lines[0].ends_with("END"));
+        assert!(p.lines[0].len() <= MAX_LINE_BYTES + 64);
+        let next = page(&text, p.older, 5);
+        assert!(next.lines[0].starts_with(CUT_MARKER) && next.older < p.older);
     }
 
     #[test]
-    fn paginate_never_returns_empty_page_for_nonempty_input() {
-        // A single line far larger than the page budget must still come back
-        // (clamped to MAX_LINE_BYTES) and advance the cursor — never a zero-line,
-        // stuck page. clamp_line keeps it under the budget, so a following small
-        // line fits too.
-        let big = "z".repeat(MAX_PAGE_BYTES * 2);
-        let all = vec![big.as_str(), "next"];
-        let page = paginate(&all, 0, DEFAULT_PAGE);
-        assert!(!page.lines.is_empty(), "must return at least one line");
-        assert!(
-            page.lines[0].len() <= MAX_LINE_BYTES + 32,
-            "oversized line must be clamped under the budget"
-        );
-        assert_eq!(page.next_cursor, page.lines.len(), "cursor tracks lines");
-        assert!(
-            !page.has_more,
-            "both lines fit once the huge one is clamped"
-        );
+    fn non_utf8_is_rendered_lossily_not_dropped() {
+        let p = tail_of_bytes(b"line1\nline2\xff\xfeline3\n", 5);
+        assert_eq!(p.lines.len(), 2);
+        assert!(p.lines[1].contains("line3"));
+    }
+
+    fn tail_of_bytes(bytes: &[u8], limit: usize) -> TailPage {
+        tail_of(
+            bytes.len() as u64,
+            None,
+            TailBudget::page(limit),
+            |buf, off| {
+                let off = off as usize;
+                buf.copy_from_slice(&bytes[off..off + buf.len()]);
+                Ok(())
+            },
+        )
+        .unwrap()
     }
 
     #[test]
-    fn paginate_tail_returns_newest_window_first_in_order() {
-        let owned: Vec<String> = (1..=10).map(|i| i.to_string()).collect();
-        let all: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
-
-        // cursor 0 → newest 3 lines, still chronological within the page.
-        let p0 = paginate_tail(&all, 0, 3);
-        assert_eq!(p0.lines, vec!["8", "9", "10"], "newest window, in order");
-        assert_eq!(p0.next_cursor, 3, "advances backward by lines returned");
-        assert_eq!(p0.total_lines, 10);
-        assert!(p0.has_more, "older lines remain");
-
-        // cursor 3 → the previous (older) window.
-        let p1 = paginate_tail(&all, 3, 3);
-        assert_eq!(p1.lines, vec!["5", "6", "7"]);
-        assert_eq!(p1.next_cursor, 6);
-        assert!(p1.has_more);
-
-        // Walk to the oldest line: no more history past it.
-        let p3 = paginate_tail(&all, 9, 3);
-        assert_eq!(p3.lines, vec!["1"], "only the oldest line is left");
-        assert!(!p3.has_more, "nothing older remains");
-    }
-
-    #[test]
-    fn paginate_tail_caps_bytes_keeping_the_newest() {
-        // Each line ~1 KB; a page must stay under the byte budget and keep the
-        // NEWEST lines (trim the oldest end of the window).
-        let owned: Vec<String> = (0..1000).map(|i| format!("{i:01000}")).collect();
-        let all: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
-        let page = paginate_tail(&all, 0, DEFAULT_PAGE);
-        let returned: usize = page.lines.iter().map(|l| l.len() + 1).sum();
+    fn a_page_stays_under_the_byte_budget_keeping_the_newest() {
+        let text: String = (0..1000).map(|i| format!("{i:01000}\n")).collect();
+        let p = page(&text, None, DEFAULT_PAGE);
+        let returned: usize = p.lines.iter().map(|l| l.len() + 1).sum();
         assert!(
             returned <= MAX_PAGE_BYTES,
             "byte budget honored: {returned}"
         );
-        assert!(page.has_more, "older lines remain");
-        // The very last (newest) line must be present and last in the page.
-        assert_eq!(page.lines.last().unwrap(), all.last().unwrap());
-        assert_eq!(
-            page.next_cursor,
-            page.lines.len(),
-            "next_cursor tracks lines returned so backward paging stays in sync"
+        assert!(p.older.is_some());
+        assert_eq!(p.lines.last().unwrap(), &format!("{:01000}", 999));
+    }
+
+    /// The server-OOM regression (B1): a multi-GB log with a short real tail must
+    /// come back promptly having read only a bounded number of bytes.
+    #[tokio::test]
+    async fn a_huge_sparse_log_is_read_in_bounded_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.log");
+        let file = std::fs::File::create(&path).unwrap();
+        let hole = 2u64 * 1024 * 1024 * 1024;
+        file.set_len(hole).unwrap();
+        drop(file);
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(b"\nlast-1\nlast-2\n").unwrap();
+        }
+
+        let started = std::time::Instant::now();
+        let p = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_tail(&path, None, TailBudget::page(2)),
+        )
+        .await
+        .expect("bounded read returns promptly")
+        .unwrap();
+        assert_eq!(p.lines, ["last-1", "last-2"]);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+
+        // Count the bytes a full-budget read touches: the scan ceiling, not 2 GiB.
+        let mut read = 0u64;
+        let file = std::fs::File::open(&path).unwrap();
+        let len = file.metadata().unwrap().len();
+        let p = tail_of(len, None, TailBudget::page(DEFAULT_PAGE), |buf, off| {
+            use std::os::unix::fs::FileExt;
+            read += buf.len() as u64;
+            file.read_exact_at(buf, off)
+        })
+        .unwrap();
+        assert!(
+            read <= MAX_PAGE_BYTES as u64 + SCAN_SLACK + CHUNK as u64,
+            "read {read} bytes"
         );
+        assert!(
+            p.lines[0].starts_with(CUT_MARKER),
+            "the endless line is cut"
+        );
+        assert!(p.older.is_some(), "and the next page resumes inside it");
     }
 
     #[tokio::test]
-    async fn read_page_errors_on_missing_log() {
-        // A missing log is an error, not a silently-empty page.
+    async fn a_missing_log_is_an_error_not_an_empty_page() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("nope.log");
-        assert!(read_page(&missing, 0, 100).await.is_err());
+        assert!(
+            read_tail(&missing, None, TailBudget::page(5))
+                .await
+                .is_err()
+        );
+        assert!(tail(&missing, TailBudget::page(5)).await.is_err());
     }
 }

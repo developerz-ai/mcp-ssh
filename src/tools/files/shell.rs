@@ -8,18 +8,28 @@ use std::time::Duration;
 /// agent. Unlike `read`, these aren't line-cursored, so a `find /` or `grep -r` on
 /// a huge tree would otherwise dump unbounded text into memory *and* context. The
 /// runner streams the child's output and stops at this cap — killing the child —
-/// then appends a marker telling the agent to narrow the path/pattern.
-const MAX_SHELL_OUTPUT_BYTES: usize = 64 * 1024;
+/// and flags the output `truncated` so the adapter can say so.
+pub(in crate::tools) const MAX_SHELL_OUTPUT_BYTES: usize = 64 * 1024;
 
 /// Wall-clock ceiling for a single `ls`/`find`/`grep`. Unlike `bash`, the `file`
 /// tool has no inline window or backgrounding, so a `find /` or `grep -rn pat /`
 /// would otherwise hang the MCP request forever. On elapse the runner kills the
 /// child and returns a timeout error.
-const MAX_SHELL_RUN_SECS: u64 = 30;
+pub(super) const MAX_SHELL_RUN_SECS: u64 = 30;
+
+/// A clean (exit 0) run's combined output. `truncated` is a fact — the byte cap
+/// cut the stream and the child was killed — rendered into a sentence by the
+/// adapter, never stamped into `text` here.
+#[derive(Debug)]
+pub(in crate::tools) struct ShOutput {
+    pub text: String,
+    pub truncated: bool,
+}
 
 /// A shelled-out command that didn't produce a clean result. Exit status and
 /// combined output stay separate so callers can special-case a status (grep's
-/// exit-1-means-no-matches) without parsing message text.
+/// exit-1-means-no-matches, a partial listing) without parsing message text.
+/// Display is the bare fact; any advice is the adapter's to add.
 ///
 /// Visible to the whole `tools` module, not just `files`: `FileError::Shell`
 /// carries it out intact, so it must be at least as visible as `FileError`.
@@ -27,8 +37,15 @@ const MAX_SHELL_RUN_SECS: u64 = 30;
 pub(in crate::tools) enum ShError {
     #[error("{0}")]
     Spawn(String),
+    // `wrote_stdout`: the child produced real results before failing (a recursive
+    // listing with one unreadable subdir) — the caller may treat that as partial
+    // success rather than a failure.
     #[error("exit status {code}: {out}")]
-    Status { code: i32, out: String },
+    Status {
+        code: i32,
+        out: String,
+        wrote_stdout: bool,
+    },
     // A signal death carries no exit code: its own variant keeps it distinct from a
     // real status so the grep-exit-1 path can never accidentally match it.
     #[error("killed by signal: {out}")]
@@ -36,7 +53,7 @@ pub(in crate::tools) enum ShError {
     // A wall-clock timeout: the child outran the deadline and was killed. Its own
     // variant (not a sentinel status) keeps grep's exit-1 no-match path from ever
     // matching it, and carries the partial output gathered before the deadline.
-    #[error("{out}\n[timed out after {secs}s — narrow the path or pattern]")]
+    #[error("timed out after {secs}s")]
     Timeout { secs: u64, out: String },
 }
 
@@ -44,7 +61,7 @@ pub(in crate::tools) enum ShError {
 /// memory + wall-clock bounds applied. Combined stdout+stderr as `Ok` only on
 /// exit 0 — a failed command must surface as an error, not as a success whose
 /// body happens to contain `ls: cannot access ...`.
-pub(super) async fn sh(prog: &str, args: &[&str]) -> Result<String, ShError> {
+pub(super) async fn sh(prog: &str, args: &[&str]) -> Result<ShOutput, ShError> {
     run_bounded(
         prog,
         args,
@@ -63,15 +80,15 @@ pub(super) async fn sh(prog: &str, args: &[&str]) -> Result<String, ShError> {
 /// permission errors) — and reading stops at `max_bytes`: a huge tree can't
 /// buffer its whole listing into memory. Hitting the cap or the deadline kills
 /// the child (a plain `child.kill()`; these are direct, non-forking children, so
-/// there is no process group to signal) and returns the partial output with a
-/// truncation / timeout marker. A clean finish keeps the contract: `Ok` only on
-/// exit 0.
+/// there is no process group to signal). A capped run is `Ok` with `truncated`;
+/// a timed-out one is `Err(Timeout)` carrying the partial output. A clean finish
+/// keeps the contract: `Ok` only on exit 0.
 async fn run_bounded(
     prog: &str,
     args: &[&str],
     deadline: Duration,
     max_bytes: usize,
-) -> Result<String, ShError> {
+) -> Result<ShOutput, ShError> {
     use tokio::io::AsyncReadExt;
 
     let mut child = tokio::process::Command::new(prog)
@@ -97,6 +114,7 @@ async fn run_bounded(
     let mut err_chunk = [0u8; 8 * 1024];
     let mut stdout_done = false;
     let mut stderr_done = false;
+    let mut wrote_stdout = false;
     let mut capped = false;
     let mut timed_out = false;
     let mut read_err: Option<std::io::Error> = None;
@@ -113,10 +131,13 @@ async fn run_bounded(
             }
             r = stdout.read(&mut out_chunk), if !stdout_done => match r {
                 Ok(0) => stdout_done = true,
-                Ok(n) => if extend_bounded(&mut buf, &out_chunk[..n], max_bytes) {
-                    capped = true;
-                    break;
-                },
+                Ok(n) => {
+                    wrote_stdout = true;
+                    if extend_bounded(&mut buf, &out_chunk[..n], max_bytes) {
+                        capped = true;
+                        break;
+                    }
+                }
                 Err(e) => {
                     read_err = Some(e);
                     break;
@@ -151,11 +172,10 @@ async fn run_bounded(
     }
     if capped {
         let _ = child.kill().await;
-        let mut out = String::from_utf8_lossy(&buf).into_owned();
-        out.push_str(&format!(
-            "\n[output truncated at {max_bytes} bytes — narrow the path or pattern]"
-        ));
-        return Ok(out);
+        return Ok(ShOutput {
+            text: String::from_utf8_lossy(&buf).into_owned(),
+            truncated: true,
+        });
     }
 
     // Both streams hit EOF within budget. Reap the process for its status, still
@@ -174,25 +194,33 @@ async fn run_bounded(
     };
     let out = String::from_utf8_lossy(&buf).into_owned();
     if status.success() {
-        Ok(out)
+        Ok(ShOutput {
+            text: out,
+            truncated: false,
+        })
     } else {
         // No exit code means a signal killed the process — model it as its own
         // variant rather than folding it into a sentinel status.
         Err(match status.code() {
-            Some(code) => ShError::Status { code, out },
+            Some(code) => ShError::Status {
+                code,
+                out,
+                wrote_stdout,
+            },
             None => ShError::Signal { out },
         })
     }
 }
 
 /// Extend `buf` with `chunk`, stopping at `max` bytes total. Returns `true` once
-/// the cap is reached — the caller then stops reading and kills the child, so the
-/// peak buffer tracks `max` rather than the whole (possibly unbounded) stream.
+/// bytes had to be *dropped* — the caller then stops reading and kills the child,
+/// so the peak buffer tracks `max` rather than the whole (possibly unbounded)
+/// stream. Output of exactly `max` bytes fits and is not truncated.
 fn extend_bounded(buf: &mut Vec<u8>, chunk: &[u8], max: usize) -> bool {
     let room = max.saturating_sub(buf.len());
     let take = room.min(chunk.len());
     buf.extend_from_slice(&chunk[..take]);
-    buf.len() >= max
+    take < chunk.len()
 }
 
 #[cfg(test)]
@@ -201,24 +229,26 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn shell_output_is_capped_and_infinite_producer_killed() {
-        // `yes` streams "y\n" forever. A correct runner reads to the cap, kills it,
-        // and returns in milliseconds; a runner that buffered the whole stream would
-        // spin on it — so the outer timeout is the proof of streaming, and the bounded
-        // length proves the peak buffer tracks the cap, not the (unbounded) stream.
-        let result = tokio::time::timeout(Duration::from_secs(10), sh("yes", &[]))
+    async fn shell_output_is_capped_and_producer_killed() {
+        // Emit 3x the cap, then hang (the `exec` makes the hanging process the very
+        // child we spawned, so the runner's kill reaps it — no orphan). A correct
+        // runner reads to the cap, kills, and returns in milliseconds; one that waited
+        // for EOF would sit out the sleep — so the outer timeout proves the kill, and
+        // the bounded length proves the peak buffer tracks the cap. Bounded producer
+        // on purpose: a regression can't spin on an infinite stream.
+        let script = format!(
+            "head -c {} /dev/zero; exec sleep 30",
+            MAX_SHELL_OUTPUT_BYTES * 3
+        );
+        let result = tokio::time::timeout(Duration::from_secs(10), sh("sh", &["-c", &script]))
             .await
             .expect("runner must terminate an infinite producer (streamed cap)")
             .expect("a capped listing is still Ok");
+        assert!(result.truncated, "a capped run must be flagged truncated");
         assert!(
-            result.contains("truncated"),
-            "capped output must carry a truncation marker: {:?}",
-            result.get(result.len().saturating_sub(120)..)
-        );
-        assert!(
-            result.len() <= MAX_SHELL_OUTPUT_BYTES + 200,
+            result.text.len() <= MAX_SHELL_OUTPUT_BYTES,
             "peak buffer must track the cap, got {} bytes",
-            result.len()
+            result.text.len()
         );
     }
 
@@ -246,5 +276,42 @@ mod tests {
             elapsed < Duration::from_secs(5),
             "the deadline must fire promptly, not wait out the child: {elapsed:?}"
         );
+        assert_eq!(
+            err.to_string(),
+            "timed out after 0s",
+            "Display is the bare fact — advice belongs to the adapter"
+        );
+    }
+
+    /// F12: output of exactly the cap fits — it must not be labelled truncated.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn output_of_exactly_the_cap_is_not_truncated() {
+        let out = run_bounded("printf", &["abcd"], Duration::from_secs(5), 4)
+            .await
+            .unwrap();
+        assert_eq!(out.text, "abcd");
+        assert!(!out.truncated, "exactly-cap output lost nothing");
+
+        let out = run_bounded("printf", &["abcde"], Duration::from_secs(5), 4)
+            .await
+            .unwrap();
+        assert_eq!(out.text, "abcd");
+        assert!(out.truncated, "one byte over the cap is truncated");
+    }
+
+    #[test]
+    fn extend_bounded_reports_only_dropped_bytes() {
+        let mut buf = Vec::new();
+        assert!(!extend_bounded(&mut buf, b"ab", 4));
+        assert!(
+            !extend_bounded(&mut buf, b"cd", 4),
+            "exactly full, nothing dropped"
+        );
+        assert!(
+            extend_bounded(&mut buf, b"e", 4),
+            "a byte past the cap is dropped"
+        );
+        assert_eq!(buf, b"abcd");
     }
 }

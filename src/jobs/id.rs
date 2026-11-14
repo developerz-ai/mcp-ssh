@@ -66,7 +66,7 @@ impl JobId {
 /// unchanged; any other run (spaces, `/`, `.`, `:`) collapses to one `-` so it
 /// can't break the filename or escape the job dir. Trimmed and capped at
 /// `MAX_TITLE_LEN`; `None` when nothing usable survives (caller falls back to `job`).
-fn normalize_title(raw: &str) -> Option<String> {
+pub(super) fn normalize_title(raw: &str) -> Option<String> {
     let mut out = String::new();
     for c in raw.chars() {
         if c.is_ascii_alphanumeric() || c == '-' || c == '_' {

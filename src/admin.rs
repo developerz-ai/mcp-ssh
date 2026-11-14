@@ -8,10 +8,11 @@
 use crate::db::{Db, now_unix};
 use crate::jobs::{JobId, JobRepo, JobRow, JobStatus, KillOutcome, kill_persisted};
 
-/// Open the database the running server uses. Idempotent — applies the same schema
-/// and pragmas, safe to run alongside the daemon (SQLite WAL allows it).
+/// Open the database the running server uses — only if it exists and carries this
+/// binary's schema: no file is created and nothing is migrated, so a typo'd
+/// `MCP_SSH_DB` or a `sudo` run before the server's first start changes nothing.
 fn open_db() -> anyhow::Result<Db> {
-    Db::open(&crate::config::db_path()?)
+    Ok(Db::open_existing(&crate::config::db_path()?)?)
 }
 
 /// The `jobs` table, through the same typed repository the server uses — these
@@ -48,42 +49,82 @@ fn render_jobs(rows: &[JobRow]) -> String {
         };
         out.push_str(&format!(
             "{:<id_w$}  {:<8}  {:>4}  {:<19}  {}\n",
-            r.id,
-            r.status,
+            printable(&r.id),
+            printable(&r.status),
             code,
             fmt_time(r.started_unix),
-            note,
+            printable(note),
         ));
     }
     out
 }
 
+/// A DB string made safe for the operator's terminal (often a root one): control
+/// characters — escape sequences, a newline that would forge a row — become `?`.
+/// New rows hold a normalized title already; rows written before that did not.
+fn printable(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
 // ---- job kill ----
 
-/// `mcp-ssh job kill <id>` — signal a running job's process group dead.
+/// A `mcp-ssh job kill` that did not kill anything. Returned as the command's
+/// error so the process exits non-zero; its message is the operator sentence.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct KillNotDone(String);
+
+/// `mcp-ssh job kill <id>` — signal a job's process group dead. Exits zero only
+/// when something was killed (the running job, or what a finished one left
+/// running); every other outcome is a [`KillNotDone`] error.
 pub async fn kill(id: &str) -> anyhow::Result<()> {
-    println!("{}", kill_job(&open_repo()?, id).await?);
+    let (done, message) = kill_job(&open_repo()?, id).await?;
+    if !done {
+        return Err(KillNotDone(message).into());
+    }
+    println!("{message}");
     Ok(())
 }
 
-/// The CLI is pure rendering: the kill itself — running-check, the pgid gate, the
-/// `failed` transition — is [`kill_persisted`], the same code path the server takes
-/// for a job it doesn't track, so both agree on what a kill means.
-async fn kill_job(repo: &JobRepo, id: &str) -> anyhow::Result<String> {
+/// The CLI is pure rendering: the kill itself is [`kill_persisted`], the same code
+/// path the server takes for a job it doesn't track, so both agree on what a kill
+/// means. Returns whether something was killed, and the sentence saying what.
+async fn kill_job(repo: &JobRepo, id: &str) -> anyhow::Result<(bool, String)> {
     let outcome = kill_persisted(repo, &JobId::from(id), "killed via mcp-ssh kill").await?;
+    let id = printable(id);
     Ok(match outcome {
-        KillOutcome::Unknown => format!("no such job: {id}"),
-        KillOutcome::NotRunning { status } => format!("job {id} is not running (status: {status})"),
-        KillOutcome::NoProcessGroup => format!(
-            "job {id} has no recorded process group (started before pgid tracking) — cannot kill from the CLI"
+        KillOutcome::Killed => (true, format!("killed {id}")),
+        KillOutcome::KilledLeftovers => (
+            true,
+            format!("job {id} had already finished; killed the processes it left running"),
         ),
-        KillOutcome::CorruptProcessGroup { pgid } => {
-            format!("job {id} has a corrupt pgid ({pgid}) — refusing to signal")
-        }
-        KillOutcome::Killed => format!("killed {id}"),
-        KillOutcome::Survived { pgid } => format!(
-            "job {id} (pgid {}) outlived TERM then KILL — left running",
-            pgid.get()
+        KillOutcome::Unknown => (false, format!("no such job: {id}")),
+        KillOutcome::NotRunning { status } => (
+            false,
+            format!("job {id} is not running (status: {})", printable(&status)),
+        ),
+        KillOutcome::NoProcessGroup => (
+            false,
+            format!(
+                "job {id} has no recorded process group (started before pgid tracking) — cannot kill from the CLI"
+            ),
+        ),
+        KillOutcome::CorruptProcessGroup { pgid } => (
+            false,
+            format!("job {id} has a corrupt pgid ({pgid}) — refusing to signal"),
+        ),
+        KillOutcome::Survived { pgid } => (
+            false,
+            format!(
+                "job {id} (pgid {}) outlived TERM then KILL — left running",
+                pgid.get()
+            ),
+        ),
+        KillOutcome::NotSignalled { error } => (
+            false,
+            format!("could not signal job {id}: {error} — it may still be running"),
         ),
     })
 }
@@ -100,19 +141,24 @@ struct TokenStats {
 
 /// `mcp-ssh sessions` — summarise the durable OAuth login state (access + refresh
 /// tokens). Never prints token material, only counts and expiries.
-pub async fn sessions() -> anyhow::Result<()> {
-    let db = open_db()?;
+///
+/// `--revoke` ends every login instead (all access + refresh tokens), printing only
+/// the count. Both open the database with `Db::open_existing` (no create, no
+/// migration), so running this before the server's first start creates nothing.
+pub async fn sessions(revoke: bool) -> anyhow::Result<()> {
+    let path = crate::config::db_path()?;
+    let db = Db::open_existing(&path)?;
+    if revoke {
+        let revoked = crate::oauth::revoke_all(&db).await?;
+        println!("revoked {revoked} tokens: every client must log in again");
+        return Ok(());
+    }
     let now = now_unix();
     let access = token_stats(&db, "access_tokens", now).await?;
     let refresh = token_stats(&db, "refresh_tokens", now).await?;
     print!(
         "{}",
-        render_sessions(
-            &crate::config::db_path()?.display().to_string(),
-            &access,
-            &refresh,
-            now
-        )
+        render_sessions(&path.display().to_string(), &access, &refresh, now)
     );
     Ok(())
 }
@@ -260,7 +306,7 @@ mod tests {
         let (repo, db) = repo();
         assert_eq!(
             kill_job(&repo, "ghost").await.unwrap(),
-            "no such job: ghost"
+            (false, "no such job: ghost".to_string())
         );
 
         db.call(|conn| {
@@ -273,7 +319,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             kill_job(&repo, "done").await.unwrap(),
-            "job done is not running (status: exited)"
+            (
+                false,
+                "job done is not running (status: exited)".to_string()
+            )
         );
     }
 
@@ -289,7 +338,8 @@ mod tests {
         })
         .await
         .unwrap();
-        let msg = kill_job(&repo, "legacy").await.unwrap();
+        let (done, msg) = kill_job(&repo, "legacy").await.unwrap();
+        assert!(!done);
         assert!(
             msg.contains("no recorded process group"),
             "must refuse to guess a pgid: {msg}"
@@ -313,16 +363,7 @@ mod tests {
     async fn gone_within(pid: u32, deadline: std::time::Duration) -> bool {
         let start = tokio::time::Instant::now();
         loop {
-            let alive = tokio::process::Command::new("kill")
-                .args(["-0", "--"])
-                .arg(pid.to_string())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .await
-                .map(|s| s.success())
-                .unwrap_or(false);
-            if !alive {
+            if !crate::jobs::pid_alive(pid) {
                 return true;
             }
             if start.elapsed() >= deadline {
@@ -370,7 +411,11 @@ mod tests {
         .unwrap();
 
         let msg = kill_job(&repo, "real").await.unwrap();
-        assert_eq!(msg, "killed real", "the whole group must be gone");
+        assert_eq!(
+            msg,
+            (true, "killed real".to_string()),
+            "the whole group must be gone"
+        );
         let exit = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
             .await
             .expect("group leader should exit after kill_job")
@@ -429,9 +474,9 @@ mod tests {
             .await
             .unwrap();
 
-            let msg = kill_job(&repo, id).await.unwrap();
+            let (done, msg) = kill_job(&repo, id).await.unwrap();
             assert!(
-                msg.contains("corrupt pgid"),
+                !done && msg.contains("corrupt pgid"),
                 "must refuse to signal pgid {pgid}: {msg}"
             );
             let lookup = id.to_string();
@@ -454,15 +499,19 @@ mod tests {
         let (active_exp, expired_exp) = (now + 3_600, now - 1);
         db.call(move |conn| {
             conn.execute(
-                "INSERT INTO access_tokens (token, expires_unix) VALUES ('AAA', ?1)",
+                "INSERT INTO access_tokens (token_hash, client_id, family_id, expires_unix) \
+                 VALUES ('AAA', 'c', 'f', ?1)",
                 [active_exp],
             )?;
             conn.execute(
-                "INSERT INTO access_tokens (token, expires_unix) VALUES ('BBB', ?1)",
+                "INSERT INTO access_tokens (token_hash, client_id, family_id, expires_unix) \
+                 VALUES ('BBB', 'c', 'f', ?1)",
                 [expired_exp],
             )?;
             conn.execute(
-                "INSERT INTO refresh_tokens (token, expires_unix) VALUES ('CCC', ?1)",
+                "INSERT INTO refresh_tokens \
+                 (token_hash, client_id, family_id, expires_unix, family_expires_unix) \
+                 VALUES ('CCC', 'c', 'f', ?1, ?1)",
                 [active_exp],
             )
         })
