@@ -146,9 +146,10 @@ jobs:
           path: digests/*
           if-no-files-found: error
 
+  # Built and smoke-tested on every run (PRs too) so a broken package is caught
+  # before a tag; only `release` publishes it.
   deb:
-    needs: [fmt, check, audit, shellcheck, version]
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [fmt, check, audit, shellcheck]
     strategy:
       matrix:
         include:
@@ -189,7 +190,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: [deb, image]
+    needs: [version, deb, image]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -210,7 +211,7 @@ jobs:
             dist/SHA256SUMS
 
   image-publish:
-    needs: [deb, image]
+    needs: [version, deb, image]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 10
