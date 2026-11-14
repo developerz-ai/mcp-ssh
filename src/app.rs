@@ -25,7 +25,7 @@ pub fn build(
     shutdown: CancellationToken,
 ) -> Router {
     let mut http = StreamableHttpServerConfig::default();
-    http.stateful_mode = true;
+    http.legacy_session_mode = true;
     http.allowed_hosts = allowed_hosts.clone();
     http.cancellation_token = shutdown;
 

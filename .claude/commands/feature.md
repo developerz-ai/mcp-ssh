@@ -59,7 +59,7 @@ Whole-crate green is the coordinator's, once, **in the background**, after every
 
 ## The flow
 
-1. **Understand.** Goal in one line. Cited URLs → `WebFetch`, extract the *mechanism*, translate onto this stack: tokio + axum 0.8, rmcp 2.2 Streamable HTTP at `/mcp`, SQLite durable state (`src/db.rs`), OAuth 2.1 with a consent-page login (`src/oauth/`, `src/auth.rs`), the job engine. Runs locally as the service user, one box.
+1. **Understand.** Goal in one line. Cited URLs → `WebFetch`, extract the *mechanism*, translate onto this stack: tokio + axum 0.8, rmcp 3.9 Streamable HTTP at `/mcp`, SQLite durable state (`src/db.rs`), OAuth 2.1 with a consent-page login (`src/oauth/`, `src/auth.rs`), the job engine. Runs locally as the service user, one box.
 
 2. **Distrust the paperwork.** Check `docs/architecture.md`, `docs/plans/**/status.yml`, the module map against the code *before* planning off it. Past example: `CLAUDE.md`, `/planx` and `/implement` all said integration tests lived in `tests/` while `tests/` was empty; and the 2026-07 plan tracker read `not_started` long after every slice had merged. Brief an agent off a stale line and it writes a file nothing runs. `git log` the area first. State which claims you falsified.
 

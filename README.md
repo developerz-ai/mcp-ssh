@@ -141,7 +141,7 @@ Treat it accordingly:
 
 ## 🧬 Stack
 
-Rust 2024 · tokio · axum 0.8 · [rmcp](https://github.com/modelcontextprotocol/rust-sdk) 2.2 (MCP Streamable HTTP) · [rusqlite](https://github.com/rusqlite/rusqlite) (bundled SQLite — durable state, no system libsqlite).
+Rust 2024 · tokio · axum 0.8 · [rmcp](https://github.com/modelcontextprotocol/rust-sdk) 3.9 (MCP Streamable HTTP) · [rusqlite](https://github.com/rusqlite/rusqlite) (bundled SQLite — durable state, no system libsqlite).
 
 ## 📄 License
 
