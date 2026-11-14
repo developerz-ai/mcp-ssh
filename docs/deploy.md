@@ -74,7 +74,7 @@ Discovery 404s behind your proxy ⇒ it isn't forwarding `/.well-known/*`, `/aut
 
 The packaged unit ([`deploy/mcp-ssh.service`](../deploy/mcp-ssh.service)) runs `mcp-ssh serve` as the dedicated `mcp-ssh` user. Notable settings:
 
-- `StateDirectory=mcp-ssh` + `StateDirectoryMode=0700` + `UMask=0077` — the DB and job logs under `/var/lib/mcp-ssh` are private to the service user.
+- `StateDirectory=mcp-ssh` + `StateDirectoryMode=0700` — `/var/lib/mcp-ssh` is private to the service user, and the server creates the DB and job logs `0600` itself. There is deliberately no `UMask=`: agent commands (and their `sudo` children) inherit the service's umask, so a restrictive one would make files the agent writes elsewhere owner-only.
 - `KillMode=control-group` — stopping or restarting the service kills **every** process it started, background jobs included. Jobs do not outlive a restart.
 - `TimeoutStopSec=20` — the server drains in-flight requests for up to 10 s on SIGTERM, then exits; systemd SIGKILLs at 20 s.
 - `NoNewPrivileges=false`, no `ProtectSystem` — so the agent can self-manage via `sudo` (below).
@@ -273,7 +273,8 @@ Once `https://your-host/mcp` is live:
 
 - **GUI MCP clients** (Claude desktop/web) — add the URL; the client discovers
   `/.well-known/oauth-authorization-server`, drives the **OAuth 2.1** flow in a browser, and
-  logs in with your `set-auth` credentials. `/mcp` is **bearer-only**; there is no HTTP Basic
+  you log in with your `set-auth` credentials on mcp-ssh's consent page (it shows where the
+  code will be sent; a code is issued only when that form is submitted). `/mcp` is **bearer-only**; there is no HTTP Basic
   fallback on this endpoint.
 
 - **Headless / CLI clients** (the `claude` CLI, curl, scripts) have no browser to run the
@@ -293,5 +294,9 @@ Once `https://your-host/mcp` is live:
   for silent renewal. Tokens are persisted in
   SQLite, so they **survive a service restart** — no need to re-run `bin/mcp-token`
   after every restart. For a stable long-lived setup, prefer a GUI client's OAuth flow.
+
+- **Logging everyone out** — `sudo mcp-ssh sessions` summarises live logins (counts and
+  expiries, never token values); `sudo mcp-ssh sessions --revoke` ends every one of them.
+  Every `set-auth` run revokes every session too (restart the service to apply the new credentials).
 
 Tool reference → [usage.md](usage.md).

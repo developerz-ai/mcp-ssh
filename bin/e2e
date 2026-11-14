@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # End-to-end suite: boots the real `mcp-ssh serve` binary on an ephemeral port
-# with tempdir state and drives it over HTTP (tests/e2e.rs). bin/check runs it
+# with tempdir state and drives it over HTTP (tests/e2e/). bin/check runs it
 # too; this is the focused entry point.
 set -euo pipefail
 cd "$(dirname "$0")/.."

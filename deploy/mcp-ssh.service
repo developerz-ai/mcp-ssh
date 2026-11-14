@@ -8,10 +8,13 @@ User=mcp-ssh
 Group=mcp-ssh
 ExecStart=/usr/bin/mcp-ssh serve
 # Writes the DB + job dir under `/var/lib/mcp-ssh`. StateDirectory creates it
-# owned by the service user; 0700 + UMask keep tokens and job output private.
+# owned by the service user; 0700 keeps tokens and job output private.
 StateDirectory=mcp-ssh
 StateDirectoryMode=0700
-UMask=0077
+# No UMask= on purpose: it is inherited by every agent command, `sudo` children
+# included, so files the agent creates in /etc or elsewhere would come out
+# owner-only and break other services. The server sets its own modes
+# explicitly instead (DB/WAL and job logs 0600, its dirs 0700).
 # Optional env overrides. Config credentials live at `/etc/mcp-ssh/config.toml`
 # (written by `mcp-ssh set-auth`); this file is for ephemeral knobs.
 # GlitchTip error tracking (SENTRY_DSN / SENTRY_ENVIRONMENT) is injected via

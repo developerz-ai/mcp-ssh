@@ -13,7 +13,7 @@ Full guide: [`docs/deploy.md`](../docs/deploy.md). This directory holds the file
 ## The `.deb` package
 
 Built with `cargo deb --locked` from the `[package.metadata.deb]` section of
-`Cargo.toml`. CI builds amd64 and arm64 on every `v*` tag. Installing it:
+`Cargo.toml`. CI builds and smoke-tests amd64 and arm64 on every run and publishes them on `v*` tags. Installing it:
 
 - places the binary at `/usr/bin/mcp-ssh`
 - installs the systemd unit at `/lib/systemd/system/mcp-ssh.service`

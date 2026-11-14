@@ -38,9 +38,9 @@ ENV MCP_SSH_BIND=0.0.0.0:1337
 VOLUME /var/lib/mcp-ssh
 EXPOSE 1337
 # No curl in the image: speak just enough HTTP over bash's /dev/tcp. /healthz is
-# unauthenticated and skips the Host allowlist.
+# unauthenticated and skips the Host allowlist. Follows MCP_SSH_PORT if set.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-    CMD ["bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/1337 && printf 'GET /healthz HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q '^HTTP/1\\.[01] 200' <&3"]
+    CMD ["bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/${MCP_SSH_PORT:-1337} && printf 'GET /healthz HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q '^HTTP/1\\.[01] 200' <&3"]
 # tini as PID 1 reaps orphaned job processes. Without it they stay zombies
 # (mcp-ssh doesn't reap what it didn't spawn), a zombie still answers a
 # process-group probe, and `job kill` reports a dead group as still running.

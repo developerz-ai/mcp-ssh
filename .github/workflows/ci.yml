@@ -39,7 +39,7 @@ jobs:
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo clippy --locked --all-targets -- -D warnings
-      # Includes tests/e2e.rs: boots the real binary and drives it over HTTP.
+      # Includes tests/e2e/: boots the real binary and drives it over HTTP.
       - run: cargo test --locked
 
   audit:
@@ -125,12 +125,19 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # OCI labels (source, version, revision) ride on each per-arch image.
+      - if: startsWith(github.ref, 'refs/tags/v')
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
       - if: startsWith(github.ref, 'refs/tags/v')
         id: push
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           platforms: linux/${{ matrix.arch }}
+          labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=${{ matrix.arch }}
       - if: startsWith(github.ref, 'refs/tags/v')
@@ -236,6 +243,9 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         id: meta
+        env:
+          # The multi-arch index gets the OCI annotations (labels live per image).
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: index
         with:
           images: ${{ env.IMAGE }}
           tags: |
@@ -246,8 +256,10 @@ jobs:
         working-directory: digests
         env:
           TAGS: ${{ steps.meta.outputs.tags }}
+          ANNOTATIONS: ${{ steps.meta.outputs.annotations }}
         run: |
           args=()
           while IFS= read -r tag; do [ -n "$tag" ] && args+=(-t "$tag"); done <<<"$TAGS"
+          while IFS= read -r a; do [ -n "$a" ] && args+=(--annotation "$a"); done <<<"$ANNOTATIONS"
           for digest in *; do args+=("$IMAGE@sha256:$digest"); done
           docker buildx imagetools create "${args[@]}"
