@@ -15,7 +15,11 @@ use axum::{
 };
 
 use crate::config::Password;
-use crate::oauth::{AuthState, base_url};
+use crate::oauth::{AuthState, base_url, hash_token};
+
+mod revalidate;
+
+pub use revalidate::STREAM_REVALIDATE;
 
 #[derive(Debug, Clone)]
 pub struct Credentials {
@@ -53,12 +57,22 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
 
 /// Middleware guarding `/mcp`. Only a valid OAuth bearer token lets a request
 /// through. A token store that can't answer is a 503 (retry), not a 401 — a 401
-/// would send every client back through the login flow during a DB blip.
+/// would send every client back through the login flow during a DB blip. A
+/// streaming response keeps checking its token for as long as it stays open.
 pub async fn require_auth(State(st): State<AuthState>, req: Request, next: Next) -> Response {
     let headers = req.headers();
     if let Some(token) = bearer(headers) {
-        match st.store.validate(token).await {
-            Ok(true) => return next.run(req).await,
+        let token_hash = hash_token(token);
+        match st.store.validate_hash(&token_hash).await {
+            Ok(true) => {
+                let response = next.run(req).await;
+                return revalidate::end_when_revoked(
+                    response,
+                    st.store,
+                    token_hash,
+                    st.revalidate_every,
+                );
+            }
             Ok(false) => {}
             Err(_) => return unavailable(),
         }

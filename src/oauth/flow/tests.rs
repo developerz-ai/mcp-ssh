@@ -23,6 +23,7 @@ fn app() -> Router {
         },
         store: Arc::new(Store::new(crate::db::Db::memory())),
         public_url: None,
+        revalidate_every: crate::auth::STREAM_REVALIDATE,
     })
 }
 
@@ -349,6 +350,7 @@ async fn a_store_outage_is_a_503_not_an_invalid_grant() {
         },
         store: Arc::new(Store::new(db.clone())),
         public_url: None,
+        revalidate_every: crate::auth::STREAM_REVALIDATE,
     };
     let app = router(state);
     db.call(|c| c.execute_batch("DROP TABLE refresh_tokens"))

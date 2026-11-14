@@ -1,6 +1,7 @@
 //! Ending a job this writer may not own — a kill from the engine or the CLI, or
 //! the startup reconcile — by recording `failed` only while the row still reads
-//! `running`.
+//! `running`. Plus the supervisor's one late write: a finished job whose leftovers
+//! it had to kill.
 use rusqlite::OptionalExtension;
 
 use super::{JobRepo, KillTarget};
@@ -37,13 +38,14 @@ impl JobRepo {
         self.db
             .call(move |conn| {
                 conn.query_row(
-                    "SELECT status, pgid, boot_id FROM jobs WHERE id = ?1",
+                    "SELECT status, pgid, boot_id, interactive FROM jobs WHERE id = ?1",
                     [row_id],
                     |r| {
                         Ok(KillTarget {
                             status: r.get(0)?,
                             pgid: r.get(1)?,
                             boot_id: r.get(2)?,
+                            interactive: r.get(3)?,
                         })
                     },
                 )
@@ -61,6 +63,32 @@ impl JobRepo {
         reason: &'static str,
     ) -> rusqlite::Result<()> {
         self.fail_running(vec![id.clone()], reason).await
+    }
+
+    /// Re-record a job that had already finished as `failed`: the supervisor
+    /// killed what it left running. `reason` is a fixed message, as above. A row
+    /// still `running` is not this write's to end.
+    pub(in crate::jobs) async fn mark_leftovers_killed(
+        &self,
+        id: &JobId,
+        reason: &'static str,
+    ) -> rusqlite::Result<()> {
+        let row_id = id.as_ref().to_string();
+        self.db
+            .call(move |conn| {
+                conn.execute(
+                    "UPDATE jobs SET status = ?1, code = NULL, error = ?2 \
+                     WHERE id = ?3 AND status != ?4",
+                    rusqlite::params![
+                        JobStatus::Failed.as_str(),
+                        reason,
+                        row_id,
+                        JobStatus::Running.as_str()
+                    ],
+                )
+            })
+            .await?;
+        Ok(())
     }
 
     /// Flip rows left `running` by a previous process — their groups are gone — to

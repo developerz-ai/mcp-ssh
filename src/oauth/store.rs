@@ -200,10 +200,18 @@ impl Store {
         }
     }
 
-    /// True if the bearer token is known and unexpired. An expired token is evicted
-    /// on the way out so the table doesn't accumulate dead rows.
-    pub async fn validate(&self, token: &str) -> Result<bool, StoreUnavailable> {
-        let hash = hash_token(token);
+    /// [`Store::validate_hash`] for a bearer in hand — test convenience.
+    #[cfg(test)]
+    pub(crate) async fn validate(&self, token: &str) -> Result<bool, StoreUnavailable> {
+        self.validate_hash(&hash_token(token)).await
+    }
+
+    /// True if the bearer token with this hash is known and unexpired. An expired
+    /// token is evicted on the way out so the table doesn't accumulate dead rows.
+    /// Takes the hash so a caller that keeps checking (an open stream) never has
+    /// to hold the bearer itself.
+    pub async fn validate_hash(&self, token_hash: &str) -> Result<bool, StoreUnavailable> {
+        let hash = token_hash.to_owned(); // moves into the blocking DB call
         let now = now_unix();
         self.db
             .call(move |conn| {

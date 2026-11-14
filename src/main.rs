@@ -130,6 +130,7 @@ async fn serve(port: Option<u16>) -> anyhow::Result<()> {
         },
         store: Arc::new(oauth::Store::new(database)),
         public_url: cfg.public_url.clone(),
+        revalidate_every: auth::STREAM_REVALIDATE,
     };
 
     let shutdown = CancellationToken::new();

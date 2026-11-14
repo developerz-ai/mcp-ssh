@@ -4,7 +4,7 @@ use std::{
     collections::HashSet,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::{Arc, OnceLock},
+    sync::Arc,
     time::Duration,
 };
 
@@ -105,7 +105,7 @@ impl JobStore {
             pgid: child.id().and_then(ProcessGroupId::new),
             interactive,
             state: state.clone(),
-            kill_reason: OnceLock::new(),
+            kill_reason: Mutex::new(None),
         });
 
         // The supervisor owns the child from here, with no `.await` between the

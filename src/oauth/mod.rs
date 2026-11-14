@@ -3,6 +3,7 @@
 //! the authorization-code + PKCE flow behind a consent form. The MCP server itself
 //! is the resource server (see `crate::auth` for bearer validation on `/mcp`).
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     Router,
@@ -20,6 +21,7 @@ mod secret;
 mod store;
 
 pub use metadata::base_url;
+pub use secret::hash_token;
 pub use store::{
     Store, revoke_all, sweep_expired_access, sweep_expired_refresh, sweep_stale_clients,
 };
@@ -34,6 +36,9 @@ pub struct AuthState {
     pub creds: Credentials,
     pub store: Arc<Store>,
     pub public_url: Option<String>,
+    /// How often an open `/mcp` stream re-checks its token
+    /// (`auth::STREAM_REVALIDATE`; shortened in tests).
+    pub revalidate_every: Duration,
 }
 
 /// Public OAuth + discovery routes (no auth middleware — they bootstrap auth).

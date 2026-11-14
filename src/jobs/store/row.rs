@@ -22,12 +22,14 @@ pub(in crate::jobs) struct UntrackedJob {
 
 /// What a kill decides on: the row's status word (rendered back to the operator by
 /// the CLI, so kept verbatim), its persisted process group (unvalidated —
-/// `super::signal` gates it), and the boot it was recorded under.
+/// `super::signal` gates it), the boot it was recorded under, and whether it was
+/// launched through the interactive bash (which decides the escalation).
 #[derive(Debug)]
 pub(in crate::jobs) struct KillTarget {
     pub(in crate::jobs) status: String,
     pub(in crate::jobs) pgid: Option<i64>,
     pub(in crate::jobs) boot_id: Option<String>,
+    pub(in crate::jobs) interactive: bool,
 }
 
 /// One row the reaper weighs for log compaction or eviction.

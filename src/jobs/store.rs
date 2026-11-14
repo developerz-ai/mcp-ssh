@@ -59,6 +59,7 @@ impl JobRepo {
     /// (never command text); `pgid` + `boot_id` are persisted so `mcp-ssh job kill`
     /// can signal the group after the launching process is gone — and refuse to
     /// once the host has rebooted and the number may name another group.
+    /// `interactive` is persisted so that kill escalates as a live one would.
     pub(super) async fn insert_running(
         &self,
         id: &JobId,
@@ -66,21 +67,24 @@ impl JobRepo {
         started_unix: i64,
         pgid: Option<ProcessGroupId>,
         boot_id: Option<String>,
+        interactive: bool,
     ) -> rusqlite::Result<()> {
         let row_id = id.as_ref().to_string();
         let pgid = pgid.map(|p| i64::from(p.get()));
         self.db
             .call(move |conn| {
                 conn.execute(
-                    "INSERT INTO jobs (id, title, status, started_unix, pgid, boot_id) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    "INSERT INTO jobs \
+                     (id, title, status, started_unix, pgid, boot_id, interactive) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     rusqlite::params![
                         row_id,
                         title,
                         JobStatus::Running.as_str(),
                         started_unix,
                         pgid,
-                        boot_id
+                        boot_id,
+                        interactive
                     ],
                 )
             })

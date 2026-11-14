@@ -87,6 +87,7 @@ mod tests {
             },
             store: Arc::new(Store::new(crate::db::Db::memory())),
             public_url: Some(url.into()),
+            revalidate_every: crate::auth::STREAM_REVALIDATE,
         }
     }
 
@@ -98,6 +99,7 @@ mod tests {
             },
             store: Arc::new(Store::new(crate::db::Db::memory())),
             public_url: None,
+            revalidate_every: crate::auth::STREAM_REVALIDATE,
         }
     }
 

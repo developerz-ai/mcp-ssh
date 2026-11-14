@@ -25,9 +25,8 @@ COPY --from=builder /build/target/release/mcp-ssh /usr/bin/mcp-ssh
 # Never run as root: dedicated service user owning its state dir (config
 # default). A real home + bash login shell so `interactive=true` has a ~/.bashrc.
 RUN useradd --system --create-home --shell /bin/bash mcp-ssh \
-    && mkdir -p /var/lib/mcp-ssh/logs/jobs \
-    && chown -R mcp-ssh:mcp-ssh /var/lib/mcp-ssh \
-    && chmod 700 /var/lib/mcp-ssh
+    && install -d -m 700 /var/lib/mcp-ssh /var/lib/mcp-ssh/logs /var/lib/mcp-ssh/logs/jobs \
+    && chown -R mcp-ssh:mcp-ssh /var/lib/mcp-ssh
 USER mcp-ssh
 # Loopback inside a container is unreachable from `-p`; bind all interfaces.
 # A non-loopback bind makes MCP_SSH_ALLOWED_HOSTS mandatory (startup fails

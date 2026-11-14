@@ -158,6 +158,17 @@ async fn a_legacy_v0_database_migrates_to_the_latest_schema() {
         "the null-id row is dropped, the rest survive"
     );
 
+    // A row from before the `interactive` column reads as not interactive.
+    let interactive: bool = db
+        .call(|c| {
+            c.query_row("SELECT interactive FROM jobs WHERE id = 'old'", [], |r| {
+                r.get(0)
+            })
+        })
+        .await
+        .unwrap();
+    assert!(!interactive);
+
     // Plaintext tokens can't be hashed after the fact: they are dropped.
     let tokens: i64 = db
         .call(|c| c.query_row("SELECT COUNT(*) FROM access_tokens", [], |r| r.get(0)))
