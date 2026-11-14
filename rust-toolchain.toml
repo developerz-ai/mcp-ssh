@@ -1,4 +1,7 @@
 [toolchain]
-channel = "stable"
+# Exact version: a new stable's lints must not break `main` with no code change.
+# Bump together with the Dockerfile's cargo-chef base and Cargo.toml `rust-version`
+# (Dependabot can't bump this file).
+channel = "1.100.0"
 components = ["rustfmt", "clippy"]
 profile = "minimal"

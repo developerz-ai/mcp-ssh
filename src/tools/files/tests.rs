@@ -1,11 +1,30 @@
 use super::*;
 
-/// The text a read/list/grep produced. Ops return a structured outcome now, so a
-/// body assertion stays one line.
+/// The text a read/list/grep produced (a read page's lines joined, no footer).
+/// Ops return a structured outcome, so a body assertion stays one line.
 fn text(outcome: FileOutcome) -> String {
     match outcome {
-        FileOutcome::Output(s) => s,
+        FileOutcome::Read(page) => lines(&page).join("\n"),
+        FileOutcome::Listing(l) => l.text,
         other => panic!("expected output text, got {other:?}"),
+    }
+}
+
+fn page(outcome: FileOutcome) -> ReadPage {
+    match outcome {
+        FileOutcome::Read(page) => page,
+        other => panic!("expected a read page, got {other:?}"),
+    }
+}
+
+fn lines(page: &ReadPage) -> Vec<&str> {
+    page.lines.iter().map(|l| l.text.as_str()).collect()
+}
+
+fn listing(outcome: FileOutcome) -> Listing {
+    match outcome {
+        FileOutcome::Listing(l) => l,
+        other => panic!("expected a listing, got {other:?}"),
     }
 }
 
@@ -16,9 +35,10 @@ async fn write_read_paginate_append_move_delete() {
     let a = a.to_str().unwrap();
 
     write(a, "l1\nl2\nl3").await.unwrap();
-    let page = text(read(a, 0, 2).await.unwrap());
-    assert!(page.contains("l1") && page.contains("l2") && !page.contains("l3"));
-    assert!(page.contains("next_cursor=2"));
+    let first = page(read(a, 0, 2).await.unwrap());
+    assert_eq!(lines(&first), ["l1", "l2"]);
+    assert_eq!(first.next, 2);
+    assert_eq!(first.end, PageEnd::More { at_least: 3 });
 
     append(a, "\nl4").await.unwrap();
     assert!(text(read(a, 0, 100).await.unwrap()).contains("l4"));
@@ -28,7 +48,7 @@ async fn write_read_paginate_append_move_delete() {
     rename(a, b).await.unwrap();
     assert!(read(a, 0, 10).await.is_err());
 
-    delete(b).await.unwrap();
+    delete(b, false).await.unwrap();
     assert!(read(b, 0, 10).await.is_err());
 }
 
@@ -69,7 +89,7 @@ async fn failed_shell_op_keeps_its_typed_exit_status() {
         .await
         .unwrap_err();
     assert!(
-        matches!(err, FileError::Shell(ShError::Status { code, .. }) if code != 0),
+        matches!(err, FileError::Shell { op: "list", source: ShError::Status { code, .. }, .. } if code != 0),
         "a failed listing must carry its exit status: {err:?}"
     );
 }
@@ -77,28 +97,33 @@ async fn failed_shell_op_keeps_its_typed_exit_status() {
 #[tokio::test]
 async fn oversized_no_newline_line_is_capped_not_slurped() {
     // A multi-MiB file with no newline must not be slurped into one buffer: the
-    // per-line cap plus paginate's clamp keep the reply (and memory) bounded.
+    // per-line cap keeps the reply (and memory) bounded, and the dropped tail is
+    // counted exactly (B9) — one marker, the true number.
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path().join("huge.txt");
     let big = vec![b'a'; 2 * 1024 * 1024];
     tokio::fs::write(&p, &big).await.unwrap();
-    let out = text(read(p.to_str().unwrap(), 0, 100).await.unwrap());
-    assert!(
-        out.len() <= 16 * 1024,
-        "oversized no-newline line must be bounded, got {} bytes",
-        out.len()
+    let pg = page(read(p.to_str().unwrap(), 0, 100).await.unwrap());
+    assert_eq!(pg.lines.len(), 1);
+    let line = &pg.lines[0];
+    assert_eq!(
+        line.text.len(),
+        MAX_READ_LINE_BYTES,
+        "head kept up to the cap"
     );
-    assert!(
-        out.starts_with("aaa"),
-        "the head of the line should survive"
+    assert!(line.text.starts_with("aaa"));
+    assert_eq!(
+        line.text.len() + line.dropped,
+        big.len(),
+        "dropped count is exact"
     );
+    assert_eq!(pg.end, PageEnd::Eof { total: 1 });
 }
 
 #[tokio::test]
 async fn first_page_of_large_file_reports_lower_bound_not_a_full_scan() {
     // Reading page 1 must not walk the whole file just to print an exact total: on a
-    // multi-GB log that would defeat the line cursor. Proof by count — the footer
-    // reports the page-sized lower bound (`≥ n`), never the file's true line count.
+    // multi-GB log that would defeat the line cursor.
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path().join("big.txt");
     let mut body = String::new();
@@ -107,22 +132,15 @@ async fn first_page_of_large_file_reports_lower_bound_not_a_full_scan() {
     }
     tokio::fs::write(&p, &body).await.unwrap();
 
-    let out = text(read(p.to_str().unwrap(), 0, 10).await.unwrap());
-    assert!(
-        out.contains("line-00000") && out.contains("line-00009"),
-        "page 1 must hold the first window: {out}"
-    );
-    assert!(
-        !out.contains("line-00010"),
-        "page must stop at the window edge: {out}"
-    );
-    assert!(
-        out.contains("of ≥10") && out.contains("next_cursor=10"),
-        "early stop must report a lower-bound total: {out}"
-    );
-    assert!(
-        !out.contains("of 5000"),
-        "an exact total would mean the scan walked to EOF: {out}"
+    let pg = page(read(p.to_str().unwrap(), 0, 10).await.unwrap());
+    assert_eq!(pg.lines.len(), 10);
+    assert_eq!(pg.lines[0].text, "line-00000");
+    assert_eq!(pg.lines[9].text, "line-00009");
+    assert_eq!((pg.cursor, pg.next), (0, 10));
+    assert_eq!(
+        pg.end,
+        PageEnd::More { at_least: 11 },
+        "early stop reports a lower bound, not the true 5000"
     );
 }
 
@@ -133,25 +151,136 @@ async fn later_pages_advance_and_the_final_page_ends_cleanly() {
     tokio::fs::write(&p, b"a\nb\nc\nd\ne\n").await.unwrap();
     let p = p.to_str().unwrap();
 
-    // A middle page advances the cursor and still reports a lower bound (we stopped
-    // once the two-line window filled, before learning the true total).
-    let mid = text(read(p, 1, 2).await.unwrap());
+    let mid = page(read(p, 1, 2).await.unwrap());
+    assert_eq!(lines(&mid), ["b", "c"]);
+    assert_eq!(mid.next, 3);
+    assert_eq!(mid.end, PageEnd::More { at_least: 4 });
+
+    // The last lines fit in the window: exact end.
+    let last = page(read(p, 3, 10).await.unwrap());
+    assert_eq!(lines(&last), ["d", "e"]);
+    assert_eq!(last.end, PageEnd::Eof { total: 5 });
+
+    // Reading past the end is an empty page that still knows the line count (F11).
+    let past = page(read(p, 99, 10).await.unwrap());
+    assert!(past.lines.is_empty());
+    assert_eq!(past.end, PageEnd::Eof { total: 5 });
+}
+
+/// F11: a file of exactly `limit` lines is one complete page — no next cursor
+/// that would only lead to an empty page.
+#[tokio::test]
+async fn exactly_limit_lines_is_a_complete_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("two.txt");
+    tokio::fs::write(&p, b"x\ny\n").await.unwrap();
+    let pg = page(read(p.to_str().unwrap(), 0, 2).await.unwrap());
+    assert_eq!(lines(&pg), ["x", "y"]);
+    assert_eq!(pg.end, PageEnd::Eof { total: 2 });
+}
+
+#[tokio::test]
+async fn empty_file_is_an_empty_page_with_zero_total() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("empty.txt");
+    tokio::fs::write(&p, b"").await.unwrap();
+    let pg = page(read(p.to_str().unwrap(), 0, 10).await.unwrap());
+    assert!(pg.lines.is_empty());
+    assert_eq!(pg.end, PageEnd::Eof { total: 0 });
+}
+
+/// B4: `limit` is clamped and the page is byte-budgeted — `usize::MAX` can't
+/// make one reply (or the server's memory) proportional to the file.
+#[tokio::test]
+async fn huge_limit_is_clamped_and_byte_budgeted() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("wide.txt");
+    let line = "w".repeat(1000);
+    let body = format!("{line}\n").repeat(5000);
+    tokio::fs::write(&p, &body).await.unwrap();
+    let pg = page(read(p.to_str().unwrap(), 0, usize::MAX).await.unwrap());
+    let bytes: usize = pg.lines.iter().map(|l| l.text.len() + 1).sum();
     assert!(
-        mid.contains('b') && mid.contains('c') && !mid.contains('d'),
-        "middle page holds its window: {mid}"
+        bytes <= 64 * 1024,
+        "page stays within the byte budget: {bytes}"
     );
     assert!(
-        mid.contains("of ≥3") && mid.contains("next_cursor=3"),
-        "middle page advances on a lower-bound total: {mid}"
+        matches!(pg.end, PageEnd::More { .. }),
+        "more remains: {:?}",
+        pg.end
     );
+    assert_eq!(pg.next, pg.lines.len());
 
-    // The last lines fit in the window, so the scan reaches EOF: exact end, no footer.
-    let last = text(read(p, 3, 10).await.unwrap());
-    assert_eq!(last, "d\ne", "final page is exact and carries no cursor");
+    let short = dir.path().join("short.txt");
+    tokio::fs::write(&short, "s\n".repeat(5000)).await.unwrap();
+    let pg = page(read(short.to_str().unwrap(), 0, usize::MAX).await.unwrap());
+    assert_eq!(pg.lines.len(), read::MAX_READ_LINES, "line count clamped");
+}
 
-    // Reading past the end is an empty page, never a bogus cursor.
-    let past = text(read(p, 99, 10).await.unwrap());
-    assert_eq!(past, "", "past-EOF read is empty with no footer");
+/// B4/B5 on a sparse 50 MiB file (one newline-free line of zeros): returns
+/// promptly with one capped line and the true dropped count.
+#[tokio::test]
+async fn sparse_huge_file_reads_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("sparse.bin");
+    let f = std::fs::File::create(&p).unwrap();
+    f.set_len(50 * 1024 * 1024).unwrap();
+    let pg = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        read(p.to_str().unwrap(), 0, usize::MAX),
+    )
+    .await
+    .expect("bounded scan")
+    .unwrap();
+    let pg = page(pg);
+    assert_eq!(pg.lines.len(), 1);
+    assert_eq!(
+        pg.lines[0].text.len() + pg.lines[0].dropped,
+        50 * 1024 * 1024
+    );
+}
+
+/// B5: a device never ends and a FIFO never starts — both are refused typed,
+/// promptly, instead of pinning a core forever.
+#[tokio::test]
+async fn non_regular_files_are_refused_promptly() {
+    let zero = tokio::time::timeout(std::time::Duration::from_secs(5), read("/dev/zero", 0, 10))
+        .await
+        .expect("must not spin on /dev/zero")
+        .unwrap_err();
+    assert!(matches!(zero, FileError::NotRegularFile { .. }), "{zero:?}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("pipe");
+    let made = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap();
+    assert!(made.success());
+    let err = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        read(fifo.to_str().unwrap(), 0, 10),
+    )
+    .await
+    .expect("opening a writer-less FIFO must not block")
+    .unwrap_err();
+    assert!(matches!(err, FileError::NotRegularFile { .. }), "{err:?}");
+}
+
+/// F7: an I/O failure names the op and the path, not just an errno.
+#[tokio::test]
+async fn io_errors_carry_op_and_path() {
+    let err = read("/does/not/exist-mcp-ssh-test", 0, 10)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, FileError::Io { op: "read", path, .. } if path == "/does/not/exist-mcp-ssh-test"),
+        "{err:?}"
+    );
+    assert!(
+        err.to_string()
+            .starts_with("read /does/not/exist-mcp-ssh-test: ")
+    );
 }
 
 #[tokio::test]
@@ -218,7 +347,7 @@ async fn delete_unlinks_symlinks_instead_of_following() {
         .unwrap();
     let link = dir.path().join("link");
     tokio::fs::symlink(&target, &link).await.unwrap();
-    delete(link.to_str().unwrap()).await.unwrap();
+    delete(link.to_str().unwrap(), false).await.unwrap();
     assert!(!link.exists(), "the link itself must be gone");
     assert!(
         target.join("keep.txt").exists(),
@@ -230,10 +359,37 @@ async fn delete_unlinks_symlinks_instead_of_following() {
     tokio::fs::symlink(dir.path().join("nope"), &dangling)
         .await
         .unwrap();
-    delete(dangling.to_str().unwrap()).await.unwrap();
+    delete(dangling.to_str().unwrap(), false).await.unwrap();
     assert!(
         tokio::fs::symlink_metadata(&dangling).await.is_err(),
         "dangling link must be removed"
+    );
+}
+
+/// F1: `link/` (trailing slash) resolves *through* the link under POSIX rules, so
+/// classifying it with lstat-on-the-raw-path recursed into the target and emptied
+/// it. The link must be unlinked and the target left whole.
+#[cfg(unix)]
+#[tokio::test]
+async fn delete_symlink_with_trailing_slash_keeps_the_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("target");
+    tokio::fs::create_dir(&target).await.unwrap();
+    tokio::fs::write(target.join("keep.txt"), "keep")
+        .await
+        .unwrap();
+    let link = dir.path().join("link");
+    tokio::fs::symlink(&target, &link).await.unwrap();
+
+    let with_slash = format!("{}/", link.to_str().unwrap());
+    let _ = delete(&with_slash, true).await;
+    assert!(
+        target.join("keep.txt").exists(),
+        "the symlink target's contents must survive"
+    );
+    assert!(
+        tokio::fs::symlink_metadata(&link).await.is_err(),
+        "the link itself is what gets removed"
     );
 }
 
@@ -287,11 +443,12 @@ async fn list_recursive_is_depth_bounded() {
     let shallow = dir.path().join("shallow.txt");
     write(shallow.to_str().unwrap(), "y").await.unwrap();
 
-    let out = text(list(dir.path().to_str().unwrap(), true).await.unwrap());
+    let l = listing(list(dir.path().to_str().unwrap(), true).await.unwrap());
     assert!(
-        !out.contains("truncated"),
-        "exclusion must be the depth bound, not the byte cap: {out}"
+        !l.truncated,
+        "exclusion must be the depth bound, not the byte cap"
     );
+    let out = l.text;
     assert!(
         out.contains("shallow.txt"),
         "within-bound file must be listed: {out}"
@@ -310,11 +467,28 @@ async fn delete_directory_removes_entire_tree() {
     let f = sub.join("file.txt");
     write(f.to_str().unwrap(), "content").await.unwrap();
 
-    delete(sub.to_str().unwrap()).await.unwrap();
+    // F2: without the opt-in, a populated tree is refused and left whole.
+    let err = delete(sub.to_str().unwrap(), false).await.unwrap_err();
+    assert!(
+        matches!(err, FileError::DirectoryNotEmpty { .. }),
+        "{err:?}"
+    );
+    assert!(f.exists(), "a refused delete removes nothing");
+
+    delete(sub.to_str().unwrap(), true).await.unwrap();
     assert!(
         !sub.exists(),
         "directory and its contents should be removed"
     );
+}
+
+#[tokio::test]
+async fn delete_empty_directory_needs_no_opt_in() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("empty");
+    tokio::fs::create_dir(&sub).await.unwrap();
+    delete(sub.to_str().unwrap(), false).await.unwrap();
+    assert!(!sub.exists());
 }
 
 #[tokio::test]
@@ -398,78 +572,159 @@ async fn move_onto_a_free_path_succeeds() {
     );
 }
 
-#[test]
-fn append_capped_marks_an_over_long_line_exactly_once() {
-    // Overflow the per-line cap, then feed more: the line seals with a single marker
-    // and the later bytes are dropped, never appended after it.
-    let mut line = Vec::new();
-    append_capped(&mut line, &vec![b'a'; MAX_READ_LINE_BYTES + 5_000]);
-    append_capped(&mut line, b"tail");
+/// F3: moving onto an existing directory is refused typed (the adapter then
+/// suggests the full path), and both sides are untouched.
+#[tokio::test]
+async fn move_onto_a_directory_is_refused_typed() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("app.tar");
+    let releases = dir.path().join("releases");
+    tokio::fs::create_dir(&releases).await.unwrap();
+    tokio::fs::write(releases.join("v1"), "v1").await.unwrap();
+    write(src.to_str().unwrap(), "new").await.unwrap();
 
-    let s = String::from_utf8(line).expect("ASCII head + a valid-UTF-8 marker");
-    assert!(s.starts_with("aaa"), "the line's head survives");
+    let err = rename(src.to_str().unwrap(), releases.to_str().unwrap())
+        .await
+        .unwrap_err();
     assert!(
-        s.ends_with(LINE_TRUNCATED),
-        "an over-long line carries the truncation marker: …{}",
-        &s[s.len().saturating_sub(24)..]
+        matches!(err, FileError::DestinationIsDirectory { .. }),
+        "{err:?}"
     );
-    assert_eq!(
-        s.matches(LINE_TRUNCATED).count(),
-        1,
-        "the marker is stamped exactly once"
+    assert!(src.exists() && releases.join("v1").exists());
+}
+
+/// F4: a move that can't succeed creates nothing — the missing source is named
+/// and the destination's parents are not left behind.
+#[tokio::test]
+async fn failed_move_leaves_no_stray_directories() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing.txt");
+    let dest = dir.path().join("q/r/out.txt");
+    let err = rename(missing.to_str().unwrap(), dest.to_str().unwrap())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, FileError::SourceMissing { src } if src == missing.to_str().unwrap()),
+        "{err:?}"
     );
     assert!(
-        !s.contains("tail"),
-        "bytes past the seal are dropped, never appended after the marker"
+        !dir.path().join("q").exists(),
+        "no parent created for a doomed move"
     );
+
+    // A directory into itself: refused before anything is created.
+    let a = dir.path().join("a");
+    tokio::fs::create_dir(&a).await.unwrap();
+    let inner = a.join("x/y");
+    let err = rename(a.to_str().unwrap(), inner.to_str().unwrap())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, FileError::MoveIntoItself { .. }), "{err:?}");
+    assert!(!a.join("x").exists(), "no stray dir inside the source");
+}
+
+/// F6: a recursive listing with one unreadable subdir is a partial result, not
+/// an error that throws the readable entries away.
+#[cfg(unix)]
+#[tokio::test]
+async fn recursive_list_with_unreadable_subdir_is_partial() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    tokio::fs::write(dir.path().join("visible.txt"), "v")
+        .await
+        .unwrap();
+    let locked = dir.path().join("locked");
+    tokio::fs::create_dir(&locked).await.unwrap();
+    tokio::fs::write(locked.join("hidden.txt"), "h")
+        .await
+        .unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // root reads through 000: the premise doesn't hold there, so the probe decides.
+    let blocked = std::fs::read_dir(&locked).is_err();
+
+    let result = list(dir.path().to_str().unwrap(), true).await;
+    // Restore before asserting so tempdir cleanup always works.
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if !blocked {
+        return;
+    }
+    let l = listing(result.expect("partial results are not an error"));
+    assert!(l.partial, "the non-zero exit is noted");
     assert!(
-        s.len() <= MAX_READ_LINE_BYTES + LINE_TRUNCATED.len(),
-        "the buffer stays bounded by the cap plus the marker"
+        l.text.contains("visible.txt"),
+        "readable entries survive: {}",
+        l.text
     );
 }
 
-#[test]
-fn append_capped_seals_when_the_cap_lands_in_a_run_of_continuation_bytes() {
-    // A binary `read` can straddle the cap with a long run of continuation bytes
-    // (0x80). The boundary walk-back is floored at 3, so the kept head can't
-    // collapse: the marker's bytes still push the line past the cap, the seal
-    // latches, and a second marker can never be stamped.
-    let mut bytes = vec![b'a'; MAX_READ_LINE_BYTES - 64];
-    bytes.extend_from_slice(&[0x80u8; 128]);
-
-    let mut line = Vec::new();
-    append_capped(&mut line, &bytes);
-    assert!(
-        line.len() > MAX_READ_LINE_BYTES,
-        "the first overflow must seal the line, got {} bytes",
-        line.len()
-    );
-
-    append_capped(&mut line, b"tail");
-    let s = String::from_utf8_lossy(&line);
-    assert_eq!(
-        s.matches(LINE_TRUNCATED).count(),
-        1,
-        "the marker is stamped exactly once, even on binary input"
-    );
-    assert!(!s.contains("tail"), "bytes past the seal are dropped");
+/// F16: grep on a directory without `recursive` is typed, so the adapter can
+/// point at `recursive=true`.
+#[tokio::test]
+async fn grep_on_directory_without_recursive_is_typed() {
+    let dir = tempfile::tempdir().unwrap();
+    let err = grep("x", dir.path().to_str().unwrap(), false)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, FileError::GrepDirectory { .. }), "{err:?}");
 }
 
-#[test]
-fn append_capped_trims_a_split_multibyte_char_before_the_marker() {
-    // The cap falls in the middle of a 3-byte char (€ = E2 82 AC): the straddling
-    // char is dropped so the marker isn't preceded by a broken code point.
-    let mut bytes = vec![b'a'; MAX_READ_LINE_BYTES - 1];
-    bytes.extend_from_slice("€".as_bytes());
-    bytes.extend_from_slice(b"zzzz");
+/// F15: write replaces atomically — an existing file keeps its mode, and no
+/// temp file is left beside it.
+#[cfg(unix)]
+#[tokio::test]
+async fn write_is_atomic_and_preserves_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let env = dir.path().join(".env");
+    std::fs::write(&env, "OLD=1").unwrap();
+    std::fs::set_permissions(&env, std::fs::Permissions::from_mode(0o600)).unwrap();
 
-    let mut line = Vec::new();
-    append_capped(&mut line, &bytes);
+    write(env.to_str().unwrap(), "NEW=2").await.unwrap();
+    assert_eq!(std::fs::read_to_string(&env).unwrap(), "NEW=2");
+    let mode = std::fs::metadata(&env).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "mode preserved");
+    assert_eq!(
+        std::fs::read_dir(dir.path()).unwrap().count(),
+        1,
+        "no temp left"
+    );
+}
 
-    let s = String::from_utf8(line).expect("head trimmed to a boundary → clean UTF-8");
+/// F15: writing through a symlink updates the target; the link stays a link.
+#[cfg(unix)]
+#[tokio::test]
+async fn write_follows_an_existing_symlink() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("real.conf");
+    std::fs::write(&target, "old").unwrap();
+    let link = dir.path().join("link.conf");
+    std::os::unix::fs::symlink("real.conf", &link).unwrap();
+
+    write(link.to_str().unwrap(), "new").await.unwrap();
     assert!(
-        s.ends_with(LINE_TRUNCATED) && !s.contains('€'),
-        "the split char is dropped, the marker stamped cleanly: …{}",
-        &s[s.len().saturating_sub(24)..]
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+}
+
+/// F7/F15: writing onto a directory fails naming the op and path, and the temp
+/// file is cleaned up.
+#[tokio::test]
+async fn write_onto_a_directory_errs_with_context_and_no_temp() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("sub");
+    tokio::fs::create_dir(&sub).await.unwrap();
+    let err = write(sub.to_str().unwrap(), "x").await.unwrap_err();
+    assert!(
+        matches!(&err, FileError::Io { op: "write", path, .. } if path == sub.to_str().unwrap()),
+        "{err:?}"
+    );
+    assert_eq!(
+        std::fs::read_dir(dir.path()).unwrap().count(),
+        1,
+        "no temp left"
     );
 }

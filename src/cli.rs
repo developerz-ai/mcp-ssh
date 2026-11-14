@@ -1,4 +1,5 @@
-//! Command-line surface: `serve` (run the server) and `set-auth` (configure creds).
+//! Command-line surface: `serve` (run the server), `set-auth` (configure creds and
+//! revoke existing sessions), and the local admin commands.
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -37,7 +38,11 @@ pub enum Command {
         action: JobCommand,
     },
     /// Summarise OAuth sessions (durable access/refresh tokens).
-    Sessions,
+    Sessions {
+        /// Revoke every session instead: all clients must log in again.
+        #[arg(long)]
+        revoke: bool,
+    },
 }
 
 #[derive(Subcommand)]

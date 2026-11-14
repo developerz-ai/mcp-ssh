@@ -1,34 +1,48 @@
-//! OAuth state. Authorization codes are short-lived (10 min) and stay in-memory —
-//! losing them on a restart just costs an in-flight login a retry. Access tokens
-//! (a day) and refresh tokens (a year, rotated on use) live in SQLite so logins
-//! survive restarts. Tokens are opaque (not JWT): this server is the only
-//! validator — no signing keys, no JWKS. Many tokens coexist, so multiple clients
-//! authenticate concurrently.
+//! OAuth state. Consent requests and authorization codes are short-lived (10 min)
+//! and stay in memory (see [`Pending`]). Access tokens (a day) and refresh tokens
+//! (30 days, rotated on use, within a 90-day login "family") live in SQLite so
+//! logins survive restarts — stored only as SHA-256 hashes, each bound to the
+//! client and family it was issued to. Tokens are opaque (not JWT): this server is
+//! the only validator — no signing keys, no JWKS.
 //!
 //! Registered clients are durable too: `/register` binds a `client_id` to the
 //! redirect URIs it may receive auth codes at, and `/authorize` enforces that
 //! binding, so a restart must not silently invalidate every client's login.
-use std::{collections::HashMap, time::Duration};
+//!
+//! Every SQL statement for these tables lives here. A database failure is logged
+//! here (the rusqlite error only — never a token) and surfaces as a distinct error,
+//! so an outage is a 503 with a journal line, not an "invalid token".
+use std::time::Duration;
 
-use base64::Engine;
-use rand::Rng;
-use sha2::{Digest, Sha256};
-use tokio::{sync::Mutex, time::Instant};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
+
+use super::pending::Pending;
+use super::secret::{hash_token, random_token, verify_pkce};
+use crate::db::{Db, now_unix};
 
 const CODE_TTL: Duration = Duration::from_secs(600);
+/// A consent page left open longer than this must be reloaded.
+const CONSENT_TTL: Duration = Duration::from_secs(600);
+/// Live consent requests / codes held at once. Both are minted by unauthenticated
+/// requests, so memory is bounded; a legitimate login needs one of each.
+const PENDING_CAP: usize = 1024;
 /// Access-token lifetime. Kept short (a day) per the MCP authorization guidance —
 /// a leaked bearer is root here, so it shouldn't outlive a day. The refresh token
-/// (below) renews it silently, so a short access TTL costs the user nothing.
+/// renews it silently, so a short access TTL costs the user nothing.
 pub const TOKEN_TTL: Duration = Duration::from_secs(24 * 3600);
-/// Refresh-token lifetime. Much longer than the access token (a year) and rotated
-/// on every use, so a client used at least this often never has to redo the
-/// browser flow.
-pub const REFRESH_TTL: Duration = Duration::from_secs(365 * 24 * 3600);
+/// Refresh-token lifetime, reset on each rotation but never past the family cap.
+pub const REFRESH_TTL: Duration = Duration::from_secs(30 * 24 * 3600);
+/// Absolute lifetime of one login: however often it is refreshed, a client logs in
+/// again after this long.
+pub const FAMILY_TTL: Duration = Duration::from_secs(90 * 24 * 3600);
+/// A registered client with no live token is dropped once it is this old.
+pub const CLIENT_GRACE: Duration = Duration::from_secs(7 * 24 * 3600);
+/// Registered clients held at once. `/register` is unauthenticated (it bootstraps
+/// auth), so the table is bounded; the stale-client sweep frees room.
+const MAX_CLIENTS: i64 = 1000;
 
-/// The RFC 6749 §5.2 wire error codes this server actually emits, consolidated
-/// so the literal strings exist in exactly one place instead of scattered
-/// across every fallible `Store` method. `Display` (via `thiserror`) renders
-/// the exact wire string callers put in the JSON `error` field.
+/// The RFC 6749 §5.2 wire error codes the grant paths emit. `Display` renders the
+/// exact wire string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum GrantError {
     #[error("invalid_grant")]
@@ -37,73 +51,116 @@ pub enum GrantError {
     ServerError,
 }
 
-struct CodeEntry {
-    challenge: String,
-    redirect_uri: String,
-    expires: Instant,
+/// The token store could not be reached. Already logged where it happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("token store unavailable")]
+pub struct StoreUnavailable;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RegisterError {
+    #[error("too many registered clients")]
+    Full,
+    #[error("token store unavailable")]
+    Unavailable,
 }
 
-/// An access token plus the refresh token that renews it. Each client gets its own
-/// pair; SQLite holds many at once, so several clients (desktop, mobile, CLI) stay
-/// authenticated independently and concurrently.
+/// A validated `/authorize` request waiting for the operator's login.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsentRequest {
+    pub client_id: String,
+    pub redirect_uri: String,
+    pub challenge: String,
+    pub state: Option<String>,
+}
+
+/// An access token plus the refresh token that renews it.
 pub struct Tokens {
     pub access: String,
     pub refresh: String,
 }
 
+impl std::fmt::Debug for Tokens {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Tokens(<redacted>)")
+    }
+}
+
+/// Who a new pair is issued to: the client, and the login it continues.
+struct Grant<'a> {
+    client_id: &'a str,
+    family_id: &'a str,
+    family_expires: i64,
+}
+
+#[derive(Debug)]
 pub struct Store {
-    /// Ephemeral authorization codes — in-memory by design (10-min TTL).
-    codes: Mutex<HashMap<String, CodeEntry>>,
-    /// Durable token store: access + refresh tokens survive restarts.
-    db: crate::db::Db,
+    consents: Pending<ConsentRequest>,
+    codes: Pending<ConsentRequest>,
+    db: Db,
 }
 
 impl Store {
-    pub fn new(db: crate::db::Db) -> Self {
+    pub fn new(db: Db) -> Self {
         Self {
-            codes: Mutex::new(HashMap::new()),
+            consents: Pending::new(CONSENT_TTL, PENDING_CAP),
+            codes: Pending::new(CODE_TTL, PENDING_CAP),
             db,
         }
     }
 
     /// Register a client: mint an id and bind it to the redirect URIs that may
-    /// receive its auth codes. Duplicate URIs in one request collapse to one row.
-    /// Returns the new `client_id` — public data (see the `clients` DDL), so it is
-    /// safe to hand back, but it is still never logged.
-    pub async fn register_client(&self, redirect_uris: &[String]) -> Result<String, GrantError> {
+    /// receive its auth codes. Duplicate URIs collapse to one row. The returned
+    /// `client_id` is public data, but it is still never logged.
+    pub async fn register_client(&self, redirect_uris: &[String]) -> Result<String, RegisterError> {
         let client_id = random_token();
-        // Owned copies: the closure runs on the blocking pool and must be 'static.
-        let rows: Vec<(String, String)> = redirect_uris
-            .iter()
-            .map(|uri| (client_id.clone(), uri.clone()))
-            .collect();
-        self.db
+        let id = client_id.clone(); // the closure must own its inputs ('static)
+        let uris = redirect_uris.to_vec();
+        let now = now_unix();
+        let registered = self
+            .db
             .call(move |conn| {
-                // One transaction so a client is never half-registered — it would
-                // then authorize at some of its URIs and be rejected at the rest.
-                // `unchecked_transaction` for the same reason as `issue`.
-                let tx = conn.unchecked_transaction()?;
-                for (id, uri) in &rows {
+                // Immediate: the count and the insert see the same table.
+                let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+                let clients: i64 =
+                    tx.query_row("SELECT COUNT(DISTINCT client_id) FROM clients", [], |r| {
+                        r.get(0)
+                    })?;
+                if clients >= MAX_CLIENTS {
+                    return Ok(false);
+                }
+                for uri in &uris {
                     tx.execute(
-                        "INSERT OR IGNORE INTO clients (client_id, redirect_uri) VALUES (?1, ?2)",
-                        (id, uri),
+                        "INSERT OR IGNORE INTO clients (client_id, redirect_uri, created_unix) \
+                         VALUES (?1, ?2, ?3)",
+                        (&id, uri, now),
                     )?;
                 }
-                tx.commit()
+                tx.commit()?;
+                Ok(true)
             })
             .await
-            .map_err(|_| GrantError::ServerError)?;
-        Ok(client_id)
+            .map_err(|e| {
+                unavailable("register_client", e);
+                RegisterError::Unavailable
+            })?;
+        if registered {
+            Ok(client_id)
+        } else {
+            tracing::warn!(event = "register_refused", "client table full");
+            Err(RegisterError::Full)
+        }
     }
 
-    /// True only if `client_id` is a registered client and `redirect_uri` is
-    /// *exactly* one of the URIs it registered. Fails closed: an unknown client,
-    /// an unregistered URI, or a DB error all deny.
-    pub async fn client_allows_redirect(&self, client_id: &str, redirect_uri: &str) -> bool {
+    /// True only if `client_id` is registered and `redirect_uri` is *exactly* one
+    /// of the URIs it registered.
+    pub async fn client_allows_redirect(
+        &self,
+        client_id: &str,
+        redirect_uri: &str,
+    ) -> Result<bool, StoreUnavailable> {
         let (client_id, redirect_uri) = (client_id.to_owned(), redirect_uri.to_owned());
         self.db
             .call(move |conn| {
-                use rusqlite::OptionalExtension;
                 conn.query_row(
                     "SELECT 1 FROM clients WHERE client_id = ?1 AND redirect_uri = ?2",
                     (client_id, redirect_uri),
@@ -113,537 +170,367 @@ impl Store {
                 .map(|row| row.is_some())
             })
             .await
-            .unwrap_or(false)
+            .map_err(|e| unavailable("client_allows_redirect", e))
     }
 
-    /// Issue an authorization code bound to the PKCE challenge + redirect_uri.
-    pub async fn new_code(&self, challenge: String, redirect_uri: String) -> String {
-        let code = random_token();
-        let now = Instant::now();
-        let mut codes = self.codes.lock().await;
-        // Sweep expired entries here — codes abandoned without a redeem (any
-        // failed/dropped login) were otherwise never removed and the map grew
-        // without bound for the process lifetime.
-        codes.retain(|_, entry| entry.expires > now);
-        codes.insert(
-            code.clone(),
-            CodeEntry {
-                challenge,
-                redirect_uri,
-                expires: now + CODE_TTL,
-            },
-        );
-        code
+    /// Park a validated request until the operator logs in; returns the single-use
+    /// nonce the consent form posts back. `None` when too many are pending.
+    pub async fn begin_consent(&self, request: ConsentRequest) -> Option<String> {
+        self.consents.insert(request).await
     }
 
-    /// Exchange a code (with its PKCE verifier) for an access + refresh token pair.
+    /// The request a consent nonce was issued for — once, and only within its TTL.
+    pub async fn take_consent(&self, nonce: &str) -> Option<ConsentRequest> {
+        self.consents.take(nonce).await
+    }
+
+    /// Issue an authorization code for an approved request. `None` when too many
+    /// codes are outstanding.
+    pub async fn new_code(&self, approved: ConsentRequest) -> Option<String> {
+        self.codes.insert(approved).await
+    }
+
+    /// Exchange a code (with its PKCE verifier) for a new login's token pair. The
+    /// code is bound to its redirect URI and client (RFC 6749 §4.1.3); a token
+    /// request that names a different `client_id` is refused.
     pub async fn redeem(
         &self,
         code: &str,
         verifier: &str,
         redirect_uri: &str,
+        client_id: Option<&str>,
     ) -> Result<Tokens, GrantError> {
-        let entry = self
+        let grant = self
             .codes
-            .lock()
+            .take(code)
             .await
-            .remove(code)
             .ok_or(GrantError::InvalidGrant)?;
-        if entry.expires < Instant::now() {
+        if grant.redirect_uri != redirect_uri
+            || client_id.is_some_and(|id| id != grant.client_id)
+            || !verify_pkce(&grant.challenge, verifier)
+        {
             return Err(GrantError::InvalidGrant);
         }
-        // `/authorize` only issued this code after matching its URI against the
-        // client's registration, so re-checking it here carries the *URI* binding
-        // through to redemption (RFC 6749 §4.1.3). The client binding does not
-        // carry: no `client_id` is stored with the code, and the token request
-        // never sends one. Safe for a public PKCE client — a stolen code is
-        // useless without the verifier — but it is a half-step short of §4.1.3.
-        if entry.redirect_uri != redirect_uri {
-            return Err(GrantError::InvalidGrant);
-        }
-        if !verify_pkce(&entry.challenge, verifier) {
-            return Err(GrantError::InvalidGrant);
-        }
-        self.issue().await
-    }
-
-    /// Exchange a refresh token for a fresh pair. The old refresh token is consumed
-    /// (rotation, RFC 6749 §10.4 best practice): replaying it fails, and each use
-    /// resets the `REFRESH_TTL` window, so an actively-used client never re-auths.
-    pub async fn refresh(&self, refresh_token: &str) -> Result<Tokens, GrantError> {
-        let token = refresh_token.to_owned();
-        // Delete + expiry-check in one statement so a token can't be redeemed twice
-        // by concurrent requests. `RETURNING` hands back the row only if it existed;
-        // an absent token yields no row → `OptionalExtension::optional` gives `None`.
-        let expiry: Option<i64> = self
-            .db
-            .call(move |conn| {
-                use rusqlite::OptionalExtension;
-                conn.query_row(
-                    "DELETE FROM refresh_tokens WHERE token = ?1 RETURNING expires_unix",
-                    [token],
-                    |row| row.get(0),
-                )
-                .optional()
-            })
-            .await
-            .map_err(|_| GrantError::ServerError)?;
-        // Unknown token, or it was already past its TTL (consuming an expired token
-        // on the way out is fine — it's dead either way). Both → invalid_grant.
-        match expiry {
-            Some(exp) if exp > crate::db::now_unix() => self.issue().await,
-            _ => Err(GrantError::InvalidGrant),
-        }
-    }
-
-    /// Mint and store a new access + refresh pair. Every call is independent, so
-    /// concurrent clients accumulate distinct pairs that don't clobber each other.
-    /// Both rows commit together, so a half-written pair — an access token with no
-    /// refresh token, unrenewable and invisible to the client — is never left behind.
-    async fn issue(&self) -> Result<Tokens, GrantError> {
-        let access = random_token();
-        let refresh = random_token();
-        let access_exp = crate::db::now_unix() + TOKEN_TTL.as_secs() as i64;
-        let refresh_exp = crate::db::now_unix() + REFRESH_TTL.as_secs() as i64;
-        let (access_db, refresh_db) = (access.clone(), refresh.clone());
+        let tokens = new_tokens();
+        let (pair, client) = (hashes(&tokens), grant.client_id);
+        let now = now_unix();
         self.db
             .call(move |conn| {
-                // `unchecked_transaction` rather than `transaction`: `Db::call` hands
-                // out `&Connection`, and it holds the connection mutex for the whole
-                // closure, so the nesting `transaction`'s `&mut self` guards against
-                // can't happen. Dropping `tx` uncommitted rolls back.
-                let tx = conn.unchecked_transaction()?;
-                tx.execute(
-                    "INSERT INTO access_tokens (token, expires_unix) VALUES (?1, ?2)",
-                    (access_db, access_exp),
-                )?;
-                tx.execute(
-                    "INSERT INTO refresh_tokens (token, expires_unix) VALUES (?1, ?2)",
-                    (refresh_db, refresh_exp),
-                )?;
+                let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+                let family_id = random_token();
+                let grant = Grant {
+                    client_id: &client,
+                    family_id: &family_id,
+                    family_expires: now.saturating_add(secs(FAMILY_TTL)),
+                };
+                insert_pair(&tx, &pair, &grant, now)?;
                 tx.commit()
             })
             .await
-            .map_err(|_| GrantError::ServerError)?;
-        Ok(Tokens { access, refresh })
+            .map_err(|e| {
+                unavailable("redeem", e);
+                GrantError::ServerError
+            })?;
+        Ok(tokens)
     }
 
-    /// Insert a token directly — test seam only, bypasses the PKCE flow.
-    #[cfg(test)]
-    pub(crate) async fn insert_token(&self, token: &str) {
-        let token = token.to_owned();
-        let exp = crate::db::now_unix() + TOKEN_TTL.as_secs() as i64;
-        self.db
-            .call(move |conn| {
-                conn.execute(
-                    "INSERT INTO access_tokens (token, expires_unix) VALUES (?1, ?2)",
-                    (token, exp),
-                )
-            })
+    /// Exchange a refresh token for a fresh pair in the same login family, all in
+    /// one transaction: the presented token is consumed and tombstoned, and the new
+    /// pair inserted — or nothing changes. Presenting an already-rotated token is
+    /// reuse (the token leaked): the whole family is revoked.
+    pub async fn refresh(
+        &self,
+        refresh_token: &str,
+        client_id: Option<&str>,
+    ) -> Result<Tokens, GrantError> {
+        let presented = hash_token(refresh_token);
+        let client_id = client_id.map(str::to_owned);
+        let tokens = new_tokens();
+        let pair = hashes(&tokens);
+        let now = now_unix();
+        let outcome = self
+            .db
+            .call(move |conn| rotate(conn, &presented, client_id.as_deref(), &pair, now))
             .await
-            .expect("insert_token");
+            .map_err(|e| {
+                unavailable("refresh", e);
+                GrantError::ServerError
+            })?;
+        match outcome {
+            Rotation::Rotated => Ok(tokens),
+            Rotation::Invalid => Err(GrantError::InvalidGrant),
+            Rotation::Reused => {
+                tracing::warn!(
+                    event = "refresh_reuse",
+                    "a rotated refresh token was presented again; its login was revoked"
+                );
+                Err(GrantError::InvalidGrant)
+            }
+        }
     }
 
     /// True if the bearer token is known and unexpired. An expired token is evicted
     /// on the way out so the table doesn't accumulate dead rows.
-    pub async fn validate(&self, token: &str) -> bool {
-        let token = token.to_owned();
-        let result: rusqlite::Result<bool> = self
-            .db
+    pub async fn validate(&self, token: &str) -> Result<bool, StoreUnavailable> {
+        let hash = hash_token(token);
+        let now = now_unix();
+        self.db
             .call(move |conn| {
-                use rusqlite::OptionalExtension;
                 let expiry: Option<i64> = conn
                     .query_row(
-                        "SELECT expires_unix FROM access_tokens WHERE token = ?1",
-                        [&token],
+                        "SELECT expires_unix FROM access_tokens WHERE token_hash = ?1",
+                        [&hash],
                         |row| row.get(0),
                     )
                     .optional()?;
                 match expiry {
-                    Some(exp) if exp > crate::db::now_unix() => Ok(true),
+                    Some(exp) if exp > now => Ok(true),
                     Some(_) => {
-                        // Known but expired: drop it and report invalid.
-                        conn.execute("DELETE FROM access_tokens WHERE token = ?1", [&token])?;
+                        conn.execute("DELETE FROM access_tokens WHERE token_hash = ?1", [&hash])?;
                         Ok(false)
                     }
                     None => Ok(false),
                 }
             })
-            .await;
-        result.unwrap_or(false)
+            .await
+            .map_err(|e| unavailable("validate", e))
     }
+
+    /// Insert a live access token directly — test seam only, bypasses the flow.
+    #[cfg(test)]
+    pub(crate) async fn insert_token(&self, token: &str) {
+        let hash = hash_token(token);
+        let exp = now_unix() + secs(TOKEN_TTL);
+        self.db
+            .call(move |conn| {
+                conn.execute(
+                    "INSERT INTO access_tokens (token_hash, client_id, family_id, expires_unix) \
+                     VALUES (?1, 'test', 'test', ?2)",
+                    (hash, exp),
+                )
+            })
+            .await
+            .expect("insert_token");
+    }
+}
+
+enum Rotation {
+    Rotated,
+    Invalid,
+    Reused,
+}
+
+/// The body of [`Store::refresh`], on the blocking pool.
+fn rotate(
+    conn: &Connection,
+    presented: &str,
+    client_id: Option<&str>,
+    pair: &PairHashes,
+    now: i64,
+) -> rusqlite::Result<Rotation> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let row: Option<(String, String, i64, i64)> = tx
+        .query_row(
+            "DELETE FROM refresh_tokens WHERE token_hash = ?1 \
+             RETURNING client_id, family_id, expires_unix, family_expires_unix",
+            [presented],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    let Some((owner, family_id, expires, family_expires)) = row else {
+        let reused: Option<String> = tx
+            .query_row(
+                "SELECT family_id FROM refresh_tombstones WHERE token_hash = ?1",
+                [presented],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(family_id) = reused else {
+            return Ok(Rotation::Invalid);
+        };
+        revoke_family(&tx, &family_id)?;
+        tx.commit()?;
+        return Ok(Rotation::Reused);
+    };
+    if client_id.is_some_and(|id| id != owner) {
+        // Rolled back on drop: a token presented by the wrong client isn't burned.
+        return Ok(Rotation::Invalid);
+    }
+    if expires <= now || family_expires <= now {
+        tx.commit()?; // dead either way; consuming it on the way out is fine
+        return Ok(Rotation::Invalid);
+    }
+    tx.execute(
+        "INSERT INTO refresh_tombstones (token_hash, family_id, expires_unix) VALUES (?1, ?2, ?3)",
+        (presented, &family_id, family_expires),
+    )?;
+    let grant = Grant {
+        client_id: &owner,
+        family_id: &family_id,
+        family_expires,
+    };
+    insert_pair(&tx, pair, &grant, now)?;
+    tx.commit()?;
+    Ok(Rotation::Rotated)
+}
+
+/// Hashes of a freshly minted pair, the only form that reaches the database.
+struct PairHashes {
+    access: String,
+    refresh: String,
+}
+
+fn new_tokens() -> Tokens {
+    Tokens {
+        access: random_token(),
+        refresh: random_token(),
+    }
+}
+
+fn hashes(tokens: &Tokens) -> PairHashes {
+    PairHashes {
+        access: hash_token(&tokens.access),
+        refresh: hash_token(&tokens.refresh),
+    }
+}
+
+/// Both rows of a pair, inside the caller's transaction: never half-written.
+fn insert_pair(
+    tx: &Transaction,
+    pair: &PairHashes,
+    grant: &Grant,
+    now: i64,
+) -> rusqlite::Result<()> {
+    let access_exp = now
+        .saturating_add(secs(TOKEN_TTL))
+        .min(grant.family_expires);
+    let refresh_exp = now
+        .saturating_add(secs(REFRESH_TTL))
+        .min(grant.family_expires);
+    tx.execute(
+        "INSERT INTO access_tokens (token_hash, client_id, family_id, expires_unix) \
+         VALUES (?1, ?2, ?3, ?4)",
+        (&pair.access, grant.client_id, grant.family_id, access_exp),
+    )?;
+    tx.execute(
+        "INSERT INTO refresh_tokens \
+         (token_hash, client_id, family_id, expires_unix, family_expires_unix) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        (
+            &pair.refresh,
+            grant.client_id,
+            grant.family_id,
+            refresh_exp,
+            grant.family_expires,
+        ),
+    )?;
+    Ok(())
+}
+
+fn revoke_family(tx: &Transaction, family_id: &str) -> rusqlite::Result<()> {
+    for table in ["access_tokens", "refresh_tokens", "refresh_tombstones"] {
+        tx.execute(
+            &format!("DELETE FROM {table} WHERE family_id = ?1"),
+            [family_id],
+        )?;
+    }
+    Ok(())
+}
+
+/// Log a store failure at the boundary: the operation and the rusqlite error,
+/// which never carries a bound parameter (so never a token hash or value).
+fn unavailable(op: &'static str, error: rusqlite::Error) -> StoreUnavailable {
+    tracing::warn!(op, %error, "token store unavailable");
+    StoreUnavailable
+}
+
+fn secs(d: Duration) -> i64 {
+    i64::try_from(d.as_secs()).unwrap_or(i64::MAX)
+}
+
+/// End every login: all access and refresh tokens (and tombstones). Returns how
+/// many tokens went away — a count only. Registered clients stay: they hold no
+/// credential and can log in again. Used by `set-auth` and `sessions --revoke`.
+pub async fn revoke_all(db: &Db) -> rusqlite::Result<usize> {
+    db.call(|conn| {
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+        let access = tx.execute("DELETE FROM access_tokens", [])?;
+        let refresh = tx.execute("DELETE FROM refresh_tokens", [])?;
+        tx.execute("DELETE FROM refresh_tombstones", [])?;
+        tx.commit()?;
+        Ok(access + refresh)
+    })
+    .await
 }
 
 /// Drop every access token whose expiry has passed. Returns how many rows went
 /// away — a count only, never a token value. Run periodically by the reaper:
 /// `validate` evicts a dead row only when that exact token is re-presented, and
-/// a rotated pair's superseded access token never is, so the table would gain a
-/// dead row per refresh and keep it forever.
-pub async fn sweep_expired_access(db: &crate::db::Db, now: i64) -> usize {
-    sweep_expired(db, "access_tokens", now).await
+/// a rotated pair's superseded access token never is.
+pub async fn sweep_expired_access(db: &Db, now: i64) -> usize {
+    sweep(
+        db,
+        "access_tokens",
+        "DELETE FROM access_tokens WHERE expires_unix <= ?1",
+        now,
+    )
+    .await
 }
 
-/// Drop every refresh token whose expiry has passed. Returns the deleted count.
-/// Same rationale as `sweep_expired_access`: `refresh` only deletes the token
-/// actually presented, so abandoned clients leave rows behind indefinitely.
-pub async fn sweep_expired_refresh(db: &crate::db::Db, now: i64) -> usize {
-    sweep_expired(db, "refresh_tokens", now).await
+/// Drop every refresh token and rotation tombstone whose expiry has passed.
+/// Returns the deleted count.
+pub async fn sweep_expired_refresh(db: &Db, now: i64) -> usize {
+    sweep(
+        db,
+        "refresh_tokens",
+        "DELETE FROM refresh_tokens WHERE expires_unix <= ?1",
+        now,
+    )
+    .await
+        + sweep(
+            db,
+            "refresh_tombstones",
+            "DELETE FROM refresh_tombstones WHERE expires_unix <= ?1",
+            now,
+        )
+        .await
 }
 
-/// One bound bulk `DELETE`. `table` is a compile-time constant (never user
-/// input), so interpolating it into the SQL is injection-safe — same precedent
-/// as `db::ensure_column`. Nothing is selected, so no token string is ever read
-/// into the process, returned, or logged. A failed sweep reports zero and is
-/// logged: the reaper simply retries on the next pass.
-async fn sweep_expired(db: &crate::db::Db, table: &'static str, now: i64) -> usize {
-    let sql = format!("DELETE FROM {table} WHERE expires_unix <= ?1");
-    match db.call(move |conn| conn.execute(&sql, [now])).await {
+/// Drop registered clients older than [`CLIENT_GRACE`] that hold no live token —
+/// abandoned or drive-by registrations. Returns the number of registration rows
+/// (client, redirect URI) removed.
+pub async fn sweep_stale_clients(db: &Db, now: i64) -> usize {
+    let cutoff = now.saturating_sub(secs(CLIENT_GRACE));
+    let sql = "DELETE FROM clients WHERE created_unix <= ?1 AND client_id NOT IN ( \
+                   SELECT client_id FROM access_tokens WHERE expires_unix > ?2 \
+                   UNION SELECT client_id FROM refresh_tokens WHERE expires_unix > ?2)";
+    match db.call(move |conn| conn.execute(sql, (cutoff, now))).await {
         Ok(deleted) => {
-            tracing::debug!(table, deleted, "swept expired tokens");
+            tracing::debug!(deleted, "swept stale clients");
             deleted
         }
         Err(error) => {
-            tracing::warn!(%error, table, "sweeping expired tokens failed");
+            tracing::warn!(%error, "sweeping stale clients failed");
             0
         }
     }
 }
 
-pub fn random_token() -> String {
-    let mut bytes = [0u8; 32];
-    rand::thread_rng().fill(&mut bytes[..]);
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
-}
-
-/// PKCE S256: BASE64URL(SHA256(verifier)) == challenge.
-pub fn verify_pkce(challenge: &str, verifier: &str) -> bool {
-    let mut hasher = Sha256::new();
-    hasher.update(verifier.as_bytes());
-    let digest = hasher.finalize();
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest) == challenge
+/// One bound bulk `DELETE`. Nothing is selected, so no token hash is ever read
+/// into the process. A failed sweep reports zero and is logged: the reaper simply
+/// retries on the next pass.
+async fn sweep(db: &Db, table: &'static str, sql: &'static str, now: i64) -> usize {
+    match db.call(move |conn| conn.execute(sql, [now])).await {
+        Ok(deleted) => {
+            tracing::debug!(table, deleted, "swept expired rows");
+            deleted
+        }
+        Err(error) => {
+            tracing::warn!(%error, table, "sweeping expired rows failed");
+            0
+        }
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::db::{Db, now_unix};
-
-    const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
-    const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
-
-    fn store() -> Store {
-        Store::new(Db::memory())
-    }
-
-    async fn mint(store: &Store) -> Tokens {
-        let code = store.new_code(CHALLENGE.into(), "http://cb".into()).await;
-        store.redeem(&code, VERIFIER, "http://cb").await.unwrap()
-    }
-
-    #[tokio::test]
-    async fn expired_codes_are_swept_on_the_next_issue() {
-        let store = store();
-        // Plant an already-expired entry directly; a lazily-checked map would
-        // keep it forever if it's never redeemed.
-        store.codes.lock().await.insert(
-            "stale".into(),
-            CodeEntry {
-                challenge: CHALLENGE.into(),
-                redirect_uri: "http://cb".into(),
-                expires: Instant::now() - Duration::from_secs(1),
-            },
-        );
-
-        let fresh = store.new_code(CHALLENGE.into(), "http://cb".into()).await;
-
-        let codes = store.codes.lock().await;
-        assert!(
-            !codes.contains_key("stale"),
-            "expired code must be swept, not retained until redeem"
-        );
-        assert!(codes.contains_key(&fresh), "fresh code must be kept");
-    }
-
-    #[tokio::test]
-    async fn a_client_is_bound_to_exactly_the_uris_it_registered() {
-        let store = store();
-        let uris = ["http://localhost/cb".to_string(), "https://app/cb".into()];
-        let client_id = store.register_client(&uris).await.unwrap();
-        let other = store
-            .register_client(&["https://other/cb".into()])
-            .await
-            .unwrap();
-        let unknown = "never-registered".to_string();
-
-        // The match is exact — not a prefix, not a host check, not a pool shared
-        // between clients — and an unregistered id is denied outright.
-        for (id, uri, allowed) in [
-            (&client_id, "http://localhost/cb", true),
-            (&client_id, "https://app/cb", true),
-            (&client_id, "https://app/cb/x", false),
-            (&client_id, "https://app", false),
-            (&client_id, "https://other/cb", false),
-            (&other, "https://app/cb", false),
-            (&unknown, "https://app/cb", false),
-        ] {
-            assert_eq!(
-                store.client_allows_redirect(id, uri).await,
-                allowed,
-                "redirect {uri} should be allowed={allowed}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn registering_the_same_uri_twice_is_one_binding() {
-        // A client listing a URI twice is not an error, and doesn't collide on the
-        // (client_id, redirect_uri) primary key.
-        let store = store();
-        let uri = "https://app/cb".to_string();
-        let client_id = store
-            .register_client(&[uri.clone(), uri.clone()])
-            .await
-            .unwrap();
-        assert!(store.client_allows_redirect(&client_id, &uri).await);
-        assert_eq!(row_count(&store.db, "clients").await, 1);
-    }
-
-    #[test]
-    fn pkce_roundtrip() {
-        // verifier -> S256 challenge, must verify; a wrong verifier must not.
-        assert!(verify_pkce(CHALLENGE, VERIFIER));
-        assert!(!verify_pkce(CHALLENGE, "wrong-verifier"));
-    }
-
-    #[tokio::test]
-    async fn redeem_requires_matching_pkce_and_redirect() {
-        let store = store();
-        let code = store.new_code(CHALLENGE.into(), "http://cb".into()).await;
-
-        assert!(store.redeem(&code, VERIFIER, "http://wrong").await.is_err());
-        // code was consumed on the failed attempt above, so issue a fresh one
-        let code = store.new_code(CHALLENGE.into(), "http://cb".into()).await;
-        let tokens = store.redeem(&code, VERIFIER, "http://cb").await.unwrap();
-        assert!(store.validate(&tokens.access).await);
-        assert!(!store.validate("nope").await);
-    }
-
-    #[tokio::test]
-    async fn issue_commits_both_rows_of_a_pair() {
-        let store = store();
-        mint(&store).await;
-
-        assert_eq!(
-            row_count(&store.db, "access_tokens").await,
-            1,
-            "the access row is committed"
-        );
-        assert_eq!(
-            row_count(&store.db, "refresh_tokens").await,
-            1,
-            "and its refresh row with it — a pair is never half-written"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_failed_refresh_insert_rolls_the_access_row_back() {
-        let store = store();
-        // Make the second INSERT fail. Without one transaction the first INSERT
-        // would already be committed, leaving an orphan access token that can
-        // never be refreshed — and that the caller never learns about.
-        store
-            .db
-            .call(|conn| conn.execute("DROP TABLE refresh_tokens", []))
-            .await
-            .unwrap();
-
-        let code = store.new_code(CHALLENGE.into(), "http://cb".into()).await;
-        assert!(
-            store.redeem(&code, VERIFIER, "http://cb").await.is_err(),
-            "a pair that can't be stored must not be handed out"
-        );
-
-        assert_eq!(
-            row_count(&store.db, "access_tokens").await,
-            0,
-            "the access row must roll back with the failed refresh insert"
-        );
-    }
-
-    #[tokio::test]
-    async fn expired_access_token_is_rejected_and_evicted() {
-        let store = store();
-        // Seed an already-expired access token directly (wall clock, so we can't use
-        // tokio's mock timer — just write a past `expires_unix`).
-        let token = random_token();
-        let (t, exp) = (token.clone(), now_unix() - 1);
-        store
-            .db
-            .call(move |conn| {
-                conn.execute(
-                    "INSERT INTO access_tokens (token, expires_unix) VALUES (?1, ?2)",
-                    (t, exp),
-                )
-            })
-            .await
-            .unwrap();
-
-        // First call rejects and evicts the row.
-        assert!(!store.validate(&token).await);
-        // Second call confirms the row is gone, not merely considered invalid.
-        let t = token.clone();
-        let still_present: bool = store
-            .db
-            .call(move |conn| {
-                conn.query_row(
-                    "SELECT COUNT(*) FROM access_tokens WHERE token = ?1",
-                    [t],
-                    |row| row.get::<_, i64>(0),
-                )
-                .map(|n| n > 0)
-            })
-            .await
-            .unwrap();
-        assert!(!still_present, "expired token must be evicted");
-    }
-
-    #[tokio::test]
-    async fn refresh_rotates_and_issues_a_working_access_token() {
-        let store = store();
-        let first = mint(&store).await;
-
-        // Refreshing yields a new, valid access token...
-        let second = store.refresh(&first.refresh).await.unwrap();
-        assert!(store.validate(&second.access).await);
-        assert_ne!(
-            first.access, second.access,
-            "a fresh access token is issued"
-        );
-        assert_ne!(first.refresh, second.refresh, "refresh token rotates");
-
-        // ...and the consumed refresh token can't be replayed (rotation).
-        assert!(
-            store.refresh(&first.refresh).await.is_err(),
-            "old refresh token must be single-use"
-        );
-        // The new one still works.
-        assert!(store.refresh(&second.refresh).await.is_ok());
-    }
-
-    #[tokio::test]
-    async fn expired_refresh_token_is_rejected() {
-        let store = store();
-        // Seed an expired refresh token directly (past `expires_unix`).
-        let token = random_token();
-        let (t, exp) = (token.clone(), now_unix() - 1);
-        store
-            .db
-            .call(move |conn| {
-                conn.execute(
-                    "INSERT INTO refresh_tokens (token, expires_unix) VALUES (?1, ?2)",
-                    (t, exp),
-                )
-            })
-            .await
-            .unwrap();
-        assert!(
-            store.refresh(&token).await.is_err(),
-            "a refresh token past REFRESH_TTL must be rejected"
-        );
-    }
-
-    /// Rows in `table` — counted, never read, so no token value leaves the DB.
-    async fn row_count(db: &Db, table: &'static str) -> i64 {
-        db.call(move |conn| {
-            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
-        })
-        .await
-        .unwrap()
-    }
-
-    async fn seed(db: &Db, table: &'static str, token: &str, expires: i64) {
-        let token = token.to_owned();
-        db.call(move |conn| {
-            conn.execute(
-                &format!("INSERT INTO {table} (token, expires_unix) VALUES (?1, ?2)"),
-                (token, expires),
-            )
-        })
-        .await
-        .unwrap();
-    }
-
-    #[tokio::test]
-    async fn sweep_deletes_expired_tokens_and_keeps_live_ones() {
-        let store = store();
-        // Fixed clock: expiries are compared against the `now` passed in, so the
-        // boundary case is deterministic rather than racing the wall clock.
-        const NOW: i64 = 1_000_000;
-        seed(&store.db, "access_tokens", "a-past", NOW - 1).await;
-        seed(&store.db, "access_tokens", "a-boundary", NOW).await; // expired: `validate` needs exp > now
-        seed(&store.db, "access_tokens", "a-live", NOW + 1).await;
-        seed(&store.db, "refresh_tokens", "r-past", NOW - 1).await;
-        seed(&store.db, "refresh_tokens", "r-live", NOW + 1).await;
-
-        // The sweep hands back a count — a token string is never returned.
-        assert_eq!(sweep_expired_access(&store.db, NOW).await, 2);
-        assert_eq!(sweep_expired_refresh(&store.db, NOW).await, 1);
-
-        assert_eq!(
-            row_count(&store.db, "access_tokens").await,
-            1,
-            "only the unexpired access row survives"
-        );
-        assert_eq!(
-            row_count(&store.db, "refresh_tokens").await,
-            1,
-            "only the unexpired refresh row survives"
-        );
-        // Nothing left to drop — a repeat pass is a no-op, not a re-delete.
-        assert_eq!(sweep_expired_access(&store.db, NOW).await, 0);
-        assert_eq!(sweep_expired_refresh(&store.db, NOW).await, 0);
-    }
-
-    #[tokio::test]
-    async fn sweep_leaves_a_freshly_issued_pair_usable() {
-        let store = store();
-        let tokens = mint(&store).await;
-
-        let now = now_unix();
-        assert_eq!(sweep_expired_access(&store.db, now).await, 0);
-        assert_eq!(sweep_expired_refresh(&store.db, now).await, 0);
-
-        assert!(
-            store.validate(&tokens.access).await,
-            "a live access token must survive the sweep"
-        );
-        assert!(
-            store.refresh(&tokens.refresh).await.is_ok(),
-            "a live refresh token must survive the sweep"
-        );
-    }
-
-    #[tokio::test]
-    async fn multiple_clients_hold_independent_tokens() {
-        // Several clients authenticate; every access token stays valid at once and
-        // refreshing one never affects the others.
-        let store = store();
-        let a = mint(&store).await;
-        let b = mint(&store).await;
-        let c = mint(&store).await;
-        for t in [&a, &b, &c] {
-            assert!(store.validate(&t.access).await);
-        }
-        assert!(a.access != b.access && b.access != c.access);
-        // Refreshing b is independent of a and c.
-        assert!(store.refresh(&b.refresh).await.is_ok());
-        assert!(
-            store.validate(&a.access).await,
-            "a unaffected by b's refresh"
-        );
-        assert!(
-            store.validate(&c.access).await,
-            "c unaffected by b's refresh"
-        );
-    }
-}
+mod tests;

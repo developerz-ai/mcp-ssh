@@ -10,9 +10,12 @@ mod oauth;
 mod sentry;
 mod tools;
 
+use std::future::{Future, IntoFuture};
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
+use tokio_util::sync::CancellationToken;
 
 use cli::{Cli, Command, JobCommand};
 
@@ -51,23 +54,46 @@ async fn run() -> anyhow::Result<()> {
         .unwrap_or(Command::Serve { port: None })
     {
         Command::Serve { port } => serve(port).await,
-        Command::SetAuth { user } => set_auth(user),
+        Command::SetAuth { user } => set_auth(user).await,
         Command::Jobs { all } => admin::jobs(all).await,
         Command::Job {
             action: JobCommand::Kill { id },
-        } => admin::kill(&id).await,
-        Command::Sessions => admin::sessions().await,
+        } => match admin::kill(&id).await {
+            // Nothing was killed: an operator outcome, not a fault — exit 1 with
+            // the sentence, and keep it out of error tracking.
+            Err(error) if error.is::<admin::KillNotDone>() => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+            other => other,
+        },
+        Command::Sessions { revoke } => admin::sessions(revoke).await,
     }
 }
 
-/// `mcp-ssh set-auth <user>` — prompt for a password and write it to the config.
-fn set_auth(user: String) -> anyhow::Result<()> {
-    let pass = rpassword::prompt_password("Password: ")?;
-    if pass.is_empty() {
-        anyhow::bail!("password must not be empty");
-    }
+/// How long in-flight requests get to finish after a shutdown signal before the
+/// server stops waiting. The systemd unit's `TimeoutStopSec` sits above this.
+const DRAIN_DEADLINE: Duration = Duration::from_secs(10);
+
+/// `mcp-ssh set-auth <user>` — prompt for a password, write it to the config, and
+/// end every existing login: a credential change must lock out whoever held the
+/// old one, not just future logins.
+async fn set_auth(user: String) -> anyhow::Result<()> {
+    let pass = config::Password::new(rpassword::prompt_password("Password: ")?);
     let path = config::set_auth(&user, &pass)?;
     println!("Saved credentials for {user} to {}", path.display());
+    match db::Db::open_existing(&config::db_path()?) {
+        Ok(database) => {
+            let revoked = oauth::revoke_all(&database).await?;
+            println!("Revoked {revoked} tokens: every client must log in again.");
+        }
+        Err(db::DbError::Missing(_)) => println!("No session database yet: nothing to revoke."),
+        Err(e) => anyhow::bail!(
+            "credentials saved, but existing sessions were NOT revoked ({e}); \
+             run `mcp-ssh sessions --revoke` once the server is up"
+        ),
+    }
+    println!("Restart the service to apply the new credentials.");
     Ok(())
 }
 
@@ -81,9 +107,10 @@ async fn serve(port: Option<u16>) -> anyhow::Result<()> {
         cfg.bind.set_port(p);
     }
     // The single SQLite database (OAuth tokens + job metadata) under the systemd
-    // StateDirectory. Ensure its parent dir exists before opening it.
+    // StateDirectory. Any directory created for it is owner-only; an existing one
+    // keeps its mode (systemd's `StateDirectoryMode` sets the default one's).
     if let Some(parent) = cfg.db_path.parent() {
-        std::fs::create_dir_all(parent)?;
+        create_private_dir(parent)?;
     }
     let database = db::Db::open(&cfg.db_path)?;
 
@@ -103,14 +130,69 @@ async fn serve(port: Option<u16>) -> anyhow::Result<()> {
         public_url: cfg.public_url.clone(),
     };
 
-    let app = app::build(auth_state, store, cfg.allowed_hosts.clone());
+    let shutdown = CancellationToken::new();
+    let app = app::build(
+        auth_state,
+        store,
+        cfg.allowed_hosts.clone(),
+        shutdown.clone(),
+    );
 
     let listener = tokio::net::TcpListener::bind(cfg.bind).await?;
     tracing::info!(addr = %cfg.bind, "mcp-ssh listening on /mcp");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    let signalled = shutdown.clone();
+    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        // Ends every MCP session's SSE stream, so the graceful drain isn't held
+        // open by connected clients.
+        signalled.cancel();
+    });
+    serve_until_drained(server.into_future(), shutdown, DRAIN_DEADLINE).await?;
     Ok(())
+}
+
+/// Run `server` to completion — but once `shutdown` fires, give it only
+/// `deadline` to drain. A connection that outlives that (a client holding a
+/// stream open) is dropped with the server rather than stalling the stop until
+/// the service manager kills the process.
+async fn serve_until_drained<F>(
+    server: F,
+    shutdown: CancellationToken,
+    deadline: Duration,
+) -> std::io::Result<()>
+where
+    F: Future<Output = std::io::Result<()>>,
+{
+    tokio::pin!(server);
+    tokio::select! {
+        result = &mut server => return result,
+        () = shutdown.cancelled() => {}
+    }
+    match tokio::time::timeout(deadline, server).await {
+        Ok(result) => {
+            tracing::info!("drained");
+            result
+        }
+        Err(_) => {
+            tracing::warn!(
+                ?deadline,
+                "drain deadline hit; dropping remaining connections"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// `create_dir_all`, but every directory it creates is 0700.
+fn create_private_dir(path: &std::path::Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
 }
 
 /// Parse the `MCP_SSH_PORT` value. Unset/empty → no override; anything else must
@@ -181,6 +263,41 @@ mod tests {
         // default port.
         assert!(env_port(Some("8080x".into())).is_err());
         assert!(env_port(Some("70000".into())).is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_server_that_never_drains_is_dropped_at_the_deadline() {
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let never = std::future::pending::<std::io::Result<()>>();
+        let started = tokio::time::Instant::now();
+        serve_until_drained(never, shutdown, Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(started.elapsed(), Duration::from_secs(10));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_server_that_drains_returns_at_once() {
+        let shutdown = CancellationToken::new();
+        let server = async { Ok(()) };
+        let started = tokio::time::Instant::now();
+        serve_until_drained(server, shutdown, Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_created_state_dir_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("a/b");
+        create_private_dir(&state).unwrap();
+        for p in [dir.path().join("a"), state] {
+            let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{}", p.display());
+        }
     }
 
     // SIGTERM (what systemd sends on stop) must resolve `shutdown_signal` so

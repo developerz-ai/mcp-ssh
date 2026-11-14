@@ -4,13 +4,18 @@
 
 // ---- bash ----
 
+/// Longest `timeout` honoured, in seconds: past it a command is backgrounded
+/// anyway, so a request can't sit open for hours.
+pub const MAX_BASH_TIMEOUT_SECS: u64 = 600;
+
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct BashArgs {
-    /// Shell command to run.
+    /// Shell command to run (must not be empty).
     pub cmd: String,
-    /// Working directory (optional).
+    /// Working directory (optional; must be an existing directory).
     pub cwd: Option<String>,
-    /// Seconds to wait inline before backgrounding (default 2).
+    /// Seconds to wait inline before backgrounding (default 2, at most 600).
     pub timeout: Option<u64>,
     /// Background immediately and return a job id without waiting.
     pub bg: Option<bool>,
@@ -19,27 +24,18 @@ pub struct BashArgs {
     /// `sh -c`); set true when the command needs the user's shell setup.
     pub interactive: Option<bool>,
     /// Short label for this job, e.g. "build-api" or "deploy check". It becomes
-    /// the job id prefix (`<title>-HH:MM:SS`) so you can tell your own jobs apart
-    /// in `job(action="list")`. Optional; omit and the id is `job-HH:MM:SS`.
+    /// the job id prefix (`<title>-HH-MM-SS`) so you can tell your own jobs apart
+    /// in `job(action="list")`. Optional; omit and the id is `job-HH-MM-SS`.
     pub title: Option<String>,
 }
 
 // ---- job ----
 
-// `#[schemars(inline)]`: emit this enum inline on the `action` property
-// (`{"type":"string","enum":[...]}`) instead of a `$ref` into `$defs`. Clients
-// (Claude Desktop, codex, n8n) routinely drop `$defs`, so a `$ref` enum resolves
-// to nothing — the model can't see it's a string and sends a garbage placeholder
-// (`null`, then `true`), which fails deserialization before dispatch. Inlining is
-// the documented fix (MCP python-sdk #1373: Literal inlines, Enum uses `$ref`).
-//
-// Variants also carry NO `///` doc comments on purpose: a doc'd unit enum renders
-// as `oneOf` of `{const, description}`, which the same clients mishandle. Bare
-// variants render a flat `enum`. Per-action docs live in the `job` tool
-// description and the `action` field below.
-#[derive(serde::Deserialize, schemars::JsonSchema, Default)]
-#[serde(rename_all = "snake_case")]
-#[schemars(inline)]
+/// The `job` tool's `action`. Deserialized only through [`lenient_action`], and
+/// its schema is written by hand (below) because it must advertise exactly the
+/// three real actions while `Unknown` carries a string no derive would leave out
+/// cleanly.
+#[derive(Debug, Default)]
 pub enum JobAction {
     Poll,
     // Read-only and id-free, so it's the safe fallback when `action` arrives as a
@@ -47,14 +43,52 @@ pub enum JobAction {
     #[default]
     List,
     Kill,
+    // A string naming no action (`"stop"`, `"KILL"`): an error naming the valid
+    // ones, never a guess. Not advertised in the schema.
+    Unknown(String),
 }
 
-/// Tolerate the malformed `action` clients still send despite the inlined schema:
-/// a literal `null`, a bare `true`, a number — anything non-string. Accept a valid
-/// string variant; coerce everything else (and an omitted key, via `#[serde(default)]`)
-/// to the read-only `list` default instead of dead-ending the whole call. `list`
-/// is safe to guess: it's id-free and has no side effects, so the model just gets
-/// the job list back and retries. Destructive `file` actions get no such fallback.
+/// A flat, inlined `{"type":"string","enum":[...]}` — never a `$ref` into `$defs`
+/// and never a `oneOf`. Clients (Claude Desktop, codex, n8n) drop `$defs` and
+/// mishandle `oneOf`, then send a garbage placeholder (`null`, `true`) that fails
+/// before dispatch (MCP python-sdk #1373 has the same fix).
+impl schemars::JsonSchema for JobAction {
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "JobAction".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "enum": ["poll", "list", "kill"]
+        })
+    }
+}
+
+impl JobAction {
+    /// The action's name for a log line — fixed words only, never the raw string
+    /// an unknown action carried.
+    pub fn name(&self) -> &'static str {
+        match self {
+            JobAction::Poll => "poll",
+            JobAction::List => "list",
+            JobAction::Kill => "kill",
+            JobAction::Unknown(_) => "unknown",
+        }
+    }
+}
+
+/// Tolerate the malformed `action` clients send despite the inlined schema: a
+/// literal `null`, a bare `true`, a number — anything non-string — and an omitted
+/// key (via `#[serde(default)]`) become the read-only `list`, instead of
+/// dead-ending the whole call; it's id-free and side-effect-free, so the model
+/// just gets the job list back. A *string* is the model's real intent, though: one
+/// that names no action is kept as [`JobAction::Unknown`] and refused, never
+/// silently turned into a listing.
 pub fn lenient_action<'de, D>(de: D) -> Result<JobAction, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -63,9 +97,9 @@ where
     Ok(match Option::<serde_json::Value>::deserialize(de)? {
         Some(serde_json::Value::String(s)) => match s.as_str() {
             "poll" => JobAction::Poll,
+            "list" => JobAction::List,
             "kill" => JobAction::Kill,
-            // "list" or any unknown string falls through to the safe default.
-            _ => JobAction::List,
+            _ => JobAction::Unknown(s),
         },
         // null, bool, number, object, or array — the client bug. Default safely.
         _ => JobAction::List,
@@ -73,16 +107,19 @@ where
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct JobArgs {
     /// What to do: poll, list, or kill. Defaults to list.
     #[serde(default, deserialize_with = "lenient_action")]
     pub action: JobAction,
     /// [poll, kill] job id.
     pub id: Option<String>,
-    /// [poll] how many of the newest lines to skip. 0 (default) returns the most
-    /// recent page; pass the previous response's next_cursor to page further back.
-    pub cursor: Option<usize>,
-    /// [poll] max lines to return (default 200).
+    /// [poll, list] where the next page starts: pass the previous response's
+    /// next_cursor. Omit for the first page (poll: the latest output; list: the
+    /// newest jobs).
+    pub cursor: Option<u64>,
+    /// [poll] max lines to return (default 200); [list] max jobs (default and
+    /// most 200).
     pub limit: Option<usize>,
 }
 
@@ -92,7 +129,7 @@ pub struct JobArgs {
 // `action` property instead of a `$ref` clients drop. No lenient fallback here —
 // `file` actions are destructive (delete/write/move) with no safe default, so a
 // malformed `action` must error rather than be guessed.
-#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 #[schemars(inline)]
 pub enum FileAction {
@@ -105,7 +142,10 @@ pub enum FileAction {
     Move,
 }
 
+// `deny_unknown_fields`: a misspelt param (`recurse=true`, `offset=200`) must
+// error, not be silently ignored — for `delete` that would change what's removed.
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct FileArgs {
     /// What to do.
     pub action: FileAction,
@@ -113,16 +153,18 @@ pub struct FileArgs {
     pub path: Option<String>,
     /// [write, append] file content.
     pub content: Option<String>,
-    /// [grep] pattern to search for.
+    /// [grep] basic regular expression (grep's default syntax) to search for.
     pub pattern: Option<String>,
-    /// [list, grep] recurse into subdirectories.
+    /// [list, grep, delete] recurse into subdirectories; delete requires it to
+    /// remove a non-empty directory.
     pub recursive: Option<bool>,
     /// [move] source path.
     pub src: Option<String>,
-    /// [move] destination path.
+    /// [move] destination path — the full new path, not a directory to move into.
     pub dest: Option<String>,
     /// [read] line offset to start from (default 0).
     pub cursor: Option<usize>,
-    /// [read] max lines to return (default 200).
+    /// [read] max lines to return (default 200, at most 1000; a page is also
+    /// capped at 64 KiB).
     pub limit: Option<usize>,
 }

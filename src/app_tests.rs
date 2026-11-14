@@ -38,12 +38,17 @@ fn test_app_with(public_url: Option<&str>) -> Router {
     let state = oauth::AuthState {
         creds: auth::Credentials {
             user: "admin".into(),
-            pass: "secret".into(),
+            pass: crate::config::Password::new("secret"),
         },
         store: Arc::new(oauth::Store::new(database)),
         public_url: public_url.map(Into::into),
     };
-    build(state, jobs, vec!["localhost".into(), "127.0.0.1".into()])
+    build(
+        state,
+        jobs,
+        vec!["localhost".into(), "127.0.0.1".into()],
+        tokio_util::sync::CancellationToken::new(),
+    )
 }
 
 /// Build a test app with a pre-minted bearer token ready for session tests.
@@ -63,12 +68,17 @@ async fn test_app_with_token() -> (Router, String) {
     let state = oauth::AuthState {
         creds: auth::Credentials {
             user: "admin".into(),
-            pass: "secret".into(),
+            pass: crate::config::Password::new("secret"),
         },
         store: oauth_store,
         public_url: None,
     };
-    let app = build(state, jobs, vec!["localhost".into(), "127.0.0.1".into()]);
+    let app = build(
+        state,
+        jobs,
+        vec!["localhost".into(), "127.0.0.1".into()],
+        tokio_util::sync::CancellationToken::new(),
+    );
     (app, token)
 }
 
@@ -99,7 +109,7 @@ async fn healthz_does_not_bypass_mcp_auth() {
             Request::builder()
                 .method("POST")
                 .uri("/mcp")
-                .header(header::HOST, "mcp.example.com")
+                .header(header::HOST, "localhost")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -108,13 +118,15 @@ async fn healthz_does_not_bypass_mcp_auth() {
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 }
 
+/// `/healthz` answers whatever the Host: local probes use `127.0.0.1` even when
+/// only the public name is allow-listed.
 #[tokio::test]
-async fn discovery_metadata_is_public() {
+async fn healthz_is_outside_the_host_guard() {
     let res = test_app()
         .oneshot(
             Request::builder()
-                .uri("/.well-known/oauth-authorization-server")
-                .header(header::HOST, "mcp.example.com")
+                .uri("/healthz")
+                .header(header::HOST, "elsewhere.example")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -124,10 +136,93 @@ async fn discovery_metadata_is_public() {
 }
 
 #[tokio::test]
-async fn mcp_without_auth_and_no_public_url_returns_bare_401() {
-    // `/mcp` auth runs before the allowed-hosts gate, so the Host here is
-    // attacker-controlled. With no configured public_url it must NOT be
-    // reflected into a challenge: a bare 401, no WWW-Authenticate.
+async fn discovery_metadata_is_public() {
+    let res = test_app()
+        .oneshot(
+            Request::builder()
+                .uri("/.well-known/oauth-authorization-server")
+                .header(header::HOST, "localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+}
+
+/// Without a `public_url` the metadata is built from `Host`, so a Host off the
+/// allowlist must never reach it — nor any other OAuth route.
+#[tokio::test]
+async fn oauth_routes_refuse_a_disallowed_host() {
+    for (method, uri) in [
+        ("GET", "/.well-known/oauth-authorization-server"),
+        ("GET", "/.well-known/oauth-protected-resource"),
+        ("GET", "/authorize"),
+        ("POST", "/token"),
+        ("POST", "/register"),
+    ] {
+        let res = test_app()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header(header::HOST, "evil.example.com")
+                    .header("x-forwarded-proto", "javascript")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN, "{method} {uri}");
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(!body.contains("evil.example.com") && !body.contains("javascript"));
+    }
+}
+
+#[tokio::test]
+async fn an_allowed_host_matches_case_insensitively_and_with_any_port() {
+    for host in ["LOCALHOST", "localhost:1337", "127.0.0.1:9"] {
+        let res = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/.well-known/oauth-authorization-server")
+                    .header(header::HOST, host)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "{host}");
+    }
+}
+
+/// Any 401 from `/mcp` carries the RFC 9728 challenge, built from the
+/// (allow-listed) Host when no `public_url` is configured.
+#[tokio::test]
+async fn mcp_without_auth_and_no_public_url_challenges_with_the_allowed_host() {
+    let res = test_app()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header(header::HOST, "localhost:1337")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        res.headers()[header::WWW_AUTHENTICATE],
+        "Bearer resource_metadata=\"http://localhost:1337/.well-known/oauth-protected-resource\""
+    );
+}
+
+#[tokio::test]
+async fn mcp_with_a_disallowed_host_is_forbidden_before_auth() {
     let res = test_app()
         .oneshot(
             Request::builder()
@@ -139,58 +234,106 @@ async fn mcp_without_auth_and_no_public_url_returns_bare_401() {
         )
         .await
         .unwrap();
-    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
     assert!(!res.headers().contains_key(header::WWW_AUTHENTICATE));
 }
 
 #[tokio::test]
 async fn mcp_without_auth_with_public_url_advertises_configured_challenge() {
-    // A configured public_url is trusted, so the challenge is advertised — and
-    // it uses that URL, never the (attacker-controlled) Host header.
+    // A configured public_url is the challenge's base; the request's Host is
+    // never consulted.
     let res = test_app_with(Some("https://mcp.example.com"))
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/mcp")
-                .header(header::HOST, "evil.example.com")
+                .header(header::HOST, "127.0.0.1")
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
-    let challenge = res
-        .headers()
-        .get(header::WWW_AUTHENTICATE)
-        .expect("challenge present when public_url is configured")
-        .to_str()
-        .unwrap();
-    assert!(challenge.contains("Bearer"));
-    assert!(challenge.contains("https://mcp.example.com/.well-known/oauth-protected-resource"));
-    assert!(!challenge.contains("evil.example.com"));
+    assert_eq!(
+        res.headers()[header::WWW_AUTHENTICATE],
+        "Bearer resource_metadata=\"https://mcp.example.com/.well-known/oauth-protected-resource\""
+    );
 }
 
-/// A valid OAuth bearer token passes the `/mcp` guard.
+/// A token store that can't answer is a 503, never a 401 that would send every
+/// client back through the login flow.
 #[tokio::test]
-async fn mcp_with_bearer_auth_passes_the_guard() {
-    let (app, token) = test_app_with_token().await;
+async fn mcp_with_an_unavailable_token_store_is_503() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let database = crate::db::Db::memory();
+    let jobs = JobStore::new(
+        dir,
+        std::time::Duration::from_secs(2),
+        crate::jobs::Shell::sh(),
+        database.clone(),
+    )
+    .unwrap();
+    let state = oauth::AuthState {
+        creds: auth::Credentials {
+            user: "admin".into(),
+            pass: crate::config::Password::new("secret"),
+        },
+        store: Arc::new(oauth::Store::new(database.clone())),
+        public_url: None,
+    };
+    let app = build(
+        state,
+        jobs,
+        vec!["localhost".into()],
+        tokio_util::sync::CancellationToken::new(),
+    );
+    database
+        .call(|c| c.execute_batch("DROP TABLE access_tokens"))
+        .await
+        .unwrap();
     let res = app
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/mcp")
-                .header(header::HOST, "mcp.example.com")
-                .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                .header(header::CONTENT_TYPE, "application/json")
-                .header(header::ACCEPT, "application/json, text/event-stream")
-                .body(Body::from(
-                    r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#,
-                ))
+                .header(header::HOST, "localhost")
+                .header(header::AUTHORIZATION, "Bearer some-token")
+                .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// A valid OAuth bearer token passes the `/mcp` guard — but only under an
+/// allowed Host: a disallowed one is refused outright (DNS-rebinding guard).
+#[tokio::test]
+async fn mcp_with_bearer_auth_passes_the_guard() {
+    let (app, token) = test_app_with_token().await;
+    for (host, expected) in [
+        ("localhost", StatusCode::OK),
+        ("mcp.example.com", StatusCode::FORBIDDEN),
+    ] {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header(header::HOST, host)
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::ACCEPT, "application/json, text/event-stream")
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), expected, "Host {host}");
+    }
 }
 
 /// HTTP Basic is no longer accepted on `/mcp` — bearer-only per OAuth 2.1.
@@ -203,7 +346,7 @@ async fn basic_on_mcp_now_401s() {
             Request::builder()
                 .method("POST")
                 .uri("/mcp")
-                .header(header::HOST, "mcp.example.com")
+                .header(header::HOST, "localhost")
                 .header(header::AUTHORIZATION, format!("Basic {creds}"))
                 .header(header::CONTENT_TYPE, "application/json")
                 .header(header::ACCEPT, "application/json, text/event-stream")

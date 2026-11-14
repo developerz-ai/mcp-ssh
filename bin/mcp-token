@@ -11,8 +11,11 @@
 #
 # Credentials come from .env (MCP_SSH_USER/MCP_SSH_PASS) or the environment.
 # The base URL defaults to the local bind; override with $MCP_SSH_URL.
-# Access tokens last 24h (the response also carries a 30-day refresh_token for
-# silent renewal); all tokens reset when the server restarts — re-run to refresh.
+# The access token lasts 24h and survives server restarts (tokens are stored,
+# hashed, in the server's SQLite). Only the access token is printed — the 30-day
+# refresh token in the response is discarded — so re-run this to get a new one.
+# Each run is a separate login (and a registered client, swept 7 days after its
+# tokens expire); `mcp-ssh sessions --revoke` on the host ends every login.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -29,7 +32,7 @@ fi
 BASE="${MCP_SSH_URL:-http://${MCP_SSH_BIND:-127.0.0.1:1337}}"
 REDIRECT="http://localhost/cb"
 
-for bin in curl openssl sed; do
+for bin in curl openssl sed grep; do
   command -v "$bin" >/dev/null || { echo "mcp-token: '$bin' not found" >&2; exit 1; }
 done
 
@@ -46,23 +49,33 @@ client_id=$(curl -fsS -X POST "$BASE/register" \
   | sed -n 's/.*"client_id":"\([^"]*\)".*/\1/p')
 [ -n "$client_id" ] || { echo "mcp-token: client registration failed (server down?)" >&2; exit 1; }
 
-# /authorize — authenticate with HTTP Basic, receive an auth code on the redirect.
-# Build the Basic header ourselves and feed it via a curl config file on stdin
-# (-K -), never on argv, so the password can't surface in the process list. The
-# header value is pure base64, so no curl-config quoting/escaping is needed.
-basic=$(printf '%s:%s' "$MCP_SSH_USER" "$MCP_SSH_PASS" | openssl base64 -A)
-location=$(curl -fsS -o /dev/null -w '%{redirect_url}' -G "$BASE/authorize" \
-  -K - \
+# GET /authorize — validates the request and serves the consent form; never a
+# code. The form carries a single-use csrf_token naming this request server-side.
+csrf=$(curl -fsS -G "$BASE/authorize" \
   --data-urlencode "response_type=code" \
   --data-urlencode "client_id=$client_id" \
   --data-urlencode "redirect_uri=$REDIRECT" \
   --data-urlencode "code_challenge=$challenge" \
-  --data-urlencode "code_challenge_method=S256" <<EOF
-header = "Authorization: Basic $basic"
-EOF
-)
+  --data-urlencode "code_challenge_method=S256" \
+  | grep -o 'name="csrf_token" value="[^"]*"' \
+  | sed 's/.*value="\([^"]*\)"/\1/')
+[ -n "$csrf" ] || { echo "mcp-token: no consent form from /authorize (server down?)" >&2; exit 1; }
+
+# POST /authorize — submit the form; a right login answers 302 to the redirect URI
+# with the code. The password goes in on stdin (`password@-`), never on argv, so
+# it can't surface in the process list.
+location=$(printf '%s' "$MCP_SSH_PASS" | curl -sS -o /dev/null -w '%{http_code} %{redirect_url}' \
+  -X POST "$BASE/authorize" \
+  --data-urlencode "csrf_token=$csrf" \
+  --data-urlencode "username=$MCP_SSH_USER" \
+  --data-urlencode "password@-")
+status=${location%% *}
+location=${location#* }
 code=$(printf '%s' "$location" | sed -n 's/.*[?&]code=\([^&]*\).*/\1/p')
-[ -n "$code" ] || { echo "mcp-token: no auth code (bad credentials or server down?): $location" >&2; exit 1; }
+if [ "$status" != 302 ] || [ -z "$code" ]; then
+  echo "mcp-token: login refused (HTTP $status) — check MCP_SSH_USER/MCP_SSH_PASS" >&2
+  exit 1
+fi
 
 # /token — exchange the code + PKCE verifier for an access token.
 token=$(curl -fsS -X POST "$BASE/token" \
@@ -70,6 +83,7 @@ token=$(curl -fsS -X POST "$BASE/token" \
   --data-urlencode "code=$code" \
   --data-urlencode "code_verifier=$verifier" \
   --data-urlencode "redirect_uri=$REDIRECT" \
+  --data-urlencode "client_id=$client_id" \
   | sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p')
 [ -n "$token" ] || { echo "mcp-token: token exchange failed" >&2; exit 1; }
 

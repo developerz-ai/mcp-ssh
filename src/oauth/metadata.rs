@@ -1,12 +1,18 @@
 //! OAuth discovery endpoints (RFC 9728 + RFC 8414) and base-URL derivation.
-use axum::{Json, extract::State, http::HeaderMap};
+use axum::{
+    Json,
+    extract::State,
+    http::{HeaderMap, uri::Authority},
+};
 use serde_json::json;
 
 use super::AuthState;
 
-/// Canonical base URL for this server. Configured `public_url` wins; otherwise
-/// derived from the `Host` header (scheme from `X-Forwarded-Proto`, defaulting
-/// to https for non-loopback hosts).
+/// Canonical base URL for this server. A configured `public_url` (already
+/// normalised by config) wins, and then the request is never consulted. Otherwise
+/// it is derived from the `Host` header — which the app's host guard has checked
+/// against the allowlist — with the scheme from `X-Forwarded-Proto` only when that
+/// says `http` or `https`, defaulting to https off-loopback.
 pub fn base_url(public_url: Option<&str>, headers: &HeaderMap) -> String {
     if let Some(url) = public_url {
         return url.trim_end_matches('/').to_string();
@@ -14,18 +20,23 @@ pub fn base_url(public_url: Option<&str>, headers: &HeaderMap) -> String {
     let host = headers
         .get("host")
         .and_then(|h| h.to_str().ok())
-        .unwrap_or("localhost");
-    let scheme = headers
+        .and_then(|h| h.parse::<Authority>().ok())
+        .filter(|a| !a.as_str().contains('@'))
+        .map_or_else(|| "localhost".to_string(), |a| a.as_str().to_string());
+    let forwarded = headers
         .get("x-forwarded-proto")
         .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            if host.starts_with("localhost") || host.starts_with("127.") {
-                "http".into()
-            } else {
-                "https".into()
-            }
-        });
+        .map(|s| s.trim().to_ascii_lowercase());
+    let scheme = match forwarded.as_deref() {
+        Some(s @ ("http" | "https")) => s,
+        _ if host.starts_with("localhost")
+            || host.starts_with("127.")
+            || host.starts_with("[::1]") =>
+        {
+            "http"
+        }
+        _ => "https",
+    };
     format!("{scheme}://{host}")
 }
 
@@ -72,7 +83,7 @@ mod tests {
         AuthState {
             creds: Credentials {
                 user: "u".into(),
-                pass: "p".into(),
+                pass: crate::config::Password::new("p"),
             },
             store: Arc::new(Store::new(crate::db::Db::memory())),
             public_url: Some(url.into()),
@@ -83,7 +94,7 @@ mod tests {
         AuthState {
             creds: Credentials {
                 user: "u".into(),
-                pass: "p".into(),
+                pass: crate::config::Password::new("p"),
             },
             store: Arc::new(Store::new(crate::db::Db::memory())),
             public_url: None,
@@ -129,6 +140,23 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("host", HeaderValue::from_static("127.0.0.1:8080"));
         assert_eq!(base_url(None, &headers), "http://127.0.0.1:8080");
+    }
+
+    #[test]
+    fn base_url_ignores_a_non_http_forwarded_proto() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("mcp.example.com"));
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("javascript"));
+        assert_eq!(base_url(None, &headers), "https://mcp.example.com");
+    }
+
+    #[test]
+    fn base_url_never_reflects_a_malformed_host() {
+        for bad in ["evil\"host", "a@b.example", "x/y"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("host", HeaderValue::from_str(bad).unwrap());
+            assert_eq!(base_url(None, &headers), "http://localhost", "{bad}");
+        }
     }
 
     // --- metadata JSON shape ---

@@ -1,89 +1,243 @@
-//! Process-group signalling: terminate a job's process group, `SIGTERM` then
-//! `SIGKILL` on a grace timeout, and probe group liveness.
+//! Process-group signalling and the one kill semantics.
 //!
 //! A job leads its own process group (so its pgid equals its pid; see
-//! `JobStore::run`), which lets a single signal to the negative pid reach the
-//! whole tree the command spawned, not just `sh` itself.
+//! `JobStore::run`), which lets one `kill(2)` on the negative pid reach the whole
+//! tree the command spawned, not just its shell.
 //!
-//! Two entry points, one semantics: [`kill_job`] for a job this process still
-//! holds a handle to, [`kill_persisted`] for one it only has a row for — the
-//! engine's untracked jobs and every `mcp-ssh job kill`. Both decide on the same
-//! rules; only the answer's rendering differs per caller.
+//! Two entry points, one decision: [`kill_job`] for a job this process still holds
+//! a handle to, [`kill_persisted`] for one it only has a row for (the engine's
+//! untracked jobs and every `mcp-ssh job kill`). Both end in [`escalate`], and a
+//! kill is reported as done only once a probe finds the group gone — never from
+//! the leader's exit alone (descendants can outlive it) and never from an error.
+use std::io;
+use std::sync::OnceLock;
 use std::time::Duration;
-
-use tokio::sync::watch;
 
 use super::{Job, JobId, JobRepo, JobState, JobStatus, ProcessGroupId};
 
 /// Grace between `SIGTERM` and `SIGKILL` when killing a job's process group.
 const KILL_GRACE: Duration = Duration::from_secs(2);
+/// How long a group may take to disappear after `SIGKILL` (its members must be
+/// reaped by their parent) before it is reported as having survived.
+const REAP_WAIT: Duration = Duration::from_secs(1);
+const PROBE_EVERY: Duration = Duration::from_millis(50);
 
-/// Signal a job's process group dead: `SIGTERM`, then `SIGKILL` if it outlasts a
-/// short grace. Returns `true` if the group is gone afterwards, `false` if there
-/// was nothing to kill (the store already recorded the exit, the OS withheld its
-/// pid) or the group outlived the signals.
-pub(super) async fn kill_job(job: &Job) -> bool {
-    if !matches!(*job.state.lock().await, JobState::Running) {
-        return false;
-    }
-    let Some(pgid) = job.pgid else {
-        return false;
-    };
-    if !signal_group(pgid, "TERM").await {
-        // `TERM` only fails once the group is gone, so the job exited between the
-        // state check and the signal. Probe the group rather than re-reading the
-        // state — the waiter task reaps the child before it records the exit, so
-        // the state still reads `Running` for that window — and report a group
-        // that is already gone as killed, not as a kill failure.
-        return !group_alive(pgid).await;
-    }
-    // Give the group a chance to exit on TERM; force it with KILL otherwise.
-    if !exited_within(job.done.clone(), KILL_GRACE).await && !signal_group(pgid, "KILL").await {
-        // The group can die between the grace expiring and the KILL — its own
-        // TERM worked, the KILL just found nothing. Report by final state, not
-        // by KILL delivery, so that success isn't misread as "nothing to kill".
-        return !matches!(*job.state.lock().await, JobState::Running);
-    }
-    true
+/// What `kill(2)` says about a target. An error is never read as "gone": a
+/// failed probe keeps a job `running` rather than mark it dead.
+#[derive(Debug)]
+pub(super) enum Probe {
+    /// The target exists (signal delivered, or `EPERM`: it exists but isn't ours).
+    Alive,
+    /// `ESRCH`: no such process or group.
+    Gone,
+    /// Any other failure — the answer is unknown.
+    Unknown(io::Error),
 }
 
-/// What killing a job from its persisted row decided. The two callers render it
-/// differently — `job(action="kill")` answers a bool, `mcp-ssh job kill` an
-/// operator sentence — so the decision is returned here, never formatted.
+/// Send `sig` to `target` (a pid, or a negated pgid for the whole group) and map
+/// the errno. `target` is never `0` or `-1` (the caller's own group / every
+/// process we may signal): every caller passes a `ProcessGroupId`, which holds
+/// `2..=i32::MAX`.
+pub(super) fn send(target: libc::pid_t, sig: libc::c_int) -> Probe {
+    // SAFETY: kill(2) takes two plain integers and touches no memory of ours; every
+    // argument value is defined behaviour (a bad one only fails with an errno).
+    let rc = unsafe { libc::kill(target, sig) };
+    if rc == 0 {
+        return Probe::Alive;
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ESRCH) => Probe::Gone,
+        Some(libc::EPERM) => Probe::Alive,
+        _ => Probe::Unknown(error),
+    }
+}
+
+/// Signal every member of the group.
+fn signal_group(pgid: ProcessGroupId, sig: libc::c_int) -> Probe {
+    send(-pgid.get(), sig)
+}
+
+/// Whether process group `pgid` still has a member. Signal 0 delivers nothing,
+/// only checks deliverability.
+pub(super) fn probe(pgid: ProcessGroupId) -> Probe {
+    signal_group(pgid, 0)
+}
+
+/// The kernel's id for this boot. A pgid persisted under another boot names
+/// nothing that still exists — the number may since have been handed to an
+/// unrelated group — so such a row is treated as gone without being probed.
+/// `None` where the kernel doesn't expose it (then every row is probed).
+fn current_boot_id() -> Option<&'static str> {
+    static BOOT_ID: OnceLock<Option<String>> = OnceLock::new();
+    BOOT_ID
+        .get_or_init(|| {
+            // procfs is memory-backed and this runs once per process.
+            std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                .ok()
+                .map(|s| s.trim().to_string())
+        })
+        .as_deref()
+}
+
+/// The boot id persisted with a new job row.
+pub(super) fn boot_id() -> Option<String> {
+    current_boot_id().map(str::to_string)
+}
+
+/// The signalable group behind a persisted row, or `None` when there is nothing
+/// that may be signalled: no pgid, a corrupt one, or one from a previous boot.
+pub(super) fn persisted_group(pgid: Option<i64>, boot: Option<&str>) -> Option<ProcessGroupId> {
+    let pgid = pgid.and_then(ProcessGroupId::from_persisted)?;
+    match (boot, current_boot_id()) {
+        (Some(row), Some(now)) if row != now => None,
+        _ => Some(pgid),
+    }
+}
+
+/// Liveness of a persisted row's group, for the reconcile and the reaper: a row
+/// with nothing signalable ([`persisted_group`] is `None`) reads as gone.
+pub(super) fn probe_persisted(pgid: Option<i64>, boot: Option<&str>) -> Probe {
+    match persisted_group(pgid, boot) {
+        Some(pgid) => probe(pgid),
+        None => Probe::Gone,
+    }
+}
+
+/// How a group is brought down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Kill {
+    /// `SIGTERM`, a grace period, then `SIGKILL`.
+    Graceful,
+    /// As `Graceful`, but the leader is `SIGSTOP`ped first. An interactive bash
+    /// ignores `SIGTERM`: with its foreground child killed it would go on to run
+    /// the *next* command of the job during the grace. Stopped, it can't.
+    GracefulStopLeader,
+    /// `SIGKILL` at once — for a runaway job (output past the live log cap) whose
+    /// every further millisecond is more disk.
+    Immediate,
+}
+
+/// The end state of an [`escalate`].
+#[derive(Debug)]
+pub(super) enum Escalation {
+    Gone,
+    Survived,
+    Unknown(io::Error),
+}
+
+/// Bring a process group down, and report what a final probe sees. Success is the
+/// group gone, never "the leader exited".
+pub(super) async fn escalate(pgid: ProcessGroupId, how: Kill) -> Escalation {
+    match probe(pgid) {
+        Probe::Gone => return Escalation::Gone,
+        Probe::Unknown(error) => return Escalation::Unknown(error),
+        Probe::Alive => {}
+    }
+    if how == Kill::GracefulStopLeader {
+        // Best effort: a leader already gone leaves only members to TERM.
+        let _ = send(pgid.get(), libc::SIGSTOP);
+    }
+    if how != Kill::Immediate {
+        match signal_group(pgid, libc::SIGTERM) {
+            Probe::Gone => return Escalation::Gone,
+            Probe::Unknown(error) => return Escalation::Unknown(error),
+            Probe::Alive => {}
+        }
+        if gone_within(pgid, KILL_GRACE).await {
+            return Escalation::Gone;
+        }
+    }
+    match signal_group(pgid, libc::SIGKILL) {
+        Probe::Gone => return Escalation::Gone,
+        Probe::Unknown(error) => return Escalation::Unknown(error),
+        Probe::Alive => {}
+    }
+    if gone_within(pgid, REAP_WAIT).await {
+        return Escalation::Gone;
+    }
+    match probe(pgid) {
+        Probe::Gone => Escalation::Gone,
+        Probe::Alive => Escalation::Survived,
+        Probe::Unknown(error) => Escalation::Unknown(error),
+    }
+}
+
+/// Poll until the group is gone or `within` elapses. An unknown probe is not gone.
+async fn gone_within(pgid: ProcessGroupId, within: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        if matches!(probe(pgid), Probe::Gone) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(PROBE_EVERY).await;
+    }
+}
+
+/// What a kill decided. Rendered by its callers — `job(action="kill")` and
+/// `mcp-ssh job kill` — never formatted here.
 #[derive(Debug)]
 pub(crate) enum KillOutcome {
-    /// No row with that id.
+    /// No job with that id.
     Unknown,
-    /// The row already holds a terminal state, so there is nothing to signal. The
-    /// status word is kept verbatim: a corrupt one is shown, not hidden.
+    /// The job already finished and nothing of its group is left. The status word
+    /// is kept verbatim.
     NotRunning { status: String },
-    /// The row records no process group — it predates pgid tracking, or the OS
-    /// withheld the pid. Nothing to signal, and no pgid may be guessed.
+    /// No process group is recorded (the OS withheld the pid, or a row predating
+    /// pgid tracking). Nothing to signal, and no pgid may be guessed.
     NoProcessGroup,
-    /// The persisted pgid is one no real job could have written (outside `u32`,
-    /// which a raw cast would wrap onto a real but wrong group, or `0`, which is
-    /// *this* process's own group). Refused, not signalled.
+    /// The persisted pgid is one no real job could have written (outside
+    /// `2..=i32::MAX`; `0` and `-1` would hit this process's group or everything we
+    /// may signal). Refused, not signalled.
     CorruptProcessGroup { pgid: i64 },
-    /// The group is gone, and the row records the kill.
+    /// The job was running and its group is gone; recorded `failed`.
     Killed,
-    /// The group outlived `TERM`→`KILL`, so the row is left `running` rather than
-    /// claim a kill that didn't happen.
+    /// The job had finished, but processes it left behind (`server &`) were still
+    /// in its group; they are gone now.
+    KilledLeftovers,
+    /// The group outlived `TERM`→`KILL`; nothing is recorded.
     Survived { pgid: ProcessGroupId },
+    /// The group could not be probed or signalled (an unexpected errno): no claim
+    /// either way, nothing recorded.
+    NotSignalled { error: io::Error },
 }
 
-/// Kill a job from its persisted row — the shared semantics for every caller that
-/// holds no in-process [`Job`]: the engine, for a job whose group outlived the
-/// process that started it, and the `mcp-ssh job kill` CLI, which never tracks
-/// one. Each job leads its own process group, so a persisted pgid stays
-/// signalable across a restart.
-///
-/// Only a row that still reads `running` is signalled, and only through
-/// [`ProcessGroupId::from_persisted`], the single gate that keeps a corrupt pgid
-/// from becoming a signal target. The `failed` transition is recorded — with
-/// `reason` in the `error` column — only once the group is actually gone, and
-/// only while the row still reads `running`: a real exit written meanwhile by the
-/// server that owns the job wins over ours. That write is best effort, since the
-/// kill has already happened by then — a failure is logged, not returned.
+/// Kill a job this process tracks. A running job's group is escalated (its
+/// `reason` becomes the job's final error once the waiter sees it die); a finished
+/// one is probed for leftovers and those are killed.
+pub(super) async fn kill_job(job: &Job, reason: &'static str) -> KillOutcome {
+    let state = job.state.lock().await.clone();
+    let Some(pgid) = job.pgid else {
+        return match state {
+            JobState::Running => KillOutcome::NoProcessGroup,
+            finished => KillOutcome::NotRunning {
+                status: status_word(&finished).to_string(),
+            },
+        };
+    };
+    let how = if job.interactive {
+        Kill::GracefulStopLeader
+    } else {
+        Kill::Graceful
+    };
+    match state {
+        JobState::Running => {
+            // First reason wins: a cap breach already recorded stays the cause.
+            let _ = job.kill_reason.set(reason.to_string());
+            running_outcome(escalate(pgid, how).await, pgid)
+        }
+        finished => leftovers(pgid, how, status_word(&finished)).await,
+    }
+}
+
+/// Kill a job from its persisted row — for every caller that holds no in-process
+/// [`Job`]. Only [`persisted_group`] turns a row into a signal target. The
+/// `failed` transition (with `reason` in the `error` column) is written only once
+/// the group is gone and only while the row still reads `running`, so a real exit
+/// recorded meanwhile wins. That write is best effort — the kill has happened.
 pub(crate) async fn kill_persisted(
     repo: &JobRepo,
     id: &JobId,
@@ -92,111 +246,83 @@ pub(crate) async fn kill_persisted(
     let Some(target) = repo.kill_target(id).await? else {
         return Ok(KillOutcome::Unknown);
     };
-    if target.status != JobStatus::Running.as_str() {
-        return Ok(KillOutcome::NotRunning {
-            status: target.status,
+    let running = target.status == JobStatus::Running.as_str();
+    let Some(raw) = target.pgid else {
+        return Ok(if running {
+            KillOutcome::NoProcessGroup
+        } else {
+            KillOutcome::NotRunning {
+                status: target.status,
+            }
+        });
+    };
+    if ProcessGroupId::from_persisted(raw).is_none() {
+        return Ok(if running {
+            KillOutcome::CorruptProcessGroup { pgid: raw }
+        } else {
+            KillOutcome::NotRunning {
+                status: target.status,
+            }
         });
     }
-    let Some(pgid) = target.pgid else {
-        return Ok(KillOutcome::NoProcessGroup);
-    };
-    let Some(group) = ProcessGroupId::from_persisted(pgid) else {
-        return Ok(KillOutcome::CorruptProcessGroup { pgid });
-    };
-    if !kill_group(group).await {
-        return Ok(KillOutcome::Survived { pgid: group });
+    let group = persisted_group(Some(raw), target.boot_id.as_deref());
+    if !running {
+        return Ok(match group {
+            Some(pgid) => leftovers(pgid, Kill::Graceful, &target.status).await,
+            None => KillOutcome::NotRunning {
+                status: target.status,
+            },
+        });
     }
-    if let Err(error) = repo.mark_killed(id, reason).await {
+    // A running row from a previous boot: its group cannot exist any more.
+    let outcome = match group {
+        Some(pgid) => running_outcome(escalate(pgid, Kill::Graceful).await, pgid),
+        None => KillOutcome::Killed,
+    };
+    if matches!(outcome, KillOutcome::Killed)
+        && let Err(error) = repo.mark_killed(id, reason).await
+    {
         tracing::warn!(%error, id = %id, "failed to record killed job");
     }
-    Ok(KillOutcome::Killed)
+    Ok(outcome)
 }
 
-/// Kill a process group by raw pgid. `SIGTERM`, then `SIGKILL` if the group
-/// outlives a short grace. Returns whether the group is gone afterwards. Liveness
-/// is probed with `kill -0` rather than a completion flag — the group's real
-/// parent (the server, or init after a restart) reaps the exited process, so no
-/// zombie lingers to read as alive.
-pub(super) async fn kill_group(pgid: ProcessGroupId) -> bool {
-    if !group_alive(pgid).await {
-        return true; // nothing to signal — already gone
-    }
-    let _ = signal_group(pgid, "TERM").await;
-    let start = tokio::time::Instant::now();
-    while start.elapsed() < KILL_GRACE {
-        if !group_alive(pgid).await {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    if group_alive(pgid).await {
-        let _ = signal_group(pgid, "KILL").await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    !group_alive(pgid).await
-}
-
-/// True if process group `pgid` still has at least one member. `kill -0` delivers
-/// no signal, only checks deliverability; stdio is discarded so a "No such
-/// process" line never reaches the terminal. Shared with the startup reconcile in
-/// `super` and the reaper's log-compaction gate, which both need the same "did
-/// this group outlive the restart?" answer.
-pub(super) async fn group_alive(pgid: ProcessGroupId) -> bool {
-    tokio::process::Command::new("kill")
-        .arg("-0")
-        .arg("--")
-        .arg(format!("-{}", pgid.get()))
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-/// Send `signal` (`"TERM"`, `"KILL"`, …) to process group `pgid`. The negative
-/// pid targets the whole group so descendants die too, not just `sh`; `--` stops
-/// `kill` reading it as an option. Returns whether the signal was delivered.
-/// ponytail: pid reuse is a non-issue here.
-async fn signal_group(pgid: ProcessGroupId, signal: &str) -> bool {
-    match tokio::process::Command::new("kill")
-        .arg(format!("-{signal}"))
-        .arg("--")
-        .arg(format!("-{}", pgid.get()))
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await
-    {
-        Ok(status) => status.success(),
-        Err(error) => {
-            tracing::warn!(%error, pgid = pgid.get(), signal, "failed to signal process group");
-            false
-        }
+fn running_outcome(escalation: Escalation, pgid: ProcessGroupId) -> KillOutcome {
+    match escalation {
+        Escalation::Gone => KillOutcome::Killed,
+        Escalation::Survived => KillOutcome::Survived { pgid },
+        Escalation::Unknown(error) => KillOutcome::NotSignalled { error },
     }
 }
 
-/// Wait up to `grace` for the job to exit, watching its completion flag rather
-/// than polling. Returns true if it exited in time, false if the grace elapsed.
-async fn exited_within(mut done: watch::Receiver<bool>, grace: Duration) -> bool {
-    // The waiter flips the flag to true exactly once, on exit. A receiver error
-    // means the sender dropped, which only happens after that same exit.
-    tokio::time::timeout(grace, done.wait_for(|&exited| exited))
-        .await
-        .is_ok()
+/// A finished job: kill whatever its group still holds.
+async fn leftovers(pgid: ProcessGroupId, how: Kill, status: &str) -> KillOutcome {
+    match probe(pgid) {
+        Probe::Gone => KillOutcome::NotRunning {
+            status: status.to_string(),
+        },
+        Probe::Unknown(error) => KillOutcome::NotSignalled { error },
+        Probe::Alive => match escalate(pgid, how).await {
+            Escalation::Gone => KillOutcome::KilledLeftovers,
+            Escalation::Survived => KillOutcome::Survived { pgid },
+            Escalation::Unknown(error) => KillOutcome::NotSignalled { error },
+        },
+    }
+}
+
+fn status_word(state: &JobState) -> &'static str {
+    match state {
+        JobState::Running => JobStatus::Running.as_str(),
+        JobState::Exited { .. } => JobStatus::Exited.as_str(),
+        JobState::Failed { .. } => JobStatus::Failed.as_str(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::Db;
-    use std::path::PathBuf;
-    use std::sync::Arc;
-    use tokio::sync::Mutex;
 
-    /// A repository over a fresh in-memory DB, plus the raw handle the tests use to
-    /// plant rows the typed API can't produce (legacy or corrupt ones) and to read
-    /// columns back.
     fn repo() -> (JobRepo, Db) {
         let db = Db::memory();
         (JobRepo::new(db.clone()), db)
@@ -225,60 +351,110 @@ mod tests {
         .unwrap()
     }
 
-    /// The kill under test, with the engine's reason unless the test cares.
     async fn kill(repo: &JobRepo, id: &str) -> KillOutcome {
         kill_persisted(repo, &JobId::from(id), "killed")
             .await
             .unwrap()
     }
 
-    /// The decision table both kill callers now share: every row that must not be
-    /// signalled is refused with its own reason and left exactly as it was.
+    /// A detached group like a real job's: its leader leads it (pgid == pid) and
+    /// is reaped in the background, as the server or init would.
+    fn spawn_group(script: &str) -> (ProcessGroupId, tokio::task::JoinHandle<()>) {
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = ProcessGroupId::new(child.id().unwrap()).unwrap();
+        let waiter = tokio::spawn(async move {
+            let _ = child.wait().await;
+        });
+        (pgid, waiter)
+    }
+
+    /// errno → `Probe`: an error is never "gone". Signal 0 delivers nothing.
+    #[test]
+    fn errno_maps_onto_probe_without_reading_failure_as_gone() {
+        // pid 1 exists; as non-root that's EPERM — alive, not ours. As root, 0.
+        assert!(matches!(send(1, 0), Probe::Alive));
+        // Above any pid_max: ESRCH.
+        assert!(matches!(send(-2_000_000_000, 0), Probe::Gone));
+        // An invalid signal is EINVAL: unknown, not gone and not alive.
+        let me = libc::pid_t::try_from(std::process::id()).unwrap();
+        assert!(matches!(send(me, 9999), Probe::Unknown(_)));
+    }
+
+    /// The invariant the type carries: no corrupt persisted pgid becomes a signal
+    /// target. `0` would hit this process's own group, `1` (`kill -1`) every
+    /// process we may signal, and anything past `i32` wraps onto a wrong group.
+    #[test]
+    fn corrupt_persisted_pgids_never_become_a_signal_target() {
+        for corrupt in [0, 1, -1, i64::from(i32::MAX) + 1, i64::from(u32::MAX) + 1] {
+            assert!(
+                ProcessGroupId::from_persisted(corrupt).is_none(),
+                "pgid {corrupt} must not be signalable"
+            );
+        }
+        assert!(ProcessGroupId::from_persisted(1234).is_some());
+        assert!(ProcessGroupId::new(1).is_none());
+    }
+
+    #[test]
+    fn a_pgid_from_another_boot_is_never_signalled() {
+        let Some(now) = current_boot_id() else {
+            return; // no boot id on this kernel: every row is probed
+        };
+        assert!(persisted_group(Some(4242), Some(now)).is_some());
+        assert!(persisted_group(Some(4242), None).is_some(), "legacy row");
+        assert!(persisted_group(Some(4242), Some("another-boot")).is_none());
+        assert!(matches!(
+            probe_persisted(Some(4242), Some("another-boot")),
+            Probe::Gone
+        ));
+    }
+
     #[tokio::test]
     async fn unsignalable_rows_are_refused_and_left_untouched() {
         let (repo, db) = repo();
-        plant(&db, "done", "exited", Some(1234)).await;
+        plant(&db, "done", "exited", Some(2_000_000_000)).await;
         plant(&db, "legacy", "running", None).await;
         plant(&db, "zero", "running", Some(0)).await;
+        plant(&db, "one", "running", Some(1)).await;
         plant(&db, "wrapped", "running", Some(i64::from(u32::MAX) + 1)).await;
 
         assert!(matches!(kill(&repo, "ghost").await, KillOutcome::Unknown));
         assert!(
             matches!(kill(&repo, "done").await, KillOutcome::NotRunning { status } if status == "exited"),
-            "a finished row is never signalled"
+            "a finished row whose group is gone is not signalled"
         );
         assert!(matches!(
             kill(&repo, "legacy").await,
             KillOutcome::NoProcessGroup
         ));
-        // `0` is the dangerous one: `kill -- -0` would signal *this* process's own
-        // group, so this test is its own canary — a regression kills the runner.
-        assert!(matches!(
-            kill(&repo, "zero").await,
-            KillOutcome::CorruptProcessGroup { pgid: 0 }
-        ));
+        // `0` is the dangerous one: it would signal *this* process's own group, so
+        // this test is its own canary — a regression kills the runner.
+        for (id, pgid) in [("zero", 0), ("one", 1)] {
+            assert!(
+                matches!(kill(&repo, id).await, KillOutcome::CorruptProcessGroup { pgid: p } if p == pgid)
+            );
+        }
         assert!(matches!(
             kill(&repo, "wrapped").await,
             KillOutcome::CorruptProcessGroup { .. }
         ));
-
-        for id in ["legacy", "zero", "wrapped"] {
-            assert_eq!(
-                status_of(&db, id).await.as_deref(),
-                Some("running"),
-                "a refused kill must not record a kill that never happened: {id}"
-            );
+        for id in ["legacy", "zero", "one", "wrapped"] {
+            assert_eq!(status_of(&db, id).await.as_deref(), Some("running"), "{id}");
         }
         assert_eq!(status_of(&db, "done").await.as_deref(), Some("exited"));
     }
 
-    /// The recorded transition carries the caller's reason verbatim — that column is
-    /// how `mcp-ssh jobs` tells a CLI kill from the server's own.
     #[tokio::test]
     async fn a_gone_group_is_recorded_failed_with_the_caller_s_reason() {
         let (repo, db) = repo();
-        // A pgid with no live members: `kill_group` reports it already gone, which is
-        // the same "the group is dead" answer a real signal ends at.
         plant(&db, "gone", "running", Some(2_000_000_000)).await;
 
         let outcome = kill_persisted(&repo, &JobId::from("gone"), "killed via mcp-ssh kill")
@@ -300,88 +476,71 @@ mod tests {
         assert_eq!(row.1.as_deref(), Some("killed via mcp-ssh kill"));
     }
 
-    #[cfg(unix)]
     #[tokio::test]
-    async fn kill_group_terminates_a_detached_group() {
-        use std::process::Stdio;
-        // Leader of its own group (pgid == pid), like a real job's shell.
-        let mut child = tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg("sleep 300")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .process_group(0)
-            .spawn()
-            .unwrap();
-        let pid = ProcessGroupId::new(child.id().expect("child pid")).expect("nonzero pid");
-        // Reap in the background so the signalled child leaves no zombie — mirrors
-        // the real parent (server/init) reaping it, which is what `group_alive`
-        // assumes.
-        let waiter = tokio::spawn(async move { child.wait().await });
+    async fn escalate_terminates_a_detached_group() {
+        let (pgid, waiter) = spawn_group("sleep 300");
+        assert!(matches!(
+            escalate(pgid, Kill::Graceful).await,
+            Escalation::Gone
+        ));
+        let _ = tokio::time::timeout(Duration::from_secs(2), waiter).await;
+    }
 
+    #[tokio::test]
+    async fn escalate_on_a_dead_pgid_reports_gone() {
+        let dead = ProcessGroupId::from_persisted(2_000_000_000).unwrap();
+        assert!(matches!(
+            escalate(dead, Kill::Graceful).await,
+            Escalation::Gone
+        ));
+    }
+
+    /// K3: a TERM-ignoring descendant keeps the group alive after the leader dies;
+    /// success is the group gone, so the KILL must still reach it.
+    #[tokio::test]
+    async fn escalate_reaches_a_term_ignoring_descendant() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        let (pgid, waiter) = spawn_group(&format!(
+            "(trap '' TERM; sleep 300) & echo $! > '{}'; wait",
+            pidfile.display()
+        ));
+        let descendant = loop {
+            if let Ok(text) = std::fs::read_to_string(&pidfile)
+                && let Ok(pid) = text.trim().parse::<libc::pid_t>()
+            {
+                break pid;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert!(matches!(
+            escalate(pgid, Kill::Graceful).await,
+            Escalation::Gone
+        ));
         assert!(
-            kill_group(pid).await,
-            "group should be gone after kill_group"
+            matches!(send(descendant, 0), Probe::Gone),
+            "descendant reaped"
         );
         let _ = tokio::time::timeout(Duration::from_secs(2), waiter).await;
     }
 
-    #[cfg(unix)]
+    /// K4: a finished row whose group still holds a process (`server &`) kills the
+    /// leftovers rather than answering "not running".
     #[tokio::test]
-    async fn kill_group_on_dead_pgid_reports_gone() {
-        // A pgid with no live members must read as already-gone, not hang.
-        let dead = ProcessGroupId::new(2_000_000_000).expect("nonzero pgid");
-        assert!(kill_group(dead).await);
-    }
-
-    /// The invariant the type carries: no corrupt persisted pgid can become a
-    /// signal target. `0` is the dangerous one — `kill -- -0` hits *this* process's
-    /// group, i.e. the server — so it must never survive into a `ProcessGroupId`.
-    #[test]
-    fn corrupt_persisted_pgids_never_become_a_signal_target() {
-        for corrupt in [0, -1, i64::from(u32::MAX) + 1] {
-            assert!(
-                ProcessGroupId::from_persisted(corrupt).is_none(),
-                "pgid {corrupt} must not be signalable"
-            );
-        }
-        assert!(ProcessGroupId::from_persisted(1234).is_some());
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn kill_job_reports_a_group_gone_before_term_as_killed() {
-        use std::process::Stdio;
-        // The race `kill_job` guards: the group exits between the state check and
-        // the `TERM`. Reproduced deterministically by killing and reaping the group
-        // first, then killing a job whose state still reads `Running` — exactly the
-        // window between the waiter reaping the child and recording its exit.
-        let mut child = tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg("sleep 300")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .process_group(0)
-            .spawn()
-            .unwrap();
-        let pgid = ProcessGroupId::new(child.id().expect("child pid")).expect("nonzero pid");
-        let waiter = tokio::spawn(async move { child.wait().await });
-        assert!(kill_group(pgid).await, "group should be gone after kill");
-        let _ = tokio::time::timeout(Duration::from_secs(2), waiter).await;
-
-        let (_tx, rx) = watch::channel(false);
-        let job = Arc::new(Job {
-            pgid: Some(pgid),
-            state: Arc::new(Mutex::new(JobState::Running)),
-            done: rx,
-            log_path: PathBuf::from("unused.log"),
-        });
-
-        assert!(
-            kill_job(&job).await,
-            "a group already gone must report killed, not a kill failure"
+    async fn a_finished_row_with_live_leftovers_kills_them() {
+        let (pgid, waiter) = spawn_group("sleep 300");
+        let (repo, db) = repo();
+        plant(&db, "left", "exited", Some(i64::from(pgid.get()))).await;
+        assert!(matches!(
+            kill(&repo, "left").await,
+            KillOutcome::KilledLeftovers
+        ));
+        assert!(matches!(probe(pgid), Probe::Gone));
+        assert_eq!(
+            status_of(&db, "left").await.as_deref(),
+            Some("exited"),
+            "the job's own exit stays its final state"
         );
+        let _ = tokio::time::timeout(Duration::from_secs(2), waiter).await;
     }
 }
