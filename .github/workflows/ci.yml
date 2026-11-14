@@ -152,11 +152,13 @@ jobs:
     needs: [fmt, check, audit, shellcheck]
     strategy:
       matrix:
+        # 22.04 (glibc 2.35): cargo-deb's `$auto` depends on the build host's
+        # glibc, so a 24.04 build (2.39) won't install on Debian 12 / Ubuntu 22.04.
         include:
           - arch: amd64
-            runner: ubuntu-24.04
+            runner: ubuntu-22.04
           - arch: arm64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-22.04-arm
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     steps:
