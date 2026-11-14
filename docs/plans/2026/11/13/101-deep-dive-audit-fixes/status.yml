@@ -1,36 +1,45 @@
 plan: 101-deep-dive-audit-fixes
 title: Deep-Dive Audit Fixes (all areas)
-status: not_started        # not_started | in_progress | blocked | complete | superseded
+status: complete           # not_started | in_progress | blocked | complete | superseded
 created_by: sebi
-worked_by: ""              # who is executing it; empty = unclaimed; executor fills with their git user.name
+worked_by: sebi            # who is executing it; empty = unclaimed; executor fills with their git user.name
 owner: sebi
-percent: 0                 # 0–100, overall completion
-current_focus: ""          # next: 01-bounded-output.md (server OOM on poll, reproduced end to end)
+percent: 100               # 0–100, overall completion
+current_focus: ""         # done; released as v2.0.0
 slices:
   - file: 01-bounded-output.md
-    status: not_started      # not_started | in_progress | complete
-    percent: 0
+    status: complete         # not_started | in_progress | complete
+    percent: 100
   - file: 02-kill-and-lifecycle.md
-    status: not_started
-    percent: 0
+    status: complete
+    percent: 100
   - file: 03-db-state.md
-    status: not_started
-    percent: 0
+    status: complete
+    percent: 100
   - file: 04-auth-oauth.md
-    status: not_started
-    percent: 0
+    status: complete
+    percent: 100
   - file: 05-file-tool.md
-    status: not_started
-    percent: 0
+    status: complete
+    percent: 100
   - file: 06-runtime-deploy.md
-    status: not_started
-    percent: 0
+    status: complete
+    percent: 100
   - file: 07-ci-dx.md
-    status: not_started
-    percent: 0
+    status: complete
+    percent: 100
   - file: 08-docs-structure.md
-    status: not_started
-    percent: 0
-evidence: []               # commits/PRs proving progress, e.g. ["#18", "abc1234"]
-notes: "Audit of main @ 109ac78: 4 area audits by reading + a live end-to-end run (bin/check green, 191 tests). Findings tagged [E2E]/[READ]/[PLAUS] in each slice. Owner decisions pending (see overview Risks): delete needs recursive=true, strict unknown job action + deny_unknown_fields, 24h reaper policy, atomic write, consent-page design, argon2 password-at-rest, ProtectSystem vs sudo, LOC-rule scope. Order: 03 before 04; 01 and 02 sequential (same files); 08 last. Harness from 07 steps 1-2 may land first. Supersedes any unfinished part of 2026/07/20/101-mcp-ssh-audit-fixes (its tracker is stale — see 08 X16)."
+    status: complete
+    percent: 100
+evidence: ["#61", "#62", "#63", "#68", "v2.0.0"]   # #61 (572dd85): slices 01–05 code; #62 (5db496b): 06–07 ops/CI/e2e; #63: 08 splits + module-map guard; #68: 08 docs + release notes
+notes: |
+  Owner decisions taken: delete of a non-empty dir needs recursive=true; unknown job action string -> error, deny_unknown_fields on all args; reaper ages from finish and never kills; atomic write; consent page; no argon2 (redacted Debug + parse-error scrub only); SHA-256 token hashing (one-time logout); 90-day refresh family; 256 MiB live log cap; ProtectSystem only in the lockdown drop-in; LOC rule = <=300 non-test LOC, tests in a sibling tests.rs.
+  Deferred (not fixed by 01–07; each needs its own change):
+  - Interactive job surviving a restart is killed from its persisted row without the leader SIGSTOP (kill_persisted always uses Kill::Graceful): needs an `interactive` column on jobs.
+  - A failed kill can leave the row reading killed: the kill_reason is set before the escalation, so a group that Survived/NotSignalled and later exits on its own is recorded "killed".
+  - Docker `ProtectSystem`/sudo interaction and UMask removal not verified on a live systemd box.
+  - The 256 MiB live log cap is enforced only while the job's leader runs; leftovers (`server &`) still writing after the leader exits are not capped.
+  - rmcp rejects malformed tool args (deny_unknown_fields, bad types) before dispatch, so those calls get no tool span and no outcome log line.
+  - A16 (cross-process stream close): bearers are validated per HTTP request only, so an SSE stream opened before a token expired or was revoked (`sessions --revoke` / `set-auth` run as another process) is not closed; new requests on it are refused. Unverified how long rmcp keeps such a stream.
+  - ProtectSystem-vs-sudo (06) and the unit's sudo self-management were reasoned from systemd semantics, not verified on a live box.
 last_updated: 2026-11-13
