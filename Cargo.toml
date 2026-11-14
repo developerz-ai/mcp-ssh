@@ -15,7 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 # MCP server + Streamable HTTP transport
-rmcp = { version = "3.8", features = [
+rmcp = { version = "3.9", features = [
     "server",
     "macros",
     "transport-streamable-http-server",

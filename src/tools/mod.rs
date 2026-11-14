@@ -5,7 +5,7 @@
 use rmcp::{
     ErrorData as McpError, ServerHandler,
     handler::server::{common::RequestId, router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo},
+    model::{CallToolResult, ContentBlock, ServerCapabilities, ServerConfig},
     tool, tool_handler, tool_router,
 };
 // `RequestId` above is rmcp's extractor for the per-call JSON-RPC request id.
@@ -203,8 +203,8 @@ impl Tools {
 
 #[tool_handler]
 impl ServerHandler for Tools {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "Remote shell + file access for one host. Three tools: `bash` runs a command \
              (auto-backgrounds slow ones, returning a job id); `job` (action=poll/list/kill) \
              monitors jobs with paginated output; `file` (action=read/write/append/delete/list/grep/move) \

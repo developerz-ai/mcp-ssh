@@ -20,7 +20,7 @@
 | Lang | Rust 2024, toolchain pinned to 1.100.0 (`rust-toolchain.toml` = `Cargo.toml` `rust-version` = Dockerfile base; bump together) |
 | Runtime | tokio |
 | HTTP | axum 0.8 |
-| MCP | rmcp 2.2 (Streamable HTTP server transport) |
+| MCP | rmcp 3.9 (Streamable HTTP server transport) |
 | Durable state | SQLite via `rusqlite` (`bundled` — compiled in, no system libsqlite). OAuth tokens (hashed) + clients + job metadata durable across restarts; schema versioned by `PRAGMA user_version` |
 | Errors | thiserror (domain) + anyhow (main boundary) |
 | Logging | tracing |
