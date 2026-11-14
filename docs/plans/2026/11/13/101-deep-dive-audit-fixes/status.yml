@@ -1,0 +1,36 @@
+plan: 101-deep-dive-audit-fixes
+title: Deep-Dive Audit Fixes (all areas)
+status: not_started        # not_started | in_progress | blocked | complete | superseded
+created_by: sebi
+worked_by: ""              # who is executing it; empty = unclaimed; executor fills with their git user.name
+owner: sebi
+percent: 0                 # 0–100, overall completion
+current_focus: ""          # next: 01-bounded-output.md (server OOM on poll, reproduced end to end)
+slices:
+  - file: 01-bounded-output.md
+    status: not_started      # not_started | in_progress | complete
+    percent: 0
+  - file: 02-kill-and-lifecycle.md
+    status: not_started
+    percent: 0
+  - file: 03-db-state.md
+    status: not_started
+    percent: 0
+  - file: 04-auth-oauth.md
+    status: not_started
+    percent: 0
+  - file: 05-file-tool.md
+    status: not_started
+    percent: 0
+  - file: 06-runtime-deploy.md
+    status: not_started
+    percent: 0
+  - file: 07-ci-dx.md
+    status: not_started
+    percent: 0
+  - file: 08-docs-structure.md
+    status: not_started
+    percent: 0
+evidence: []               # commits/PRs proving progress, e.g. ["#18", "abc1234"]
+notes: "Audit of main @ 109ac78: 4 area audits by reading + a live end-to-end run (bin/check green, 191 tests). Findings tagged [E2E]/[READ]/[PLAUS] in each slice. Owner decisions pending (see overview Risks): delete needs recursive=true, strict unknown job action + deny_unknown_fields, 24h reaper policy, atomic write, consent-page design, argon2 password-at-rest, ProtectSystem vs sudo, LOC-rule scope. Order: 03 before 04; 01 and 02 sequential (same files); 08 last. Harness from 07 steps 1-2 may land first. Supersedes any unfinished part of 2026/07/20/101-mcp-ssh-audit-fixes (its tracker is stale — see 08 X16)."
+last_updated: 2026-11-13
