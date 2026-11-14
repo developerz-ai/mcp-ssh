@@ -23,7 +23,6 @@ env:
 # keeps them fresh). The Rust toolchain comes from rust-toolchain.toml.
 jobs:
   fmt:
-    # GitHub-hosted runner (org rule: private repos on Ubicloud, public on GitHub-hosted).
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

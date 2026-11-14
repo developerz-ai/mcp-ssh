@@ -179,6 +179,7 @@ Non-negotiable: SOLID, SRP, tested code. The bar: idiomatic, boring, readable Ru
 - Unit: pure logic (config validation, job pagination, path handling) under `#[cfg(test)]` — in the file, or its sibling `tests.rs` once that keeps the file under the LOC limit.
 - In-process: `src/app_tests.rs` drives the axum router (auth, host guard, OAuth, MCP JSON-RPC) with `tower::ServiceExt::oneshot`, no socket.
 - End-to-end: `tests/e2e/` (`bin/e2e`, also part of `bin/check` and CI) boots the real `mcp-ssh serve` binary per test on an ephemeral port with tempdir state and drives it over HTTP — one scenario per top audit finding.
+- Public tree: `tests/public_tree.rs` scans every tracked file (minus `.dz/`) for facts about our own infrastructure; a failure names the file, never the value.
 - Tested code is the default, not the exception. New behavior ships with the test that proves it. Never an unbounded writer (`yes`) in a test — use sparse files.
 
 ## Where to look
