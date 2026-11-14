@@ -4,6 +4,10 @@ All notable changes to mcp-ssh are recorded here. Format: [Keep a Changelog](htt
 
 Each release's notes live in their own file under [`docs/changelog/`](docs/changelog/); this page is the index, newest first. Not released yet: [`docs/changelog/unreleased.md`](docs/changelog/unreleased.md) ([diff since the last release][Unreleased]). A pull request with a user-visible change adds its line there.
 
+## [2.1.0] - 2026-11-14
+
+rmcp 3.9, and the follow-ups from the 2.0.0 audit: kills from a persisted row, the log cap on leftover processes, logging of refused tool calls, and open streams ending when their token is revoked. The database schema moves to version 6. [Release notes](docs/changelog/2.1.0.md).
+
 ## [2.0.0] - 2026-11-14
 
 A major release: the fixes from the deep-dive audit — bounded output, real kills, hashed tokens and a consent-page login, safe file ops. Several are deliberate behaviour changes; read **Upgrading** first. [Release notes](docs/changelog/2.0.0.md).
@@ -64,7 +68,8 @@ Opt-in interactive bash and a one-shot installer. [Release notes](docs/changelog
 
 First stable release: an MCP server giving an agent shell, file and job access to one host over authenticated Streamable HTTP. [Release notes](docs/changelog/1.0.0.md).
 
-[Unreleased]: https://github.com/developerz-ai/mcp-ssh/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/developerz-ai/mcp-ssh/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/developerz-ai/mcp-ssh/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/developerz-ai/mcp-ssh/compare/v1.4.0...v2.0.0
 [1.4.0]: https://github.com/developerz-ai/mcp-ssh/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/developerz-ai/mcp-ssh/compare/v1.2.4...v1.3.0
