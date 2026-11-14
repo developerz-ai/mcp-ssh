@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # one-command stop, run by developerz.ai when a session ends — established by the developerz.ai maintainer agent for the maintainers of this repository. One command; adjust as the repo grows.
-# Stops only the server bin/dev started (pid in .local/dev.pid), never any other
+# Stops only the server bin/dev started (pid in apps/mcp-ssh/.local/dev.pid), never any other
 # `mcp-ssh serve` on the machine.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-PID_FILE=.local/dev.pid
+PID_FILE=apps/mcp-ssh/.local/dev.pid
 [ -f "$PID_FILE" ] || { echo "bin/dev is not running (no $PID_FILE)"; exit 0; }
 pid="$(cat "$PID_FILE")"
 rm -f "$PID_FILE"

@@ -6,7 +6,7 @@ mcp-ssh is **one binary**: an [rmcp](https://github.com/modelcontextprotocol/rus
 
 | Layer | Choice |
 |---|---|
-| Language | Rust 2024, toolchain pinned to 1.100.0 (`rust-toolchain.toml`) |
+| Language | Rust 2024, toolchain pinned to 1.100.0 (`apps/mcp-ssh/rust-toolchain.toml`) |
 | Async runtime | tokio |
 | HTTP server | axum 0.8 |
 | MCP transport | rmcp 3.9 — **Streamable HTTP** at `/mcp` |

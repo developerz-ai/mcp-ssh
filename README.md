@@ -39,7 +39,7 @@ Want to go further? Run `bash("claude -p 'fix the failing test and push'")` — 
 **One-liner (Debian/Ubuntu)** — downloads the latest release, asks for a username + password, installs the service, and starts it:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/developerz-ai/mcp-ssh/main/deploy/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/developerz-ai/mcp-ssh/main/apps/mcp-ssh/deploy/install.sh | sudo bash
 ```
 
 <details><summary>Or do it by hand</summary>
@@ -136,10 +136,10 @@ Treat it accordingly:
 
 | Method | How |
 |---|---|
-| **One-liner** | `curl -fsSL https://raw.githubusercontent.com/developerz-ai/mcp-ssh/main/deploy/install.sh \| sudo bash` — latest release, prompts for creds, installs + starts the service |
+| **One-liner** | `curl -fsSL https://raw.githubusercontent.com/developerz-ai/mcp-ssh/main/apps/mcp-ssh/deploy/install.sh \| sudo bash` — latest release, prompts for creds, installs + starts the service |
 | **Debian/Ubuntu** | download `mcp-ssh_*.deb` from [releases](https://github.com/developerz-ai/mcp-ssh/releases) → `sudo dpkg -i mcp-ssh_*.deb` |
 | **Docker** | pull the image and run it with a state volume and `MCP_SSH_ALLOWED_HOSTS` (see [docs/deploy.md](docs/deploy.md#-docker)) |
-| **From source** | `cargo build --release` → binary at `target/release/mcp-ssh` |
+| **From source** | `cargo build --release` in `apps/mcp-ssh/` → binary at the repo-root `target/release/mcp-ssh` |
 
 ## 📚 Docs
 
@@ -151,7 +151,7 @@ Treat it accordingly:
 | [docs/deploy.md](docs/deploy.md) | systemd, Caddy & nginx+certbot TLS, Docker, hardening |
 | [docs/prompts/system-prompt.md](docs/prompts/system-prompt.md) | Ready-to-paste system prompt for driving the server from a chat LLM |
 | [docs/prompts/skill.md](docs/prompts/skill.md) | Claude Code skill for autonomous server-side work |
-| [`.coderabbit.yaml`](.coderabbit.yaml) | CodeRabbit AI review config; install the [GitHub App](https://github.com/apps/coderabbitai) on the repo |
+| [`.coderabbit.yaml`](apps/mcp-ssh/.coderabbit.yaml) | CodeRabbit AI review config; install the [GitHub App](https://github.com/apps/coderabbitai) on the repo |
 
 ## 🧬 Stack
 

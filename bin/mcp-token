@@ -9,7 +9,7 @@
 #   claude mcp add --transport http mcp-ssh http://localhost:1337/mcp \
 #     --header "Authorization: Bearer $(bin/mcp-token)"
 #
-# Credentials come from .env (MCP_SSH_USER/MCP_SSH_PASS) or the environment.
+# Credentials come from the app's .env (apps/mcp-ssh/.env; MCP_SSH_USER/MCP_SSH_PASS) or the environment.
 # The base URL defaults to the local bind; override with $MCP_SSH_URL.
 # The access token lasts 24h and survives server restarts (tokens are stored,
 # hashed, in the server's SQLite). Only the access token is printed — the 30-day
@@ -20,7 +20,13 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-if [ -f .env ]; then
+# The app's .env lives at apps/mcp-ssh/.env; older checkouts keep one at the repo root.
+if [ -f apps/mcp-ssh/.env ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . apps/mcp-ssh/.env
+  set +a
+elif [ -f .env ]; then
   set -a
   # shellcheck disable=SC1091
   . ./.env

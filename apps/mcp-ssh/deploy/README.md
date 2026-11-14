@@ -1,6 +1,6 @@
 # Deployment
 
-Full guide: [`docs/deploy.md`](../docs/deploy.md). This directory holds the files it references.
+Full guide: [`docs/deploy.md`](../../../docs/deploy.md). This directory holds the files it references.
 
 | File | What |
 |---|---|
@@ -30,7 +30,7 @@ sudo systemctl enable --now mcp-ssh
 
 - Config file: `/etc/mcp-ssh/config.toml`
 - Env overrides: `/etc/mcp-ssh/mcp-ssh.env` (read by the systemd unit via
-  `EnvironmentFile=`). See `.env.example` in the repo root and the env table in
+  `EnvironmentFile=`). See `apps/mcp-ssh/.env.example` and the env table in
   `docs/deploy.md` for the full list of `MCP_SSH_*` vars.
 
 ## TLS / reverse proxy

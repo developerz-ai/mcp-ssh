@@ -25,7 +25,7 @@
 
 | Concern | Choice |
 |---|---|
-| Lang | Rust 2024, toolchain pinned to 1.100.0 (`rust-toolchain.toml` = `Cargo.toml` `rust-version` = Dockerfile base; bump together) |
+| Lang | Rust 2024, toolchain pinned to 1.100.0 (`apps/mcp-ssh/rust-toolchain.toml` = `apps/mcp-ssh/Cargo.toml` `rust-version` = apps/mcp-ssh/Dockerfile base; bump together) |
 | Runtime | tokio |
 | HTTP | axum 0.8 |
 | MCP | rmcp 3.9 (Streamable HTTP server transport) |
@@ -42,21 +42,21 @@ Deps pinned to latest stable at implementation time.
 
 | Task | Command |
 |---|---|
-| First-time setup (`cargo build --locked`; seeds `.env` from `.env.example` if absent; activates the pre-commit hook) | `bin/setup` |
-| Full gate (fmt --check + clippy --locked --all-targets -D warnings + cargo test --locked; e2e + dev_scripts included) | `bin/check` |
-| Run locally (watch + reload, loads `.env`, state in `.local/`) | `bin/dev` |
-| Stop `bin/dev` (targets the pid in `.local/dev.pid` and its children only, args-checked — never a name-based hunt for `mcp-ssh serve`) | `bin/stop` |
+| First-time setup (`cargo build --locked`; seeds `apps/mcp-ssh/.env` from `apps/mcp-ssh/.env.example` if absent; activates the pre-commit hook) | `bin/setup` |
+| Full gate (fmt --check + clippy --locked --all-targets -D warnings + cargo test --locked; unit + in-process tests; `tests/` (e2e, dev_scripts) stays at the root pending its own move and is not compiled yet) | `bin/check` |
+| Run locally (watch + reload, loads `.env`, state in `apps/mcp-ssh/.local/`) | `bin/dev` |
+| Stop `bin/dev` (targets the pid in `apps/mcp-ssh/.local/dev.pid` and its children only, args-checked — never a name-based hunt for `mcp-ssh serve`) | `bin/stop` |
 | End-to-end suite only (real binary over HTTP, `--test-threads=1`) | `bin/e2e` |
 | Mint a bearer for a headless client (OAuth PKCE, creds from `.env`) | `bin/mcp-token` |
 | Build / test / single test / format + lint | `cargo build` / `cargo test` / `cargo test <pattern>` / `cargo fmt && cargo clippy` |
 | Run the binary | `cargo run -- serve` |
 
 `.githooks/pre-commit` (activated by `bin/setup`) runs `bin/check` on every commit.
-Secrets and local config: copy `.env.example` → `.env`; `.env` is gitignored.
+Secrets and local config: copy `apps/mcp-ssh/.env.example` → `apps/mcp-ssh/.env`; `.env` is gitignored.
 
 ## Module map
 
-Keep this accurate — it's the navigation aid. One row per non-test file (`tests/module_map.rs` enforces it); extracted tests (`tests.rs`, `*_tests.rs`) need no row.
+Keep this accurate — it's the navigation aid. Paths below are relative to the app root (`apps/mcp-ssh/`), not the repo root. One row per non-test file (`tests/module_map.rs` enforces it); extracted tests (`tests.rs`, `*_tests.rs`) need no row.
 
 | Module | Owns |
 |---|---|
@@ -170,7 +170,7 @@ The bar: idiomatic, boring, readable Rust — SOLID, SRP, tested code; no spaghe
 
 - Unit: pure logic (config validation, job pagination, path handling) under `#[cfg(test)]` — in the file, or a sibling `tests.rs` once that keeps the file under the LOC limit.
 - In-process: `src/app_tests.rs` drives the axum router (auth, host guard, OAuth, MCP JSON-RPC) with `tower::ServiceExt::oneshot`, no socket.
-- End-to-end: `tests/e2e/` (`bin/e2e`, also part of `bin/check` and CI) boots the real `mcp-ssh serve` binary per test on an ephemeral port with tempdir state, driven over HTTP — one scenario per top audit finding.
+- End-to-end: `tests/e2e/` (`bin/e2e`) boots the real `mcp-ssh serve` binary per test on an ephemeral port with tempdir state, driven over HTTP — one scenario per top audit finding. `tests/` stays at the repo root pending its own move: until then `cargo test` compiles unit + in-process tests only.
 - Public tree: `tests/public_tree.rs` scans every tracked file (minus `.dz/`) for facts about our own infrastructure; a failure names the file, never the value.
 - Tested code is the default, not the exception. New behavior ships with the test that proves it. Never an unbounded writer (`yes`) in a test — use sparse files.
 

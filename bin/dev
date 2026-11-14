@@ -1,12 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+# The cargo package lives in apps/mcp-ssh.
+cd "$(dirname "$0")/../apps/mcp-ssh"
 
+# .env lives next to the app (see .env.example); older checkouts keep one at the repo root.
 if [ -f .env ]; then
   set -a
   # shellcheck disable=SC1091
   . ./.env
+  set +a
+elif [ -f ../../.env ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . ../../.env
   set +a
 fi
 

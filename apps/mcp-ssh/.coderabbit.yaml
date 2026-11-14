@@ -59,7 +59,7 @@ reviews:
         public behaviour.
 
     # Rust source — CLAUDE.md Conventions
-    - path: "src/**/*.rs"
+    - path: "apps/mcp-ssh/src/**/*.rs"
       instructions: |
         Enforce CLAUDE.md Conventions:
         - No unwrap/expect outside main.rs and #[cfg(test)]; panic in the
@@ -75,32 +75,32 @@ reviews:
           clean is the floor.
 
     # Auth + OAuth — security review required
-    - path: "src/auth.rs"
+    - path: "apps/mcp-ssh/src/auth.rs"
       instructions: |
         SECURITY REVIEW. Bearer-only guard on /mcp; Basic auth is only
         permitted inside /authorize (the OAuth login page). Never log/return
         the password or token. Flag any path that bypasses or weakens auth.
-    - path: "src/oauth/**"
+    - path: "apps/mcp-ssh/src/oauth/**"
       instructions: |
         SECURITY REVIEW. OAuth 2.1: discovery, dynamic registration, PKCE on
         authorize+token, bearer validation. No token material in logs/errors.
 
     # Config — fail fast, secrets
-    - path: "src/config.rs"
+    - path: "apps/mcp-ssh/src/config.rs"
       instructions: |
         Validated at boot — missing auth creds fail at startup, never at
         request time. MCP_SSH_ALLOWED_HOSTS must be required. Secrets never
         logged.
 
     # Tools — constant 3-tool surface
-    - path: "src/tools/**"
+    - path: "apps/mcp-ssh/src/tools/**"
       instructions: |
         Exactly 3 tools (bash/job/file) dispatching on action. NEW capability
         = a new param/action, never a 4th tool. Thin adapters — no business
         logic in the dispatch arm.
 
     # Jobs — backgrounding, log pagination, process-group kill
-    - path: "src/jobs/**"
+    - path: "apps/mcp-ssh/src/jobs/**"
       instructions: |
         Output streams to a per-job log file; poll paginates (cursor/limit)
         so chatty commands never flood agent context. Jobs spawn in their own
@@ -108,7 +108,7 @@ reviews:
         Reaper drops jobs >24h, killing any still-Running group first.
 
     # Tests — colocated in src/**/*.rs via #[cfg(test)] mod blocks
-    - path: "src/**/*.rs"
+    - path: "apps/mcp-ssh/src/**/*.rs"
       instructions: |
         Tests colocated in #[cfg(test)] mod blocks. New behaviour ships with
         the test that proves it.
@@ -120,7 +120,7 @@ reviews:
         Required jobs: fmt, clippy (-D warnings), test.
 
     # Dockerfile
-    - path: "Dockerfile"
+    - path: "apps/mcp-ssh/Dockerfile"
       instructions: |
         Multi-stage build. Non-root user — never run as root. No build
         secrets baked in.

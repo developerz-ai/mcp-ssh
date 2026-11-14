@@ -3,31 +3,35 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# The cargo package (and its .env) lives in apps/mcp-ssh.
+APP=apps/mcp-ssh
+
 if ! command -v cargo >/dev/null 2>&1; then
   echo "error: cargo not found. Install Rust from https://rustup.rs" >&2
   exit 1
 fi
 
 # Fresh checkout: seed .env from the example — never overwrite real credentials.
-if [ -f .env ]; then
+# Either location counts as present: the app's .env, or a pre-move repo-root one.
+if [ -f "$APP/.env" ] || [ -f .env ]; then
   echo ".env already present — left untouched"
 else
-  cp .env.example .env
-  chmod 600 .env
-  echo "seeded .env from .env.example (mode 600) — edit MCP_SSH_USER/MCP_SSH_PASS before serving"
+  cp "$APP/.env.example" "$APP/.env"
+  chmod 600 "$APP/.env"
+  echo "seeded $APP/.env from $APP/.env.example (mode 600) — edit MCP_SSH_USER/MCP_SSH_PASS before serving"
 fi
 
 # One pre-commit gate: .githooks/pre-commit runs bin/check.
 git config core.hooksPath .githooks
 
-cargo build --locked
+(cd "$APP" && cargo build --locked)
 
 cat <<'MSG'
 
 Build complete. Pre-commit hook active (.githooks/pre-commit → bin/check).
 
 Next steps:
-  bin/dev                # run the server locally (state in .local/)
+  bin/dev                # run the server locally (state in apps/mcp-ssh/.local/)
   bin/stop               # stop it
   bin/check              # run the fmt/clippy/test gate
   bin/e2e                # boot the real binary and drive it over HTTP

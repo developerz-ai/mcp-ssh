@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+# The cargo package, its rust-toolchain.toml and rustfmt.toml live in apps/mcp-ssh;
+# cargo resolves the workspace lock (Cargo.lock) at the repo root.
+cd "$(dirname "$0")/../apps/mcp-ssh"
 
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings

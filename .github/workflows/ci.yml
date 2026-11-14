@@ -28,7 +28,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install
+        working-directory: apps/mcp-ssh
       - run: cargo fmt --check
+        working-directory: apps/mcp-ssh
 
   check:
     runs-on: ubuntu-latest
@@ -36,10 +38,14 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install
+        working-directory: apps/mcp-ssh
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo clippy --locked --all-targets -- -D warnings
-      # Includes tests/e2e/: boots the real binary and drives it over HTTP.
+        working-directory: apps/mcp-ssh
+      # tests/ stays at the repo root pending its own move — outside the cargo
+      # package, so not compiled here.
       - run: cargo test --locked
+        working-directory: apps/mcp-ssh
 
   audit:
     runs-on: ubuntu-latest
@@ -58,7 +64,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # The installer runs as root via `curl | sudo bash`.
       - run: >-
-          shellcheck bin/* deploy/install.sh deploy/debian/postinst
+          shellcheck bin/* apps/mcp-ssh/deploy/install.sh apps/mcp-ssh/deploy/debian/postinst
           .githooks/pre-commit .claude/hooks/*.sh .github/scripts/*.sh
 
   version:
@@ -69,7 +75,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Tag matches Cargo.toml version
         run: |
-          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' apps/mcp-ssh/Cargo.toml | head -n1)"
           if [ "v$version" != "$GITHUB_REF_NAME" ]; then
             echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version v$version"
             exit 1
@@ -100,7 +106,7 @@ jobs:
       - name: Build (local)
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
-          context: .
+          context: apps/mcp-ssh
           load: true
           tags: mcp-ssh:smoke
           cache-from: type=gha,scope=${{ matrix.arch }}
@@ -132,7 +138,7 @@ jobs:
         id: push
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
-          context: .
+          context: apps/mcp-ssh
           platforms: linux/${{ matrix.arch }}
           labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
@@ -168,11 +174,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install
+        working-directory: apps/mcp-ssh
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
         with:
           tool: cargo-deb
       - run: cargo deb --locked
+        working-directory: apps/mcp-ssh
       # Install into a clean Debian, then prove the packaged user, config dir and
       # binary work: serve as `mcp-ssh` (no systemd in the container) + smoke.
       - name: Smoke test

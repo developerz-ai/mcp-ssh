@@ -13,10 +13,10 @@ The login flow needs more than `/mcp` on the public origin: both the browser OAu
 Downloads the latest release for your arch (amd64 or arm64), verifies it against the release's `SHA256SUMS`, prompts for a username + password, asks which OS user to run as and the public hostname (validated; sets `MCP_SSH_ALLOWED_HOSTS` and `MCP_SSH_PUBLIC_URL`), writes the config + a systemd drop-in, and (re)starts the service:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/developerz-ai/mcp-ssh/main/deploy/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/developerz-ai/mcp-ssh/main/apps/mcp-ssh/deploy/install.sh | sudo bash
 ```
 
-Re-running it updates the binary, re-applies your answers and restarts the service so they take effect. Source: [`deploy/install.sh`](../deploy/install.sh).
+Re-running it updates the binary, re-applies your answers and restarts the service so they take effect. Source: [`deploy/install.sh`](../apps/mcp-ssh/deploy/install.sh).
 
 ### By hand
 
@@ -72,7 +72,7 @@ Discovery 404s behind your proxy ⇒ it isn't forwarding `/.well-known/*`, `/aut
 
 ## 🔧 systemd
 
-The packaged unit ([`deploy/mcp-ssh.service`](../deploy/mcp-ssh.service)) runs `mcp-ssh serve` as the dedicated `mcp-ssh` user. Notable settings:
+The packaged unit ([`deploy/mcp-ssh.service`](../apps/mcp-ssh/deploy/mcp-ssh.service)) runs `mcp-ssh serve` as the dedicated `mcp-ssh` user. Notable settings:
 
 - `StateDirectory=mcp-ssh` + `StateDirectoryMode=0700` — `/var/lib/mcp-ssh` is private to the service user, and the server creates the DB and job logs `0600` itself. There is deliberately no `UMask=`: agent commands (and their `sudo` children) inherit the service's umask, so a restrictive one would make files the agent writes elsewhere owner-only.
 - `KillMode=control-group` — stopping or restarting the service kills **every** process it started, background jobs included. Jobs do not outlive a restart.
@@ -195,7 +195,7 @@ sudo ln -s /etc/nginx/sites-available/mcp-ssh /etc/nginx/sites-enabled/
 sudo nginx -t && sudo systemctl reload nginx
 ```
 
-> `proxy_buffering off` and a long `proxy_read_timeout` keep streaming responses and long polls working. Full example: [`deploy/nginx-mcp-ssh.conf.example`](../deploy/nginx-mcp-ssh.conf.example).
+> `proxy_buffering off` and a long `proxy_read_timeout` keep streaming responses and long polls working. Full example: [`deploy/nginx-mcp-ssh.conf.example`](../apps/mcp-ssh/deploy/nginx-mcp-ssh.conf.example).
 
 ## 🐳 Docker
 
@@ -220,11 +220,11 @@ Then point Caddy/nginx at `127.0.0.1:1337` exactly as above. Note: inside a cont
 ## 🛠️ Build from source
 
 ```bash
-cargo build --release          # binary at target/release/mcp-ssh
-./target/release/mcp-ssh serve
+cd apps/mcp-ssh && cargo build --release   # binary lands at the repo-root target/release/mcp-ssh
+../target/release/mcp-ssh serve
 ```
 
-The toolchain is pinned in [`rust-toolchain.toml`](../rust-toolchain.toml) (Rust 1.100.0); `rustup` picks it up automatically. Releases are built with `--locked`.
+The toolchain is pinned in [`rust-toolchain.toml`](../apps/mcp-ssh/rust-toolchain.toml) (Rust 1.100.0); `rustup` picks it up automatically. Releases are built with `--locked`.
 
 ## ⚙️ Config & env
 

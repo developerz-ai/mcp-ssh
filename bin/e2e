@@ -3,5 +3,7 @@
 # with tempdir state and drives it over HTTP (tests/e2e/). bin/check runs it
 # too; this is the focused entry point.
 set -euo pipefail
-cd "$(dirname "$0")/.."
+# Run from the app dir so the rust-toolchain.toml pin applies.
+cd "$(dirname "$0")/../apps/mcp-ssh"
+# tests/ stays at the repo root until its own move, so --test e2e has no target until then.
 exec cargo test --locked --test e2e -- --test-threads=1 "$@"
