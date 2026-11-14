@@ -38,9 +38,13 @@ as tools in any chat.
 
    Leave **Advanced settings** (OAuth Client ID / Secret) empty — mcp-ssh supports
    dynamic client registration, so Claude provisions its own client.
-4. **Add**, then **log in.** Claude opens the OAuth 2.1 flow in your browser. Sign
-   in with the **username and password you set via `mcp-ssh set-auth`** and approve
-   the request. The browser hands the bearer back to Claude automatically.
+4. **Add**, then **log in.** Claude opens the OAuth 2.1 flow in your browser on
+   mcp-ssh's **Authorize client** page. It shows where the login will be sent —
+   check that's Claude's callback, not something you don't recognise — then enter
+   the **username and password you set via `mcp-ssh set-auth`** and click **Log in
+   and authorize**. The browser hands the bearer back to Claude automatically. (The
+   page expires after 10 minutes; if it says the request expired, start again from
+   Claude.)
 5. **Enable it in a chat.** In a conversation, click the **+** button (lower-left
    of the composer) → **Connectors**, and toggle **mcp-ssh** on for that chat.
 6. **Confirm the tools.** The connector should list **`bash`**, **`job`**, and
@@ -74,8 +78,9 @@ mobile.
 |---|---|
 | **Connection fails / "can't reach server"** | Server isn't public. Claude dials from **Anthropic's cloud**, not your device — `localhost`/LAN/VPN-only won't work. Expose `https://your-host/mcp` on the public internet (allowlist Anthropic IP ranges if firewalled). |
 | **Discovery 404 / OAuth never starts** | Proxy only forwards `/mcp`. It must also forward `/.well-known/oauth-authorization-server`, `/.well-known/oauth-protected-resource`, `/authorize`, `/token`, `/register`. Verify: `curl -fsS https://your-host/.well-known/oauth-authorization-server` returns JSON. See [docs/deploy.md](deploy.md). |
-| **Login page errors / blank, or 421/400 on connect** | Host not allowed. Set `MCP_SSH_ALLOWED_HOSTS` to your **public hostname** (DNS-rebinding guard) and restart: `journalctl -u mcp-ssh -e` shows the rejected `Host`. |
-| **Worked, then tools go unauthorized after a while** | Access tokens last 24h; Claude silently renews them with the refresh token, so this should be rare. Tokens also reset when the server restarts — GUI clients re-auth automatically (remove/re-add the connector if not); for headless tokens, re-mint (below). |
+| **Login page says "Wrong username or password"** | The form takes the `set-auth` credentials (not your Claude account). Each failure costs a short delay; check `journalctl -u mcp-ssh -e` for `login_failed`. |
+| **Login page errors / blank, or 403/400 on connect** | Host not allowed. Set `MCP_SSH_ALLOWED_HOSTS` to your **public hostname** (DNS-rebinding guard) and restart. The 403 body reads `Forbidden: Host header is not allowed` (the rejection isn't logged). |
+| **Worked, then tools go unauthorized after a while** | Access tokens last 24h; Claude silently renews them with a 30-day refresh token, so this should be rare. Tokens survive a server restart (they're persisted in SQLite). A login ends after 90 days however often it renews, and every login ends when the password is changed with `set-auth`, on `mcp-ssh sessions --revoke`, or once after upgrading to v2.0.0 (tokens are now stored hashed) — reconnect the connector (remove/re-add if it doesn't prompt). For headless tokens, re-mint (below). |
 | **Tools don't appear in a chat** | Connector added but not enabled for that conversation. Click **+** → **Connectors** → toggle **mcp-ssh** on. |
 
 Quick reachability check from the public side:

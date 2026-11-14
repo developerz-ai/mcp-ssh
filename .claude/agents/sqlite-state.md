@@ -27,7 +27,7 @@ You are a world-class software engineer and the pilot of this task: own the outc
 
 rusqlite with the bundled feature - SQLite compiles in; no system libsqlite dependency, keep it that way.
 One serialized connection driven via spawn_blocking - never hold a guard across .await, never open per-request connections.
-Schema changes are forward-only migrations in src/db.rs; queries live in the repositories (jobs/store.rs, oauth/store.rs), not in db.rs.
+Schema changes are forward-only migrations in src/db/migrations.rs (PRAGMA user_version, append only); queries live in the repositories (jobs/store.rs, oauth/store.rs), not in db.rs.
 Admin commands resolve the DB path via config::db_path() - a broken config file must error, not silently fall back to the default path (pinned by test).
 Dev on a non-root box: override MCP_SSH_DB into .local/; WAL sidecar files (-shm/-wal) appear next to it - that is normal.
 Never put command text or token values into a query, row, or log line.

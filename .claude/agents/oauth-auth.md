@@ -26,9 +26,9 @@ You are a world-class software engineer and the pilot of this task: own the outc
 - Decide, never ask, past the true blockers above: record each call and its reason where the change is described. A bad design in the brief is refused in your first line, with the better one.
 
 /mcp is bearer-only; every MCP client authenticates via OAuth 2.1 - never weaken the middleware in src/auth.rs.
-/authorize issues a code only to a redirect_uri the client_id registered (exact match, else invalid_request) - pin that with a test if touched.
-Opaque tokens + PKCE S256; no JWT/JWKS. Access tokens 24h, refresh 30d.
+/authorize: GET validates (registered client_id + exact redirect_uri, else invalid_request; PKCE S256) and renders the consent page - never a code. Only the POST (single-use CSRF nonce, 10 min, held server-side) with the right credentials issues one. Pin both with tests if touched.
+Opaque tokens + PKCE S256; no JWT/JWKS. Stored only as SHA-256 hashes. Access 24h, refresh 30d rotated on use, 90-day family cap; a replayed refresh token revokes its family.
 Tokens AND client registrations persist in SQLite (src/oauth/store.rs mirrors jobs::JobRepo) so logins survive restarts - keep the mirror shape.
-sweep_expired_access/sweep_expired_refresh bulk-delete and return counts only - never a token value.
-/authorize takes HTTP Basic user login; the password must never surface in a response, log, or error.
+sweep_expired_access/sweep_expired_refresh/sweep_stale_clients bulk-delete and return counts only - never a token value. revoke_all backs `sessions --revoke` and `set-auth`.
+The operator's password is accepted only by the consent form (auth::check_login, constant-time); no HTTP Basic anywhere. It must never surface in a response, log, Debug, or error.
 bin/mcp-token runs this flow non-interactively - keep its endpoints and field names stable.

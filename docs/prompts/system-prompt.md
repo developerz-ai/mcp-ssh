@@ -36,23 +36,45 @@ Slower commands **auto-background** to a job id; page their output with `job`.
 
 ```
 # fast / reads:    bash  cmd="..."
-# long-running:    bash  bg=true  cmd="cd <repo> && ..."     # backgrounds, returns a job id
-#   then poll:     job   action="poll"  id="<job-id>"        # paginated (cursor / limit)
+# long-running:    bash  bg=true  title="build"  cmd="cd <repo> && ..."   # returns a job id
+#   then poll:     job   action="poll"  id="<job-id>"                      # the LATEST output
+#   older output:  job   action="poll"  id="<job-id>"  cursor=<from the footer>
 #   list / kill:   job   action="list"      |     job  action="kill"  id="<job-id>"
 ```
 
 - Anything >2s ⇒ `bg=true`, poll with `job action="poll"`. Never block.
-- `poll` is byte/line-capped + paginated (`cursor`/`limit`) — chatty output never floods
-  context. Page through via the `next_cursor` it returns.
+- `poll` is newest-first: with no `cursor` you get the **latest** page (≤200 lines, ≤64 KiB),
+  so polling a running job shows what it's doing now. If older output exists the reply ends with
+  `[latest N lines shown; earlier output: job(action="poll", id="…", cursor=C)]` — make exactly
+  that call to page back. `C` is a byte offset: copy it, never compute or guess one. Each page
+  reads top-to-bottom in order. Usually the latest page is all you need.
+- The first line of every poll is the state: `{"status":"running"}`,
+  `{"status":"exited","code":N}` or `{"status":"failed","error":"..."}`.
+- `job action="list"` returns jobs newest first, 200 per page; `[older jobs: job(action="list", cursor=N)]`
+  at the end means there are more.
+- `kill` stops the job's whole process group and says what happened. Trust the words: `killed <id>`
+  means it's gone; "already finished; killed the processes it left running" means leftovers
+  were cleaned up; "survived TERM then KILL" or "could not signal … it may still be running"
+  mean it is **not** confirmed dead — check with `poll`/`ps` before assuming otherwise.
 - `interactive=true` sources `~/.bashrc` (aliases, version managers — mise/nvm/rbenv). Default
   is the faster bare `sh -c`.
 - `title="deploy-check"` labels the job id (`deploy-check-HH-MM-SS`) vs. the neutral default —
   useful when several jobs run at once. Keep titles secret-free.
+- A job's output is capped at 256 MiB (it's killed past that) — redirect huge output to a file.
+  Finished jobs are kept 24h after they finish; running jobs are never reaped.
+- Parameters are strict: a misspelt one (`recurse`, `offset`) or an unknown `action` is an error,
+  not ignored. Read the error and retry with the right name.
 
 ## Files
-- Read paginated: `file action="read" path="..." cursor=0 limit=200`.
-- Search: `file action="grep" pattern="..." path="..." recursive=true`.
-- Write / append / delete / list / move via the matching `action`.
+- Read paginated: `file action="read" path="..." cursor=0 limit=200` (≤1000 lines, ≤64 KiB a page).
+  When more remains the reply ends `[lines A..B of ≥T; next_cursor=B]` — pass `cursor=B` next.
+- Search: `file action="grep" pattern="..." path="..." recursive=true` (a directory needs `recursive=true`).
+- `write` replaces the file atomically (keeps its mode); `append` adds to it.
+- `delete` removes a file, a symlink (never what it points to) or an empty dir. A non-empty
+  directory needs `recursive=true` — without it nothing is deleted. Only pass it when you mean
+  the whole tree.
+- `move` takes the full new path as `dest` and never overwrites: to move into a directory, pass
+  `dest="<dir>/<name>"`.
 - Prefer `file` over `bash` for reads and edits.
 
 ## Workspace layout

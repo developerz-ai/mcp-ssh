@@ -14,8 +14,8 @@
 # The access token lasts 24h and survives server restarts (tokens are stored,
 # hashed, in the server's SQLite). Only the access token is printed — the 30-day
 # refresh token in the response is discarded — so re-run this to get a new one.
-# Each run is a separate login (and a registered client, swept 7 days after its
-# tokens expire); `mcp-ssh sessions --revoke` on the host ends every login.
+# Each run is a separate login (and a registered client, swept once it is 7+ days
+# old and holds no live token); `mcp-ssh sessions --revoke` on the host ends every login.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."

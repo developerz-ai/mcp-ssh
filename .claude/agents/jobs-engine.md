@@ -27,9 +27,10 @@ You are a world-class software engineer and the pilot of this task: own the outc
 
 Job ids come from src/jobs/id.rs - neutral prefix + local HH-MM-SS; never let command text reach an id, log line, or filename.
 Inline window default is 2s (MCP_SSH_INLINE_TIMEOUT_SECS); slower commands auto-background to a job id - do not make polling modal.
-poll pages the per-job log newest-first (cursor 0 = latest) and falls back to the SQLite output tail when the log file is gone.
+poll pages the per-job log newest-first: no cursor = the latest page; the footer's cursor is a byte offset where that page starts (absolute, so a growing log never re-serves lines). Falls back to the SQLite output tail (500 lines, <=256 KiB) when the log file is gone. Never read a log whole - src/jobs/log.rs walks backwards under a line/byte/scan budget.
 All jobs SQL lives in src/jobs/store.rs (JobRepo); engine, reaper, and admin CLI call typed methods - no inline SQL elsewhere.
-Kill semantics exist once, in src/jobs/signal.rs (kill_job/kill_persisted over TERM->KILL escalation); everyone else renders the KillOutcome.
-Startup reconcile flips rows left running by a dead process to failed only when the persisted pgid is really dead (group_alive) - a survivor stays running.
-Reaper (startup + hourly) drops jobs >24h, trims finished logs, sweeps expired OAuth tokens on the same pass.
+Kill semantics exist once, in src/jobs/signal/kill.rs over src/jobs/signal.rs: kill(2) via libc (no external kill binary), errno tri-state Probe (Alive incl. EPERM / Gone=ESRCH / Unknown - never read as gone), escalate TERM -> 2s -> KILL, success only when the group is probed gone. kill_job (live handle) / kill_persisted (row pgid, boot-id gated) return a KillOutcome (Killed, KilledLeftovers, NotRunning, Unknown, NoProcessGroup, CorruptProcessGroup, Survived, NotSignalled) that src/tools/job_render.rs and the CLI only render.
+Startup reconcile flips rows left running by a previous process to failed only when the persisted group probes Gone (or its boot id is stale) - a survivor stays running.
+Reaper (startup + hourly) never kills: a finished job goes 24h after it finished (finished_unix), a running one is never aged out, a finished one with live leftovers keeps its row. It trims finished logs (5000 lines <3h, 500 after) and sweeps expired OAuth tokens + stale clients on the same pass.
+Live log cap 256 MiB: past it the group is SIGKILLed and the job finishes failed.
 Live output goes to per-job log files; SQLite only sees low-frequency writes - keep that split.

@@ -15,7 +15,7 @@ You're in your car. From your phone, you point Claude at `https://your-vps/mcp` 
 
 - Claude calls `bash("./deploy.sh")`.
 - The deploy takes 20 minutes — so it **auto-backgrounds** and hands back a job id instead of blocking.
-- Claude polls `job(action="poll", id)` **page by page**, watching progress a few hundred lines at a time, so a 20-minute build never floods its context window.
+- Claude polls `job(action="poll", id)` and sees the **latest** output first — a bounded page, never the whole log — so a 20-minute build never floods its context window.
 - It finishes. Claude tells you it's done. You never touched a keyboard.
 
 Want to go further? Run `bash("claude -p 'fix the failing test and push'")` — **one agent supervising another agent** on your VPS. mcp-ssh is just the shell; what you run through it is up to you.
@@ -57,8 +57,8 @@ A small, heavily-parametrized surface — **three resource-oriented tools**, com
 | Tool | Params | What it does |
 |---|---|---|
 | `bash` | `cmd`, `cwd?`, `timeout?`, `bg?`, `interactive?`, `title?` | Run a shell command. Returns output inline if it finishes within the inline window (default 2s), else a **job id** to monitor with `job`. `timeout` overrides the inline window; `bg=true` backgrounds immediately; `interactive=true` sources `~/.bashrc`; `title` labels the job id (`<title>-HH-MM-SS`). Output is byte/line-capped per page. |
-| `job` | `action`, `id?`, `cursor?`, `limit?` | Manage jobs. `action="poll"` → status + **one page** of merged stdout+stderr (default 200 lines, byte-capped, with `next_cursor`/`has_more`); `action="list"` → all jobs + status; `action="kill"` → kill running job `id`. |
-| `file` | `action`, `path?`, `content?`, `pattern?`, `recursive?`, `src?`, `dest?`, `cursor?`, `limit?` | File operations by `action`: `read` (paginated), `write`, `append`, `delete`, `list` (`recursive` for the tree), `grep` (`pattern`, `recursive` under a dir), `move` (`src`→`dest`). |
+| `job` | `action?`, `id?`, `cursor?`, `limit?` | Manage jobs. `action="poll"` → status + the **newest page** of merged stdout+stderr (default 200 lines, ≤64 KiB); a footer names the `cursor` that pages back to older output. `action="list"` (the default) → jobs + status, newest first, paged. `action="kill"` → kill job `id`'s process group and say what actually happened. An unknown `action` is an error. |
+| `file` | `action`, `path?`, `content?`, `pattern?`, `recursive?`, `src?`, `dest?`, `cursor?`, `limit?` | File operations by `action`: `read` (paginated by line), `write` (atomic replace), `append`, `delete` (a non-empty dir needs `recursive=true`; symlinks are never followed), `list` (`recursive` for the tree), `grep` (`pattern`, `recursive` under a dir), `move` (`src`→`dest`, never overwrites). |
 
 Full reference with examples → **[docs/usage.md](docs/usage.md)**.
 
@@ -66,7 +66,7 @@ Full reference with examples → **[docs/usage.md](docs/usage.md)**.
 
 1. Deploy mcp-ssh behind TLS so it's reachable at `https://your-host/mcp`.
 2. In Claude, add a remote MCP server with URL `https://your-host/mcp`.
-3. Claude runs the **OAuth 2.1** flow (the spec-compliant auth GUI clients use); log in with the username/password you set via `mcp-ssh set-auth`.
+3. Claude runs the **OAuth 2.1** flow (the spec-compliant auth GUI clients use): your browser opens mcp-ssh's login page, which shows where the client will be sent — log in with the username/password you set via `mcp-ssh set-auth`.
 4. The tools above appear. Say *"run the deploy."*
 
 Headless client (the `claude` CLI, curl) with no browser? Mint a bearer with [`bin/mcp-token`](bin/mcp-token) and pass it as `Authorization: Bearer …` → **[docs/deploy.md](docs/deploy.md#-connect-a-client)**.
@@ -75,9 +75,12 @@ Headless client (the `claude` CLI, curl) with no browser? Mint a bearer with [`b
 
 `/mcp` is **bearer-only** — all MCP clients must authenticate via OAuth 2.1. Claude and every
 spec-compliant GUI client run this flow automatically; you just log in with the username/password
-you set via `mcp-ssh set-auth`. Tokens (and job history) are persisted to a bundled SQLite database,
-so **logins and job history survive a service restart** — handy since the agent can self-update and
-restart itself.
+you set via `mcp-ssh set-auth` on mcp-ssh's own login page. Tokens (and job history) are persisted to a
+bundled SQLite database — tokens only as SHA-256 hashes — so **logins and job history survive a service
+restart**, handy since the agent can self-update and restart itself. Access tokens last 24h and renew
+silently with a 30-day refresh token; a login ends after 90 days however often it renews.
+
+Changing the password with `set-auth` logs every client out; so does `mcp-ssh sessions --revoke`.
 
 Set the credentials once:
 
@@ -89,11 +92,12 @@ mcp-ssh set-auth admin     # prompts for the password
 
 ```bash
 mcp-ssh serve              # run the server (this is the default)
-mcp-ssh set-auth <user>    # configure the username/password
+mcp-ssh set-auth <user>    # configure the username/password (logs every client out)
 
 mcp-ssh jobs               # list running jobs (--all includes finished ones)
 mcp-ssh job kill <id>      # SIGTERM then SIGKILL a job's process group
 mcp-ssh sessions           # summarise OAuth logins (token counts + next expiry)
+mcp-ssh sessions --revoke  # end every login: all clients must log in again
 ```
 
 `jobs`/`job kill`/`sessions` read the same SQLite state the server uses, so they
@@ -112,7 +116,7 @@ Treat it accordingly:
 - Always put it **behind TLS** (reverse proxy). Never expose `:1337` directly.
 - Use a **strong password** — it's the only thing between the internet and root.
 - Set `MCP_SSH_ALLOWED_HOSTS` to your public hostname — it's the DNS-rebinding guard.
-- Don't want root? [Lock it down](docs/deploy.md#self-management-the-agent-has-sudo-by-default) — remove the sudoers file + set `NoNewPrivileges=true`.
+- Don't want root? [Lock it down](docs/deploy.md#self-management-the-agent-has-sudo-by-default) — remove the sudoers file + add the lockdown drop-in (`NoNewPrivileges=true`, `ProtectSystem=full`).
 
 ## 📦 Install
 
@@ -120,7 +124,7 @@ Treat it accordingly:
 |---|---|
 | **One-liner** | `curl -fsSL https://raw.githubusercontent.com/developerz-ai/mcp-ssh/main/deploy/install.sh \| sudo bash` — latest release, prompts for creds, installs + starts the service |
 | **Debian/Ubuntu** | download `mcp-ssh_*.deb` from [releases](https://github.com/developerz-ai/mcp-ssh/releases) → `sudo dpkg -i mcp-ssh_*.deb` |
-| **Docker** | pull the image and run it (see [docs/deploy.md](docs/deploy.md)) |
+| **Docker** | pull the image and run it with a state volume and `MCP_SSH_ALLOWED_HOSTS` (see [docs/deploy.md](docs/deploy.md#-docker)) |
 | **From source** | `cargo build --release` → binary at `target/release/mcp-ssh` |
 
 ## 📚 Docs
@@ -137,7 +141,7 @@ Treat it accordingly:
 
 ## 🧬 Stack
 
-Rust 2024 · tokio · axum 0.8 · [rmcp](https://github.com/modelcontextprotocol/rust-sdk) 1.7 (MCP Streamable HTTP) · [rusqlite](https://github.com/rusqlite/rusqlite) (bundled SQLite — durable state, no system libsqlite).
+Rust 2024 · tokio · axum 0.8 · [rmcp](https://github.com/modelcontextprotocol/rust-sdk) 2.2 (MCP Streamable HTTP) · [rusqlite](https://github.com/rusqlite/rusqlite) (bundled SQLite — durable state, no system libsqlite).
 
 ## 📄 License
 
