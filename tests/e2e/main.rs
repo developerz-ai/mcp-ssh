@@ -6,6 +6,7 @@ mod client;
 mod harness;
 mod oauth;
 
+mod agents;
 mod auth;
 mod files;
 mod jobs;

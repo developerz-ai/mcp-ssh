@@ -23,7 +23,8 @@ mod store;
 pub use metadata::base_url;
 pub use secret::hash_token;
 pub use store::{
-    Store, revoke_all, sweep_expired_access, sweep_expired_refresh, sweep_stale_clients,
+    AgentActivity, PRESENCE_WINDOW, Store, StoreUnavailable, revoke_all, sweep_expired_access,
+    sweep_expired_refresh, sweep_stale_clients,
 };
 
 /// Largest request body the OAuth routes accept. Every legitimate body (a token

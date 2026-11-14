@@ -8,6 +8,7 @@ use axum::{
 use serde_json::json;
 
 use super::{is_allowed_redirect, json_error};
+use crate::agent::ClientName;
 use crate::oauth::AuthState;
 use crate::oauth::store::RegisterError;
 
@@ -15,18 +16,24 @@ use crate::oauth::store::RegisterError;
 const MAX_REDIRECT_URIS: usize = 5;
 
 /// `/register` — minimal Dynamic Client Registration (RFC 7591). Clients are
-/// public (PKCE, no secret), so the only thing persisted is the `client_id` →
-/// `redirect_uri` binding that `/authorize` then enforces. Bounded: a few short
-/// URIs per client, and a cap on clients overall.
+/// public (PKCE, no secret), so what is persisted is the `client_id` →
+/// `redirect_uri` binding that `/authorize` then enforces, plus the optional
+/// `client_name` other agents see it by — cleaned by [`ClientName::parse`],
+/// never echoed raw. Bounded: a few short URIs per client, and a cap on clients
+/// overall.
 pub async fn register(
     State(st): State<AuthState>,
     body: Option<Json<serde_json::Value>>,
 ) -> Response {
+    let name = body
+        .as_ref()
+        .and_then(|Json(b)| b.get("client_name")?.as_str())
+        .and_then(ClientName::parse);
     let redirect_uris = match registered_redirect_uris(body) {
         Ok(uris) => uris,
         Err(error) => return json_error(StatusCode::BAD_REQUEST, error),
     };
-    let client_id = match st.store.register_client(&redirect_uris).await {
+    let client_id = match st.store.register_client(&redirect_uris, name).await {
         Ok(id) => id,
         Err(RegisterError::Full | RegisterError::Unavailable) => {
             return json_error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable");

@@ -29,8 +29,9 @@ pub fn build(
     http.allowed_hosts = allowed_hosts.clone();
     http.cancellation_token = shutdown;
 
+    let agents = auth_state.store.clone();
     let service = StreamableHttpService::new(
-        move || Ok(tools::Tools::new(store.clone())),
+        move || Ok(tools::Tools::new(store.clone(), agents.clone())),
         Arc::new(LocalSessionManager::default()),
         http,
     );

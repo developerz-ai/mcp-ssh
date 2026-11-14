@@ -14,7 +14,7 @@
 //! so an outage is a 503 with a journal line, not an "invalid token".
 use std::time::Duration;
 
-use rusqlite::{OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
 
 use super::pending::Pending;
 use super::secret::{hash_token, random_token, verify_pkce};
@@ -22,9 +22,11 @@ use crate::db::{Db, now_unix};
 
 mod clients;
 mod pair;
+mod presence;
 mod sweep;
 
 use pair::{Grant, Rotation, hashes, insert_pair, new_tokens, rotate};
+pub use presence::{AgentActivity, PRESENCE_WINDOW};
 pub use sweep::{revoke_all, sweep_expired_access, sweep_expired_refresh, sweep_stale_clients};
 
 const CODE_TTL: Duration = Duration::from_secs(600);
@@ -214,23 +216,7 @@ impl Store {
         let hash = token_hash.to_owned(); // moves into the blocking DB call
         let now = now_unix();
         self.db
-            .call(move |conn| {
-                let expiry: Option<i64> = conn
-                    .query_row(
-                        "SELECT expires_unix FROM access_tokens WHERE token_hash = ?1",
-                        [&hash],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                match expiry {
-                    Some(exp) if exp > now => Ok(true),
-                    Some(_) => {
-                        conn.execute("DELETE FROM access_tokens WHERE token_hash = ?1", [&hash])?;
-                        Ok(false)
-                    }
-                    None => Ok(false),
-                }
-            })
+            .call(move |conn| live_token_client(conn, &hash, now).map(|client| client.is_some()))
             .await
             .map_err(|e| unavailable("validate", e))
     }
@@ -250,6 +236,27 @@ impl Store {
             })
             .await
             .expect("insert_token");
+    }
+}
+
+/// The client a live access token (by hash) was issued to; `None` when the token
+/// is unknown or expired. An expired row is evicted on the way out, so the table
+/// doesn't accumulate dead rows.
+fn live_token_client(conn: &Connection, hash: &str, now: i64) -> rusqlite::Result<Option<String>> {
+    let row: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT expires_unix, client_id FROM access_tokens WHERE token_hash = ?1",
+            [hash],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    match row {
+        Some((expires, client)) if expires > now => Ok(Some(client)),
+        Some(_) => {
+            conn.execute("DELETE FROM access_tokens WHERE token_hash = ?1", [hash])?;
+            Ok(None)
+        }
+        None => Ok(None),
     }
 }
 

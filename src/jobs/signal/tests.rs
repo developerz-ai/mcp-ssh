@@ -1,6 +1,6 @@
 use super::*;
 use crate::db::Db;
-use crate::jobs::{JobId, JobRepo};
+use crate::jobs::{JobId, JobMeta, JobRepo};
 
 fn repo() -> (JobRepo, Db) {
     let db = Db::memory();
@@ -231,7 +231,14 @@ async fn a_kill_that_did_not_take_is_not_blamed_for_the_job_s_later_exit() {
     let dir = tempfile::tempdir().unwrap().keep();
     let store = JobStore::new(dir, Duration::from_secs(5), Shell::sh(), Db::memory()).unwrap();
     let RunResult::Backgrounded { id } = store
-        .run("sleep 0.5; exit 3".into(), None, None, true, false, None)
+        .run(
+            "sleep 0.5; exit 3".into(),
+            None,
+            None,
+            true,
+            false,
+            JobMeta::default(),
+        )
         .await
         .unwrap()
     else {

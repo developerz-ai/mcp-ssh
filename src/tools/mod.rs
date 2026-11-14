@@ -8,8 +8,8 @@ use rmcp::{
         common::RequestId, router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters,
     },
     model::{
-        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ServerCapabilities,
-        ServerConfig,
+        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Extensions,
+        ServerCapabilities, ServerConfig,
     },
     service::RequestContext,
     tool, tool_handler, tool_router,
@@ -17,28 +17,36 @@ use rmcp::{
 // `RequestId` above is rmcp's extractor for the per-call JSON-RPC request id.
 use tracing::Instrument;
 
-use crate::jobs::{JobId, JobStore};
+use std::sync::Arc;
+
+use crate::jobs::{JobId, JobMeta, JobStore};
+use crate::oauth::Store;
 
 mod args;
+mod caller;
 mod files;
 mod job_render;
 mod reject;
 mod render;
 
 use args::{BashArgs, FileAction, FileArgs, JobAction, JobArgs};
+use caller::{caller, label};
 use render::{render_file, render_file_error};
 
 #[derive(Clone)]
 pub struct Tools {
     jobs: JobStore,
+    /// Who else is on the host: the OAuth store's record of recent bearer use.
+    agents: Arc<Store>,
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_router]
 impl Tools {
-    pub fn new(jobs: JobStore) -> Self {
+    pub fn new(jobs: JobStore, agents: Arc<Store>) -> Self {
         Self {
             jobs,
+            agents,
             tool_router: Self::tool_router(),
         }
     }
@@ -57,7 +65,11 @@ impl Tools {
             title,
         }): Parameters<BashArgs>,
         RequestId(request_id): RequestId,
+        extensions: Extensions,
     ) -> Result<CallToolResult, McpError> {
+        let caller = caller(&extensions);
+        let span =
+            tracing::info_span!("tool", tool = "bash", %request_id, agent = label(caller.as_ref()));
         async move {
             // Emit inside the span so the prod subscriber (FmtSpan::NONE) logs the
             // dispatch with the span's `tool`/`request_id`; a bare span logs nothing.
@@ -75,7 +87,10 @@ impl Tools {
                         timeout,
                         background,
                         interactive.unwrap_or(false),
-                        title,
+                        JobMeta {
+                            title,
+                            owner: caller,
+                        },
                     )
                     .await;
                 job_render::run(run, background)
@@ -83,28 +98,37 @@ impl Tools {
             log_outcome(&result);
             Ok(result)
         }
-        .instrument(tracing::info_span!("tool", tool = "bash", %request_id))
+        .instrument(span)
         .await
     }
 
     #[tool(
-        description = "Manage background jobs created by `bash`. action=poll returns job `id`'s status + output newest-first: call it with no cursor to see the most recent output, then page *back* through history with the cursor the reply names (each page is itself in chronological order). action=list lists jobs newest first, paged by cursor/limit. action=kill kills job `id`'s whole process group (and processes a finished job left running)."
+        description = "Manage background jobs created by `bash`. action=poll returns job `id`'s status + output newest-first: call it with no cursor to see the most recent output, then page *back* through history with the cursor the reply names (each page is itself in chronological order). action=list lists jobs newest first, paged by cursor/limit; it opens with which agents (OAuth clients) used this host in the last 15 min, you first, and each job's `by` is `you` or the agent that started it. action=kill kills job `id`'s whole process group (and processes a finished job left running). Jobs are shared between agents on the host: you can poll or kill another agent's job, and the reply says whose it is."
     )]
     async fn job(
         &self,
         Parameters(args): Parameters<JobArgs>,
         RequestId(request_id): RequestId,
+        extensions: Extensions,
     ) -> Result<CallToolResult, McpError> {
+        let caller = caller(&extensions);
         // `action` is a fixed word only — never the raw string an unknown one carried.
-        let span =
-            tracing::info_span!("tool", tool = "job", action = args.action.name(), %request_id);
+        let span = tracing::info_span!(
+            "tool",
+            tool = "job",
+            action = args.action.name(),
+            %request_id,
+            agent = label(caller.as_ref())
+        );
         async move {
             tracing::info!("dispatch");
             let id = non_empty(args.id).map(JobId::from);
             let result = match args.action {
                 JobAction::Poll => match id {
                     Some(id) => {
-                        job_render::poll(&id, self.jobs.poll(&id, args.cursor, args.limit).await)
+                        let polled = self.jobs.poll(&id, args.cursor, args.limit).await;
+                        let foreign = self.foreign_owner(&id, caller.as_ref()).await;
+                        job_render::poll(&id, polled, foreign.as_deref())
                     }
                     None => err("poll requires `id`"),
                 },
@@ -112,10 +136,17 @@ impl Tools {
                     let cursor = args
                         .cursor
                         .map_or(0, |c| usize::try_from(c).unwrap_or(usize::MAX));
-                    job_render::list(self.jobs.list(cursor, args.limit).await)
+                    let page = self.jobs.list(cursor, args.limit).await;
+                    let active = self.agents.active_agents().await;
+                    job_render::list(page, caller.as_ref(), active)
                 }
                 JobAction::Kill => match id {
-                    Some(id) => job_render::kill(&id, self.jobs.kill(&id).await),
+                    Some(id) => {
+                        // Read the owner first: a kill can't change it, but the
+                        // reaper may drop a finished row right after.
+                        let foreign = self.foreign_owner(&id, caller.as_ref()).await;
+                        job_render::kill(&id, self.jobs.kill(&id).await, foreign.as_deref())
+                    }
                     None => err("kill requires `id`"),
                 },
                 JobAction::Unknown(action) => job_render::unknown_action(&action),
@@ -134,9 +165,16 @@ impl Tools {
         &self,
         Parameters(args): Parameters<FileArgs>,
         RequestId(request_id): RequestId,
+        extensions: Extensions,
     ) -> Result<CallToolResult, McpError> {
         // `action` is the enum name only — never a path, pattern or content.
-        let span = tracing::info_span!("tool", tool = "file", action = ?args.action, %request_id);
+        let span = tracing::info_span!(
+            "tool",
+            tool = "file",
+            action = ?args.action,
+            %request_id,
+            agent = label(caller(&extensions).as_ref())
+        );
         async move {
             tracing::info!("dispatch");
             let recursive = args.recursive.unwrap_or(false);
@@ -212,7 +250,7 @@ impl ServerHandler for Tools {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "Remote shell + file access for one host. Three tools: `bash` runs a command \
              (auto-backgrounds slow ones, returning a job id); `job` (action=poll/list/kill) \
-             monitors jobs with paginated output; `file` (action=read/write/append/delete/list/grep/move) \
+             monitors jobs with paginated output and shows which other agents share the host; `file` (action=read/write/append/delete/list/grep/move) \
              operates locally as the service user.",
         )
     }

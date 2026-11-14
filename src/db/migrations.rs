@@ -17,6 +17,7 @@ const MIGRATIONS: &[Migration] = &[
     constrain_jobs,
     hash_and_bind_tokens,
     add_job_interactive,
+    add_agent_identity,
 ];
 
 /// The newest schema version this binary understands.
@@ -171,6 +172,19 @@ fn hash_and_bind_tokens(tx: &Transaction) -> rusqlite::Result<()> {
 /// Rows from before this step read as not interactive.
 fn add_job_interactive(tx: &Transaction) -> rusqlite::Result<()> {
     tx.execute_batch("ALTER TABLE jobs ADD COLUMN interactive INTEGER NOT NULL DEFAULT 0;")
+}
+
+/// v7: which OAuth client started a job (its id and the name it registered, kept
+/// on the row so the owner still reads right after the client is swept), the
+/// registered name on `clients`, and when each client last used a token — what
+/// lets agents sharing the host see each other. Older rows have no owner.
+fn add_agent_identity(tx: &Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        "ALTER TABLE jobs ADD COLUMN client_id TEXT;
+         ALTER TABLE jobs ADD COLUMN client_name TEXT;
+         ALTER TABLE clients ADD COLUMN client_name TEXT;
+         ALTER TABLE clients ADD COLUMN last_used_unix INTEGER;",
+    )
 }
 
 /// `table`/`column` are compile-time constants (never user input), so

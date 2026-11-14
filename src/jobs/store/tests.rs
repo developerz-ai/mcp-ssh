@@ -58,7 +58,7 @@ async fn insert_running_writes_the_columns_the_inline_sql_did() {
     let id = JobId::from("job-10-00-00");
     repo.insert_running(
         &id,
-        Some("deploy".into()),
+        &JobMeta::titled("deploy".into()),
         1_700_000_000,
         ProcessGroupId::new(4242),
         Some("boot-a".into()),
@@ -91,7 +91,7 @@ async fn finish_records_the_final_state_and_a_bounded_tail() {
 
     let repo = repo();
     let id = JobId::from("job-10-00-01");
-    repo.insert_running(&id, None, now_unix(), None, None, false)
+    repo.insert_running(&id, &JobMeta::default(), now_unix(), None, None, false)
         .await
         .unwrap();
     repo.finish(&id, &log, &JobState::Exited { code: 7 }).await;
@@ -117,7 +117,7 @@ async fn finish_byte_caps_the_tail_of_one_huge_line() {
         .unwrap();
     let repo = repo();
     let id = JobId::from("job-huge");
-    repo.insert_running(&id, None, now_unix(), None, None, false)
+    repo.insert_running(&id, &JobMeta::default(), now_unix(), None, None, false)
         .await
         .unwrap();
     repo.finish(&id, &log, &JobState::Exited { code: 0 }).await;
@@ -137,7 +137,7 @@ async fn finish_byte_caps_the_tail_of_one_huge_line() {
 async fn finish_records_the_status_even_when_the_log_is_gone() {
     let repo = repo();
     let id = JobId::from("job-nolog");
-    repo.insert_running(&id, None, now_unix(), None, None, false)
+    repo.insert_running(&id, &JobMeta::default(), now_unix(), None, None, false)
         .await
         .unwrap();
     repo.finish(
@@ -156,7 +156,7 @@ async fn finish_records_the_status_even_when_the_log_is_gone() {
 async fn a_recorded_kill_reason_survives_the_waiter_s_exit() {
     let repo = repo();
     let id = JobId::from("job-cli-killed");
-    repo.insert_running(&id, None, now_unix(), None, None, false)
+    repo.insert_running(&id, &JobMeta::default(), now_unix(), None, None, false)
         .await
         .unwrap();
     repo.mark_killed(&id, "killed via mcp-ssh kill")
@@ -176,7 +176,7 @@ async fn a_recorded_kill_reason_survives_the_waiter_s_exit() {
     // The other order: the waiter recorded the bare signal death first. The
     // kill's reason still lands — it is what that signal was.
     let id = JobId::from("job-waiter-first");
-    repo.insert_running(&id, None, now_unix(), None, None, false)
+    repo.insert_running(&id, &JobMeta::default(), now_unix(), None, None, false)
         .await
         .unwrap();
     let died = JobState::Failed {
@@ -194,7 +194,7 @@ async fn a_recorded_kill_reason_survives_the_waiter_s_exit() {
 async fn find_maps_rows_back_onto_job_state() {
     let repo = repo();
     let failed = JobId::from("job-b");
-    repo.insert_running(&failed, None, now_unix(), None, None, false)
+    repo.insert_running(&failed, &JobMeta::default(), now_unix(), None, None, false)
         .await
         .unwrap();
     repo.finish(
@@ -217,9 +217,16 @@ async fn find_maps_rows_back_onto_job_state() {
 async fn summaries_page_newest_first() {
     let repo = repo();
     for (id, started) in [("b-late", 30), ("a-early", 10), ("z-mid", 20)] {
-        repo.insert_running(&JobId::from(id), None, started, None, None, false)
-            .await
-            .unwrap();
+        repo.insert_running(
+            &JobId::from(id),
+            &JobMeta::default(),
+            started,
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
     }
     let (page, more) = repo.summaries(0, 2).await.unwrap();
     let ids: Vec<&str> = page.iter().map(|s| s.id.as_ref()).collect();
@@ -235,9 +242,16 @@ async fn summaries_page_newest_first() {
 #[tokio::test]
 async fn summaries_skip_a_corrupt_row() {
     let repo = repo();
-    repo.insert_running(&JobId::from("good"), None, 10, None, None, false)
-        .await
-        .unwrap();
+    repo.insert_running(
+        &JobId::from("good"),
+        &JobMeta::default(),
+        10,
+        None,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
     // A blob where the id text should be: the row can't be mapped.
     seed_raw(
         &repo,
@@ -256,7 +270,7 @@ async fn untracked_running_skips_live_ids() {
     let (ghost, mine) = (JobId::from("job-ghost"), JobId::from("job-mine"));
     repo.insert_running(
         &ghost,
-        None,
+        &JobMeta::default(),
         boot - 3600,
         ProcessGroupId::new(2_000_000_000),
         Some("boot-a".into()),
@@ -264,7 +278,7 @@ async fn untracked_running_skips_live_ids() {
     )
     .await
     .unwrap();
-    repo.insert_running(&mine, None, boot, None, None, false)
+    repo.insert_running(&mine, &JobMeta::default(), boot, None, None, false)
         .await
         .unwrap();
 
@@ -288,7 +302,7 @@ async fn untracked_running_skips_live_ids() {
 async fn a_finished_row_keeps_its_own_state_when_a_kill_is_recorded() {
     let repo = repo();
     let id = JobId::from("job-done");
-    repo.insert_running(&id, None, now_unix(), None, None, false)
+    repo.insert_running(&id, &JobMeta::default(), now_unix(), None, None, false)
         .await
         .unwrap();
     repo.finish(
@@ -312,7 +326,7 @@ async fn leftovers_killed_re_records_a_finished_row_only() {
     let repo = repo();
     let (done, live) = (JobId::from("job-done"), JobId::from("job-live"));
     for id in [&done, &live] {
-        repo.insert_running(id, None, now_unix(), None, None, false)
+        repo.insert_running(id, &JobMeta::default(), now_unix(), None, None, false)
             .await
             .unwrap();
     }
@@ -369,10 +383,17 @@ async fn kill_target_reads_status_pgid_and_boot_verbatim() {
 async fn reap_rows_age_from_the_finish() {
     let repo = repo();
     let (old, fresh) = (JobId::from("job-old"), JobId::from("job-fresh"));
-    repo.insert_running(&old, None, 100, ProcessGroupId::new(7), None, false)
-        .await
-        .unwrap();
-    repo.insert_running(&fresh, None, 300, None, None, false)
+    repo.insert_running(
+        &old,
+        &JobMeta::default(),
+        100,
+        ProcessGroupId::new(7),
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+    repo.insert_running(&fresh, &JobMeta::default(), 300, None, None, false)
         .await
         .unwrap();
     repo.finish(
@@ -407,10 +428,10 @@ async fn reap_rows_age_from_the_finish() {
 async fn listing_filters_active_unless_all() {
     let repo = repo();
     let (a, b) = (JobId::from("a"), JobId::from("b"));
-    repo.insert_running(&a, Some("first".into()), 10, None, None, false)
+    repo.insert_running(&a, &JobMeta::titled("first".into()), 10, None, None, false)
         .await
         .unwrap();
-    repo.insert_running(&b, None, 20, None, None, false)
+    repo.insert_running(&b, &JobMeta::default(), 20, None, None, false)
         .await
         .unwrap();
     repo.finish(

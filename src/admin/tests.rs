@@ -1,4 +1,5 @@
 use super::*;
+use crate::agent::Agent;
 
 #[test]
 fn humanize_duration_scales_units() {
@@ -20,6 +21,7 @@ fn render_jobs_aligns_and_prefers_error_for_failures() {
             error: None,
             started_unix: 1_700_000_000,
             title: Some("minime-v1".into()),
+            owner: Some(Agent::new("client-a".into(), Some("Claude Code"))),
         },
         JobRow {
             id: "job-01".into(),
@@ -28,10 +30,16 @@ fn render_jobs_aligns_and_prefers_error_for_failures() {
             error: Some("server restarted".into()),
             started_unix: 1_700_000_100,
             title: None,
+            owner: None,
         },
     ];
     let out = render_jobs(&rows);
     assert!(out.contains("ID"), "has a header");
+    assert!(out.contains("BY"), "has an owner column:\n{out}");
+    assert!(
+        out.contains("Claude Code#") && !out.contains("client-a"),
+        "owner shown by label, never by client id:\n{out}"
+    );
     // Column width is driven by the longest id, so the short id is padded.
     assert!(
         out.contains("job-01             "),
@@ -287,4 +295,33 @@ async fn render_sessions_counts_without_leaking_tokens() {
             "token value leaked into output: {out}"
         );
     }
+}
+
+#[test]
+fn render_agents_shows_label_and_last_active_never_the_client_id() {
+    let now = 1_700_000_000;
+    let agents = vec![
+        AgentActivity {
+            agent: Agent::new("client-a".into(), Some("Claude Code")),
+            last_used_unix: Some(now - 180),
+        },
+        AgentActivity {
+            agent: Agent::new("client-b".into(), None),
+            last_used_unix: None,
+        },
+    ];
+    let out = render_agents(&agents, now);
+    assert!(
+        out.contains("Claude Code#") && out.contains("(3m ago)"),
+        "{out}"
+    );
+    assert!(
+        out.contains("client#") && out.contains("not active since"),
+        "{out}"
+    );
+    assert!(
+        !out.contains("client-a") && !out.contains("client-b"),
+        "{out}"
+    );
+    assert_eq!(render_agents(&[], now), "agents: none logged in\n");
 }

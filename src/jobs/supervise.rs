@@ -6,7 +6,7 @@ use std::{collections::HashMap, os::unix::process::ExitStatusExt, sync::Arc, tim
 use tokio::sync::{Mutex, oneshot, watch};
 
 use super::signal::{self, Escalation, Kill, Probe, escalate, probe};
-use super::{Job, JobError, JobId, JobRepo, JobState, ProcessGroupId, store};
+use super::{Job, JobError, JobId, JobMeta, JobRepo, JobState, ProcessGroupId, store};
 
 /// Most bytes a job's live log may reach. Past it the job's group is killed and it
 /// finishes `failed` — a runaway writer must not fill the volume the database
@@ -23,7 +23,8 @@ const LOG_CAP_EVERY: Duration = Duration::from_millis(100);
 pub(super) struct Supervised {
     pub(super) id: JobId,
     pub(super) job: Arc<Job>,
-    pub(super) label: Option<String>,
+    /// The normalized title and the owning agent, as the row records them.
+    pub(super) meta: JobMeta,
     pub(super) log_cap: u64,
     pub(super) done: watch::Sender<bool>,
 }
@@ -47,7 +48,7 @@ pub(super) async fn supervise(
     let Supervised {
         id,
         job,
-        label,
+        meta,
         log_cap,
         done,
     } = s;
@@ -55,7 +56,7 @@ pub(super) async fn supervise(
     let inserted = repo
         .insert_running(
             &id,
-            label,
+            &meta,
             crate::db::now_unix(),
             job.pgid,
             signal::boot_id(),

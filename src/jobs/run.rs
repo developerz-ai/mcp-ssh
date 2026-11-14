@@ -12,7 +12,9 @@ use tokio::sync::{Mutex, oneshot, watch};
 
 use super::log::{DEFAULT_PAGE, TailBudget, read_tail};
 use super::supervise::{Supervised, supervise};
-use super::{Job, JobError, JobId, JobState, JobStore, ProcessGroupId, RunResult, Shell, id};
+use super::{
+    Job, JobError, JobId, JobMeta, JobState, JobStore, ProcessGroupId, RunResult, Shell, id,
+};
 
 /// Single-quote a path for safe interpolation into a shell command. The job log
 /// path is engine-controlled, but quoting keeps an odd `job_dir` (spaces, `$`)
@@ -41,7 +43,8 @@ impl JobStore {
     /// Spawn `cmd`. With `background`, return a job id immediately; otherwise wait
     /// up to the inline window and return output if it finishes in time.
     /// `interactive` runs it through `~/.bashrc` (aliases, version managers);
-    /// otherwise the fast bare `sh -c` is used.
+    /// otherwise the fast bare `sh -c` is used. `meta` names the job (`title`) and
+    /// the agent it is recorded as started by.
     pub async fn run(
         &self,
         cmd: String,
@@ -49,7 +52,7 @@ impl JobStore {
         timeout_secs: Option<u64>,
         background: bool,
         interactive: bool,
-        title: Option<String>,
+        meta: JobMeta,
     ) -> Result<RunResult, JobError> {
         if let Some(dir) = &cwd {
             check_cwd(dir).await?;
@@ -59,7 +62,7 @@ impl JobStore {
         // tokens, and the id ends up in replies, `job(list)`, logs, and the log
         // filename. The normalized label is also what the row stores, so an
         // operator's terminal never renders a raw agent string.
-        let label = title.as_deref().and_then(id::normalize_title);
+        let label = meta.title.as_deref().and_then(id::normalize_title);
         let (id, log_path) = self
             .reserve_log(label.as_deref())
             .await
@@ -116,7 +119,10 @@ impl JobStore {
             Supervised {
                 id: id.clone(),
                 job,
-                label,
+                meta: JobMeta {
+                    title: label,
+                    owner: meta.owner,
+                },
                 log_cap: self.log_cap,
                 done: done_tx,
             },

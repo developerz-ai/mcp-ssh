@@ -33,12 +33,32 @@ pub(crate) use signal::{KillOutcome, kill_persisted};
 pub use status::JobStatus;
 pub(crate) use store::{JobRepo, JobRow};
 
+use crate::agent::Agent;
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum JobState {
     Running,
     Exited { code: i32 },
     Failed { error: String },
+}
+
+/// What labels a job besides its id: the agent's `title` (never command text) and
+/// the agent that started it (`None` only where no caller is known).
+#[derive(Debug, Clone, Default)]
+pub struct JobMeta {
+    pub title: Option<String>,
+    pub owner: Option<Agent>,
+}
+
+#[cfg(test)]
+impl JobMeta {
+    pub fn titled(title: String) -> Self {
+        Self {
+            title: Some(title),
+            owner: None,
+        }
+    }
 }
 
 /// Most rows one `job(action="list")` page returns.
@@ -77,11 +97,13 @@ pub enum RunResult {
 /// Public, per-job metadata for `job(action="list")`. Deliberately omits the
 /// command text: a command can carry a secret in its leading tokens
 /// (`PGPASSWORD=…`, bearer headers, pasted tokens), and this is returned in
-/// ordinary MCP responses — so the listing exposes only the id and status.
-#[derive(Debug, serde::Serialize)]
+/// ordinary MCP responses — so the listing exposes only the id, the status and
+/// who started it (`None` for a job from before that was recorded).
+#[derive(Debug)]
 pub struct JobSummary {
     pub id: JobId,
     pub state: JobState,
+    pub owner: Option<Agent>,
 }
 
 /// One page of `job(action="list")`, newest start first.
@@ -176,6 +198,12 @@ impl JobStore {
         let (jobs, more) = self.repo.summaries(cursor, limit).await?;
         let next_cursor = more.then(|| cursor + jobs.len());
         Ok(JobList { jobs, next_cursor })
+    }
+
+    /// The agent that started job `id`. `Ok(None)` for an unknown id, or a job
+    /// from before owners were recorded.
+    pub async fn owner(&self, id: &JobId) -> Result<Option<Agent>, JobError> {
+        Ok(self.repo.owner(id).await?)
     }
 
     /// Kill a job's process group — through the in-process handle when this

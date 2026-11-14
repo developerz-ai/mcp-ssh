@@ -7,6 +7,7 @@
 //! `running` rows to `failed`. Here we only ever touch the database directly.
 use crate::db::{Db, now_unix};
 use crate::jobs::{JobId, JobRepo, JobRow, JobStatus, KillOutcome, kill_persisted};
+use crate::oauth::{AgentActivity, Store};
 
 /// Open the database the running server uses — only if it exists and carries this
 /// binary's schema: no file is created and nothing is migrated, so a typo'd
@@ -36,11 +37,27 @@ pub async fn jobs(all: bool) -> anyhow::Result<()> {
 
 fn render_jobs(rows: &[JobRow]) -> String {
     let id_w = rows.iter().map(|r| r.id.len()).max().unwrap_or(2).max(2);
+    // Who started each job (an agent's label); `-` for rows from before that was
+    // recorded. Labels are cleaned on read, so they are already printable.
+    let owners: Vec<String> = rows
+        .iter()
+        .map(|r| {
+            r.owner
+                .as_ref()
+                .map_or_else(|| "-".to_string(), |a| a.label())
+        })
+        .collect();
+    let by_w = owners
+        .iter()
+        .map(|o| o.chars().count())
+        .max()
+        .unwrap_or(2)
+        .max(2);
     let mut out = format!(
-        "{:<id_w$}  {:<8}  {:>4}  {:<19}  {}\n",
-        "ID", "STATUS", "CODE", "STARTED", "TITLE / ERROR"
+        "{:<id_w$}  {:<8}  {:>4}  {:<19}  {:<by_w$}  {}\n",
+        "ID", "STATUS", "CODE", "STARTED", "BY", "TITLE / ERROR"
     );
-    for r in rows {
+    for (r, by) in rows.iter().zip(&owners) {
         let code = r.code.map(|c| c.to_string()).unwrap_or_else(|| "-".into());
         // For a failure the error is the useful column; otherwise the title.
         let note = match (r.status.parse::<JobStatus>(), r.error.as_deref()) {
@@ -48,11 +65,12 @@ fn render_jobs(rows: &[JobRow]) -> String {
             _ => r.title.as_deref().unwrap_or("-"),
         };
         out.push_str(&format!(
-            "{:<id_w$}  {:<8}  {:>4}  {:<19}  {}\n",
+            "{:<id_w$}  {:<8}  {:>4}  {:<19}  {:<by_w$}  {}\n",
             printable(&r.id),
             printable(&r.status),
             code,
             fmt_time(r.started_unix),
+            by,
             printable(note),
         ));
     }
@@ -156,10 +174,12 @@ pub async fn sessions(revoke: bool) -> anyhow::Result<()> {
     let now = now_unix();
     let access = token_stats(&db, "access_tokens", now).await?;
     let refresh = token_stats(&db, "refresh_tokens", now).await?;
+    let agents = Store::new(db).logged_in_agents().await?;
     print!(
         "{}",
         render_sessions(&path.display().to_string(), &access, &refresh, now)
     );
+    print!("{}", render_agents(&agents, now));
     Ok(())
 }
 
@@ -204,6 +224,28 @@ fn render_sessions(db_path: &str, access: &TokenStats, refresh: &TokenStats, now
     out.push_str(&line("access tokens ", access));
     out.push_str(&line("refresh tokens", refresh));
     out.push_str("(authorization codes are short-lived and held in memory — not shown)\n");
+    out
+}
+
+/// One line per client holding a live login, with when it last used a bearer.
+fn render_agents(agents: &[AgentActivity], now: i64) -> String {
+    if agents.is_empty() {
+        return "agents: none logged in\n".to_string();
+    }
+    let labels: Vec<String> = agents.iter().map(|a| a.agent.label()).collect();
+    let w = labels.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+    let mut out = "agents (logged in, most recently active first):\n".to_string();
+    for (activity, label) in agents.iter().zip(&labels) {
+        let seen = match activity.last_used_unix {
+            Some(at) => format!(
+                "last active {} ({} ago)",
+                fmt_time(at),
+                humanize_duration(now - at)
+            ),
+            None => "not active since this was tracked".to_string(),
+        };
+        out.push_str(&format!("  {label:<w$}  {seen}\n"));
+    }
     out
 }
 

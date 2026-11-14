@@ -44,9 +44,9 @@ async fn drop_table(db: &Db, table: &'static str) {
 async fn a_client_is_bound_to_exactly_the_uris_it_registered() {
     let store = store();
     let uris = ["http://localhost/cb".to_string(), "https://app/cb".into()];
-    let client_id = store.register_client(&uris).await.unwrap();
+    let client_id = store.register_client(&uris, None).await.unwrap();
     let other = store
-        .register_client(&["https://other/cb".into()])
+        .register_client(&["https://other/cb".into()], None)
         .await
         .unwrap();
     let unknown = "never-registered".to_string();
@@ -73,7 +73,7 @@ async fn registering_the_same_uri_twice_is_one_binding() {
     let store = store();
     let uri = "https://app/cb".to_string();
     let client_id = store
-        .register_client(&[uri.clone(), uri.clone()])
+        .register_client(&[uri.clone(), uri.clone()], None)
         .await
         .unwrap();
     assert!(
@@ -102,7 +102,7 @@ async fn registration_is_refused_once_the_client_table_is_full() {
         .await
         .unwrap();
     assert_eq!(
-        store.register_client(&["https://b/cb".into()]).await,
+        store.register_client(&["https://b/cb".into()], None).await,
         Err(RegisterError::Full)
     );
 }
@@ -412,4 +412,136 @@ fn tokens_debug_is_redacted() {
     let tokens = new_tokens();
     let shown = format!("{tokens:?}");
     assert!(!shown.contains(&tokens.access) && !shown.contains(&tokens.refresh));
+}
+
+// ---- presence ----
+
+/// A live token for a freshly registered client named `name`; returns the bearer.
+async fn login_as(store: &Store, name: Option<&str>) -> String {
+    let client = store
+        .register_client(&[CB.into()], name.and_then(crate::agent::ClientName::parse))
+        .await
+        .unwrap();
+    let code = store
+        .new_code(ConsentRequest {
+            client_id: client.clone(),
+            ..request(&client)
+        })
+        .await
+        .unwrap();
+    store
+        .redeem(&code, VERIFIER, CB, Some(&client))
+        .await
+        .unwrap()
+        .access
+}
+
+async fn last_used(db: &Db) -> Vec<Option<i64>> {
+    db.call(|conn| {
+        let mut stmt = conn.prepare("SELECT last_used_unix FROM clients")?;
+        stmt.query_map([], |r| r.get(0))?.collect()
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn authenticate_names_the_agent_and_marks_it_active() {
+    let db = Db::memory();
+    let store = Store::new(db.clone());
+    let bearer = login_as(&store, Some("cursor")).await;
+    assert_eq!(last_used(&db).await, [None], "not active before any use");
+
+    let agent = store
+        .authenticate(&hash_token(&bearer))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(agent.name(), Some("cursor"));
+    let first = last_used(&db).await;
+    assert!(first[0].is_some(), "the use is recorded");
+
+    // A second use within a minute is a read: the time doesn't move.
+    store
+        .authenticate(&hash_token(&bearer))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(last_used(&db).await, first);
+
+    assert_eq!(
+        store.authenticate(&hash_token("unknown")).await.unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn an_expired_bearer_authenticates_no_one_and_is_evicted() {
+    let db = Db::memory();
+    let store = Store::new(db.clone());
+    let bearer = login_as(&store, None).await;
+    db.call(|c| c.execute("UPDATE access_tokens SET expires_unix = 1", []))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.authenticate(&hash_token(&bearer)).await.unwrap(),
+        None
+    );
+    assert_eq!(row_count(&db, "access_tokens").await, 0);
+}
+
+#[tokio::test]
+async fn active_agents_are_those_seen_in_the_window_newest_first() {
+    let db = Db::memory();
+    let store = Store::new(db.clone());
+    let (a, b) = (
+        login_as(&store, Some("alpha")).await,
+        login_as(&store, Some("beta")).await,
+    );
+    let _idle = login_as(&store, Some("idle")).await;
+    store.authenticate(&hash_token(&a)).await.unwrap();
+    store.authenticate(&hash_token(&b)).await.unwrap();
+    // `alpha` was last seen long ago: outside the window.
+    let stale = now_unix() - secs(PRESENCE_WINDOW) - 1;
+    let alpha = store.authenticate(&hash_token(&a)).await.unwrap().unwrap();
+    let id = alpha.client_id().to_string();
+    db.call(move |c| {
+        c.execute(
+            "UPDATE clients SET last_used_unix = ?1 WHERE client_id = ?2",
+            (stale, id),
+        )
+    })
+    .await
+    .unwrap();
+
+    let active = store.active_agents().await.unwrap();
+    let names: Vec<_> = active.iter().map(|a| a.name()).collect();
+    assert_eq!(names, [Some("beta")]);
+
+    let logged_in = store.logged_in_agents().await.unwrap();
+    let names: Vec<_> = logged_in.iter().map(|a| a.agent.name()).collect();
+    assert_eq!(
+        names,
+        [Some("beta"), Some("alpha"), Some("idle")],
+        "most recent first, never-used last"
+    );
+    assert_eq!(logged_in[2].last_used_unix, None);
+}
+
+#[tokio::test]
+async fn a_client_name_is_stored_cleaned() {
+    let db = Db::memory();
+    let store = Store::new(db.clone());
+    let bearer = login_as(&store, Some("bad\u{1b}[2J\nname")).await;
+    let agent = store
+        .authenticate(&hash_token(&bearer))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(agent.name(), Some("bad[2J name"));
+    let stored: String = db
+        .call(|c| c.query_row("SELECT client_name FROM clients", [], |r| r.get(0)))
+        .await
+        .unwrap();
+    assert_eq!(stored, "bad[2J name");
 }

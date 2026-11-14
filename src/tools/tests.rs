@@ -131,7 +131,10 @@ async fn file_dispatch_renders_outcomes_and_next_step_hints() {
     let dir = tempfile::tempdir().unwrap();
     let path = |name: &str| dir.path().join(name).to_string_lossy().into_owned();
     let call = async |args: FileArgs| {
-        let r = tools.file(Parameters(args), req()).await.unwrap();
+        let r = tools
+            .file(Parameters(args), req(), Extensions::default())
+            .await
+            .unwrap();
         result_text(&r)
     };
 
@@ -221,7 +224,11 @@ async fn file_dispatch_rejects_missing_arguments() {
         ),
     ] {
         let r = tools
-            .file(Parameters(args), RequestId(NumberOrString::Number(1)))
+            .file(
+                Parameters(args),
+                RequestId(NumberOrString::Number(1)),
+                Extensions::default(),
+            )
             .await
             .unwrap();
         assert_eq!(result_text(&r), (want.to_string(), true));
@@ -255,7 +262,11 @@ async fn file_dispatch_rejects_missing_arguments() {
         ),
     ] {
         let r = tools
-            .file(Parameters(args), RequestId(NumberOrString::Number(1)))
+            .file(
+                Parameters(args),
+                RequestId(NumberOrString::Number(1)),
+                Extensions::default(),
+            )
             .await
             .unwrap();
         assert_eq!(result_text(&r), (want.to_string(), true));
@@ -281,6 +292,7 @@ async fn file_delete_of_populated_dir_requires_recursive() {
         .file(
             Parameters(delete(None)),
             RequestId(NumberOrString::Number(1)),
+            Extensions::default(),
         )
         .await
         .unwrap();
@@ -292,6 +304,7 @@ async fn file_delete_of_populated_dir_requires_recursive() {
         .file(
             Parameters(delete(Some(true))),
             RequestId(NumberOrString::Number(2)),
+            Extensions::default(),
         )
         .await
         .unwrap();
@@ -325,6 +338,7 @@ async fn file_dispatch_logs_action_and_outcome_not_path_or_content() {
                 ..file_args(FileAction::Write)
             }),
             RequestId(NumberOrString::Number(9)),
+            Extensions::default(),
         )
         .await
         .unwrap();
@@ -362,7 +376,11 @@ fn job_args(action: JobAction, id: Option<&str>) -> JobArgs {
 
 async fn call_bash(tools: &Tools, args: BashArgs) -> (String, bool) {
     let r = tools
-        .bash(Parameters(args), RequestId(NumberOrString::Number(1)))
+        .bash(
+            Parameters(args),
+            RequestId(NumberOrString::Number(1)),
+            Extensions::default(),
+        )
         .await
         .unwrap();
     result_text(&r)
@@ -370,7 +388,11 @@ async fn call_bash(tools: &Tools, args: BashArgs) -> (String, bool) {
 
 async fn call_job(tools: &Tools, args: JobArgs) -> (String, bool) {
     let r = tools
-        .job(Parameters(args), RequestId(NumberOrString::Number(1)))
+        .job(
+            Parameters(args),
+            RequestId(NumberOrString::Number(1)),
+            Extensions::default(),
+        )
         .await
         .unwrap();
     result_text(&r)
@@ -466,7 +488,7 @@ async fn job_kill_wording_per_outcome() {
         (format!("killed {running}"), false)
     );
 
-    let rendered = |o| result_text(&job_render::kill(&JobId::from("j"), Ok(o)));
+    let rendered = |o| result_text(&job_render::kill(&JobId::from("j"), Ok(o), None));
     assert!(
         rendered(KillOutcome::KilledLeftovers)
             .0
@@ -489,6 +511,7 @@ async fn job_kill_wording_per_outcome() {
     let (out, is_err) = result_text(&job_render::kill(
         &JobId::from("j"),
         Err(crate::jobs::JobError::Store(rusqlite::Error::InvalidQuery)),
+        None,
     ));
     assert!(
         is_err && out == "job store unavailable — try again shortly",
@@ -507,7 +530,7 @@ async fn job_list_is_a_bounded_page_with_a_cursor() {
         db.clone(),
     )
     .unwrap();
-    let tools = Tools::new(store);
+    let tools = Tools::new(store, Arc::new(Store::new(crate::db::Db::memory())));
     db.call(|c| {
         let tx = c.unchecked_transaction()?;
         for i in 0..5000 {
@@ -542,6 +565,7 @@ async fn job_dispatch_logs_action_and_outcome() {
         .job(
             Parameters(job_args(JobAction::Poll, Some("nope"))),
             RequestId(NumberOrString::Number(5)),
+            Extensions::default(),
         )
         .await
         .unwrap();
@@ -561,7 +585,7 @@ fn tools() -> Tools {
         crate::db::Db::memory(),
     )
     .unwrap();
-    Tools::new(store)
+    Tools::new(store, Arc::new(Store::new(crate::db::Db::memory())))
 }
 
 /// Every tool dispatch emits an event inside a span carrying `tool` +
@@ -584,6 +608,7 @@ async fn bash_dispatch_emits_event_with_tool_and_request_id() {
                 title: None,
             }),
             RequestId(NumberOrString::Number(42)),
+            Extensions::default(),
         )
         .await
         .unwrap();
@@ -776,4 +801,108 @@ fn advertised_input_schemas_are_the_arg_structs() {
             "{name} must stay deny_unknown_fields"
         );
     }
+}
+
+// ---- agents: presence, `by`, owner notes ----
+
+fn agent(id: &str, name: &str) -> crate::agent::Agent {
+    crate::agent::Agent::new(id.into(), Some(name))
+}
+
+fn summary(id: &str, owner: Option<crate::agent::Agent>) -> crate::jobs::JobSummary {
+    crate::jobs::JobSummary {
+        id: JobId::from(id),
+        state: crate::jobs::JobState::Running,
+        owner,
+    }
+}
+
+#[test]
+fn job_list_opens_with_presence_and_marks_each_owner() {
+    let (me, other) = (agent("me", "claude-code"), agent("other", "cursor"));
+    let page = crate::jobs::JobList {
+        jobs: vec![
+            summary("mine", Some(me.clone())),
+            summary("theirs", Some(other.clone())),
+            summary("legacy", None),
+        ],
+        next_cursor: None,
+    };
+    let active = Ok(vec![other.clone(), me.clone()]);
+    let (out, is_err) = result_text(&job_render::list(Ok(page), Some(&me), active));
+    assert!(!is_err, "{out}");
+    let (presence, json) = out.split_once('\n').unwrap();
+    assert_eq!(
+        presence,
+        format!(
+            "2 agents active (last 15 min): you ({}), {}",
+            me.label(),
+            other.label()
+        )
+    );
+    let rows: serde_json::Value = serde_json::from_str(json).unwrap();
+    let by: Vec<&str> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["by"].as_str().unwrap())
+        .collect();
+    assert_eq!(by, ["you", other.label().as_str(), "unknown"]);
+}
+
+#[test]
+fn presence_counts_the_caller_even_when_not_yet_recorded_or_unreadable() {
+    let me = agent("me", "solo");
+    let empty = crate::jobs::JobList {
+        jobs: vec![],
+        next_cursor: None,
+    };
+    let (out, _) = result_text(&job_render::list(Ok(empty), Some(&me), Ok(vec![])));
+    assert!(
+        out.starts_with(&format!(
+            "1 agent active (last 15 min): you ({})\n",
+            me.label()
+        )),
+        "{out}"
+    );
+    let empty = crate::jobs::JobList {
+        jobs: vec![],
+        next_cursor: None,
+    };
+    let down = Err(crate::oauth::StoreUnavailable);
+    let (out, is_err) = result_text(&job_render::list(Ok(empty), Some(&me), down));
+    assert!(
+        !is_err && out.starts_with("(which agents are active is unavailable"),
+        "{out}"
+    );
+}
+
+#[test]
+fn poll_and_kill_of_another_agents_job_say_whose_it_is() {
+    let page = crate::jobs::TailPage {
+        lines: vec!["hello".into()],
+        older: None,
+    };
+    let id = JobId::from("theirs");
+    let polled = Ok(Some((crate::jobs::JobState::Running, page)));
+    let (out, is_err) = result_text(&job_render::poll(&id, polled, Some("cursor#9b1c")));
+    assert!(!is_err);
+    assert!(
+        out.starts_with("[started by another agent: cursor#9b1c]\n{\"status\":\"running\"}"),
+        "{out}"
+    );
+
+    let (out, is_err) = result_text(&job_render::kill(
+        &id,
+        Ok(KillOutcome::Killed),
+        Some("cursor#9b1c"),
+    ));
+    assert!(!is_err);
+    assert_eq!(
+        out,
+        "[started by another agent: cursor#9b1c]\nkilled theirs"
+    );
+    // Your own job reads as before.
+    let (out, _) = result_text(&job_render::kill(&id, Ok(KillOutcome::Killed), None));
+    assert_eq!(out, "killed theirs");
 }
