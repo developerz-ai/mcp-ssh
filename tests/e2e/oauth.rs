@@ -16,10 +16,20 @@ pub const REDIRECT: &str = "http://localhost/cb";
 /// register → GET /authorize (consent page) → POST /authorize → /token, as the
 /// headless `bin/mcp-token` does. Returns the access token.
 pub async fn login(base: &str) -> String {
+    login_as(base, None).await
+}
+
+/// [`login`] as a client that registers `client_name` (what other agents see it
+/// by), or none.
+pub async fn login_as(base: &str, client_name: Option<&str>) -> String {
     let http = http();
+    let mut registration = json!({ "redirect_uris": [REDIRECT] });
+    if let Some(name) = client_name {
+        registration["client_name"] = json!(name);
+    }
     let reg: Value = http
         .post(format!("{base}/register"))
-        .json(&json!({ "redirect_uris": [REDIRECT] }))
+        .json(&registration)
         .send()
         .await
         .expect("register")

@@ -32,6 +32,8 @@ You're in your car. From your phone, you point Claude at `https://your-vps/mcp` 
 
 Want to go further? Run `bash("claude -p 'fix the failing test and push'")` — **one agent supervising another agent** on your VPS. mcp-ssh is just the shell; what you run through it is up to you.
 
+**Several agents, one host.** Any number of MCP clients can connect at once, each with its own login; their commands and jobs run side by side, never queued behind each other. They can see each other: `job(action="list")` opens with who is active (`2 agents active (last 15 min): you (Claude Code#4f2a), cursor#9b1c`) and marks each job `by` you or the agent that started it. Jobs are shared, not isolated — one service user — so an agent can poll or kill another's job, and the reply says whose it is.
+
 ## ⚡ Quickstart
 
 **One-liner (Debian/Ubuntu)** — downloads the latest release, asks for a username + password, installs the service, and starts it:
@@ -106,9 +108,9 @@ mcp-ssh set-auth admin     # prompts for the password
 mcp-ssh serve              # run the server (this is the default)
 mcp-ssh set-auth <user>    # configure the username/password (logs every client out)
 
-mcp-ssh jobs               # list running jobs (--all includes finished ones)
+mcp-ssh jobs               # list running jobs and which agent started each (--all includes finished ones)
 mcp-ssh job kill <id>      # SIGTERM then SIGKILL a job's process group
-mcp-ssh sessions           # summarise OAuth logins (token counts + next expiry)
+mcp-ssh sessions           # summarise OAuth logins (token counts, next expiry, each agent's last activity)
 mcp-ssh sessions --revoke  # end every login: all clients must log in again
 ```
 

@@ -1,6 +1,7 @@
 //! The row⇄domain mapping for `jobs`: the typed rows queries return, and
 //! `JobState` onto the `(status, code, error)` columns and back — so a status word
 //! is spelled (via `JobStatus`) and read in exactly one place.
+use crate::agent::Agent;
 use crate::jobs::{JobId, JobState, JobStatus};
 
 /// A job's durable row, mapped back onto the domain types. `tail` is the bounded
@@ -55,6 +56,8 @@ pub(crate) struct JobRow {
     pub(crate) error: Option<String>,
     pub(crate) started_unix: i64,
     pub(crate) title: Option<String>,
+    /// Who started it; `None` for a row from before that was recorded.
+    pub(crate) owner: Option<Agent>,
 }
 
 /// Map a `JobState` onto the DB row's `(status, code, error)` columns.
@@ -98,5 +101,6 @@ pub(super) fn job_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<JobRow> {
         error: r.get(3)?,
         started_unix: r.get(4)?,
         title: r.get(5)?,
+        owner: Agent::from_columns(r.get(6)?, r.get(7)?),
     })
 }

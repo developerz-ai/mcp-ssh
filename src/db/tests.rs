@@ -131,8 +131,9 @@ async fn a_legacy_v0_database_migrates_to_the_latest_schema() {
     // column the migrations added.
     db.call(|c| {
         c.execute(
-            "INSERT INTO jobs (id, title, status, started_unix, output_tail, pgid, boot_id, finished_unix) \
-             VALUES ('new', 't', 'running', 1, NULL, 2, 'boot', NULL)",
+            "INSERT INTO jobs (id, title, status, started_unix, output_tail, pgid, boot_id, finished_unix, \
+                               client_id, client_name) \
+             VALUES ('new', 't', 'running', 1, NULL, 2, 'boot', NULL, 'c1', 'Claude Code')",
             [],
         )
     })
@@ -287,4 +288,30 @@ async fn open_existing_waits_out_the_servers_write_lock() {
     .await
     .expect("write waits for the server's transaction");
     holder.await.unwrap().unwrap();
+}
+
+/// v7: a job from before owners were recorded keeps no owner; clients gain a
+/// name and a last-use time, both empty for an existing registration.
+#[tokio::test]
+async fn v7_adds_owner_and_presence_columns_empty_for_existing_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy.db");
+    legacy_v0(&path);
+    let db = Db::open(&path).unwrap();
+    let (job_owner, client): (Option<String>, (Option<String>, Option<i64>)) = db
+        .call(|c| {
+            let owner = c.query_row("SELECT client_id FROM jobs WHERE id = 'old'", [], |r| {
+                r.get(0)
+            })?;
+            let client = c.query_row(
+                "SELECT client_name, last_used_unix FROM clients WHERE client_id = 'c1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            Ok((owner, client))
+        })
+        .await
+        .unwrap();
+    assert_eq!(job_owner, None);
+    assert_eq!(client, (None, None));
 }

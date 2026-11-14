@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use reqwest::Client;
 
 use crate::client::Session;
-use crate::oauth::login;
+use crate::oauth::{login, login_as};
 
 pub const USER: &str = "e2e";
 pub const PASS: &str = "e2e-password";
@@ -115,6 +115,13 @@ impl Server {
     /// Run the full OAuth login and open an initialized MCP session.
     pub async fn session(&self) -> Session {
         let token = login(&self.base).await;
+        Session::open(&self.base, &token).await
+    }
+
+    /// [`Server::session`] as its own OAuth client, registered as `client_name`
+    /// — one per agent sharing the host.
+    pub async fn session_as(&self, client_name: &str) -> Session {
+        let token = login_as(&self.base, Some(client_name)).await;
         Session::open(&self.base, &token).await
     }
 }

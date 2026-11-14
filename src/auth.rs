@@ -56,15 +56,17 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
 }
 
 /// Middleware guarding `/mcp`. Only a valid OAuth bearer token lets a request
-/// through. A token store that can't answer is a 503 (retry), not a 401 — a 401
-/// would send every client back through the login flow during a DB blip. A
-/// streaming response keeps checking its token for as long as it stays open.
-pub async fn require_auth(State(st): State<AuthState>, req: Request, next: Next) -> Response {
-    let headers = req.headers();
-    if let Some(token) = bearer(headers) {
+/// through, carrying the [`Agent`](crate::agent::Agent) it was issued to as a request extension (the
+/// tools attribute jobs to it). A token store that can't answer is a 503 (retry),
+/// not a 401 — a 401 would send every client back through the login flow during
+/// a DB blip. A streaming response keeps checking its token for as long as it
+/// stays open.
+pub async fn require_auth(State(st): State<AuthState>, mut req: Request, next: Next) -> Response {
+    if let Some(token) = bearer(req.headers()) {
         let token_hash = hash_token(token);
-        match st.store.validate_hash(&token_hash).await {
-            Ok(true) => {
+        match st.store.authenticate(&token_hash).await {
+            Ok(Some(agent)) => {
+                req.extensions_mut().insert(agent);
                 let response = next.run(req).await;
                 return revalidate::end_when_revoked(
                     response,
@@ -73,11 +75,11 @@ pub async fn require_auth(State(st): State<AuthState>, req: Request, next: Next)
                     st.revalidate_every,
                 );
             }
-            Ok(false) => {}
+            Ok(None) => {}
             Err(_) => return unavailable(),
         }
     }
-    unauthorized(st.public_url.as_deref(), headers)
+    unauthorized(st.public_url.as_deref(), req.headers())
 }
 
 fn unavailable() -> Response {

@@ -66,7 +66,7 @@ fn alive(pid: &str) -> bool {
 
 async fn bg(store: &JobStore, cmd: &str) -> JobId {
     match store
-        .run(cmd.into(), None, None, true, false, None)
+        .run(cmd.into(), None, None, true, false, JobMeta::default())
         .await
         .unwrap()
     {
@@ -125,7 +125,7 @@ async fn interactive_shell_expands_rc_aliases_without_leaking_startup_noise() {
     .unwrap();
 
     let r = store
-        .run("greet".into(), None, None, false, true, None)
+        .run("greet".into(), None, None, false, true, JobMeta::default())
         .await
         .unwrap();
     let RunResult::Inline { state, page, .. } = r else {
@@ -143,7 +143,14 @@ async fn interactive_shell_expands_rc_aliases_without_leaking_startup_noise() {
 #[tokio::test]
 async fn fast_command_returns_inline() {
     let r = store(Duration::from_secs(5))
-        .run("echo hello".into(), None, None, false, false, None)
+        .run(
+            "echo hello".into(),
+            None,
+            None,
+            false,
+            false,
+            JobMeta::default(),
+        )
         .await
         .unwrap();
     let RunResult::Inline { state, page, .. } = r else {
@@ -186,7 +193,14 @@ async fn job_dir_and_logs_are_owner_only() {
     let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode(&dir), 0o700, "a loose pre-existing dir is tightened");
     let RunResult::Inline { id, .. } = store
-        .run("echo s3cret".into(), None, None, false, false, None)
+        .run(
+            "echo s3cret".into(),
+            None,
+            None,
+            false,
+            false,
+            JobMeta::default(),
+        )
         .await
         .unwrap()
     else {
@@ -206,7 +220,7 @@ async fn title_labels_the_id_and_the_row_stores_it_normalized() {
             None,
             true,
             false,
-            Some("deploy check\x1b[2J\nforged".into()),
+            JobMeta::titled("deploy check\x1b[2J\nforged".into()),
         )
         .await
         .unwrap();
@@ -240,7 +254,7 @@ async fn a_bad_cwd_is_named_and_leaves_nothing_behind() {
             None,
             false,
             false,
-            None,
+            JobMeta::default(),
         )
         .await
     else {
@@ -255,7 +269,14 @@ async fn a_bad_cwd_is_named_and_leaves_nothing_behind() {
     std::fs::write(&file, "").unwrap();
     let file = file.to_string_lossy().into_owned();
     let Err(error) = store
-        .run("true".into(), Some(file), None, false, false, None)
+        .run(
+            "true".into(),
+            Some(file),
+            None,
+            false,
+            false,
+            JobMeta::default(),
+        )
         .await
     else {
         panic!("a file cwd must fail");
@@ -279,7 +300,14 @@ async fn inline_overflow_surfaces_id_and_remains_pollable() {
     let store = store(Duration::from_secs(5));
     let n = DEFAULT_PAGE + 50;
     let r = store
-        .run(format!("seq 1 {n}"), None, None, false, false, None)
+        .run(
+            format!("seq 1 {n}"),
+            None,
+            None,
+            false,
+            false,
+            JobMeta::default(),
+        )
         .await
         .unwrap();
     let RunResult::Inline { id, page, .. } = r else {
@@ -311,7 +339,7 @@ async fn concurrent_launches_never_share_an_id_or_a_log() {
                         None,
                         true,
                         false,
-                        Some("race".into()),
+                        JobMeta::titled("race".into()),
                     )
                     .await
             })
@@ -343,7 +371,7 @@ async fn slow_command_backgrounds_then_completes() {
             None,
             false,
             false,
-            None,
+            JobMeta::default(),
         )
         .await
         .unwrap();
@@ -363,7 +391,14 @@ async fn slow_command_backgrounds_then_completes() {
 async fn a_signal_death_is_reported_by_signal() {
     let store = store(Duration::from_secs(5));
     let RunResult::Inline { state, .. } = store
-        .run("kill -9 $$".into(), None, None, false, false, None)
+        .run(
+            "kill -9 $$".into(),
+            None,
+            None,
+            false,
+            false,
+            JobMeta::default(),
+        )
         .await
         .unwrap()
     else {
@@ -412,7 +447,7 @@ async fn started_interactive_job() -> (JobStore, JobId) {
             None,
             true,
             true,
-            None,
+            JobMeta::default(),
         )
         .await
         .unwrap()
@@ -510,7 +545,14 @@ async fn kill_unknown_and_finished_say_which() {
         KillOutcome::Unknown
     ));
     let RunResult::Inline { id, .. } = store
-        .run("echo bye".into(), None, None, false, false, None)
+        .run(
+            "echo bye".into(),
+            None,
+            None,
+            false,
+            false,
+            JobMeta::default(),
+        )
         .await
         .unwrap()
     else {
@@ -534,7 +576,7 @@ async fn kill_of_a_finished_job_reaches_what_it_left_running() {
             None,
             false,
             false,
-            None,
+            JobMeta::default(),
         )
         .await
         .unwrap()
@@ -668,7 +710,7 @@ async fn leftovers_past_the_log_cap_are_killed_and_the_job_says_why() {
             None,
             false,
             false,
-            None,
+            JobMeta::default(),
         )
         .await
         .unwrap()
@@ -720,7 +762,7 @@ async fn a_cancelled_launch_still_finishes_its_job() {
             None,
             false,
             false,
-            Some("cancel".into()),
+            JobMeta::titled("cancel".into()),
         ),
     )
     .await;
@@ -757,7 +799,14 @@ async fn a_job_whose_row_cannot_be_written_is_refused() {
         .await
         .unwrap();
     let result = store
-        .run("sleep 300".into(), None, None, true, false, None)
+        .run(
+            "sleep 300".into(),
+            None,
+            None,
+            true,
+            false,
+            JobMeta::default(),
+        )
         .await;
     assert!(matches!(result, Err(JobError::Store(_))));
     assert!(store.jobs.lock().await.is_empty(), "not tracked");
@@ -792,7 +841,14 @@ async fn list_pages_newest_first() {
     let store = store(Duration::from_secs(5));
     for title in ["a", "b", "c"] {
         store
-            .run("true".into(), None, None, false, false, Some(title.into()))
+            .run(
+                "true".into(),
+                None,
+                None,
+                false,
+                false,
+                JobMeta::titled(title.into()),
+            )
             .await
             .unwrap();
         // Distinct start seconds order the rows.
@@ -820,7 +876,7 @@ async fn list_and_poll_survive_a_restart() {
             None,
             false,
             false,
-            None,
+            JobMeta::default(),
         )
         .await
         .unwrap()
@@ -921,7 +977,7 @@ async fn restart_never_reuses_a_retained_job_id() {
             None,
             false,
             false,
-            Some("t".into()),
+            JobMeta::titled("t".into()),
         )
         .await
         .unwrap()
@@ -937,7 +993,7 @@ async fn restart_never_reuses_a_retained_job_id() {
             None,
             false,
             false,
-            Some("t".into()),
+            JobMeta::titled("t".into()),
         )
         .await
         .unwrap()
@@ -989,4 +1045,49 @@ async fn store_failures_surface_as_errors() {
         store.kill(&JobId::from("x")).await,
         Err(JobError::Store(_))
     ));
+}
+
+/// Every job records the agent that started it: `owner` reads it back (live or
+/// from the row) and `list` carries it per job; a job with no known caller has
+/// no owner.
+#[tokio::test]
+async fn a_job_records_the_agent_that_started_it() {
+    let store = store(Duration::from_secs(5));
+    let alpha = crate::agent::Agent::new("client-alpha".into(), Some("alpha"));
+    let r = store
+        .run(
+            "true".into(),
+            None,
+            None,
+            false,
+            false,
+            JobMeta {
+                title: Some("owned".into()),
+                owner: Some(alpha.clone()),
+            },
+        )
+        .await
+        .unwrap();
+    let RunResult::Inline { id: owned, .. } = r else {
+        panic!("`true` finishes inline");
+    };
+    let anonymous = bg(&store, "true").await;
+
+    assert_eq!(store.owner(&owned).await.unwrap(), Some(alpha.clone()));
+    assert_eq!(store.owner(&anonymous).await.unwrap(), None);
+    assert_eq!(
+        store.owner(&JobId::from("no-such-job")).await.unwrap(),
+        None
+    );
+
+    let page = store.list(0, None).await.unwrap();
+    let owner_of = |id: &JobId| {
+        page.jobs
+            .iter()
+            .find(|job| &job.id == id)
+            .map(|job| job.owner.clone())
+            .expect("listed")
+    };
+    assert_eq!(owner_of(&owned), Some(alpha));
+    assert_eq!(owner_of(&anonymous), None);
 }

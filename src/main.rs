@@ -1,5 +1,6 @@
 //! mcp-ssh — remote shell + file access for AI agents over authenticated MCP-HTTP.
 mod admin;
+mod agent;
 mod app;
 mod auth;
 mod cli;

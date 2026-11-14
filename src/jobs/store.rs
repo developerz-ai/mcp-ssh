@@ -15,7 +15,8 @@ use std::path::Path;
 use rusqlite::OptionalExtension;
 
 use super::log::{self, TailBudget, TailPage};
-use super::{JobId, JobState, JobStatus, JobSummary, ProcessGroupId};
+use super::{JobId, JobMeta, JobState, JobStatus, JobSummary, ProcessGroupId};
+use crate::agent::Agent;
 use crate::db::{Db, now_unix};
 
 mod fail;
@@ -55,15 +56,15 @@ impl JobRepo {
         &self.db
     }
 
-    /// Record a newly launched job as `running`. `title` is the normalized label
-    /// (never command text); `pgid` + `boot_id` are persisted so `mcp-ssh job kill`
+    /// Record a newly launched job as `running`. `meta` holds the normalized title
+    /// (never command text) and the agent that started it; `pgid` + `boot_id` are persisted so `mcp-ssh job kill`
     /// can signal the group after the launching process is gone — and refuse to
     /// once the host has rebooted and the number may name another group.
     /// `interactive` is persisted so that kill escalates as a live one would.
     pub(super) async fn insert_running(
         &self,
         id: &JobId,
-        title: Option<String>,
+        meta: &JobMeta,
         started_unix: i64,
         pgid: Option<ProcessGroupId>,
         boot_id: Option<String>,
@@ -71,12 +72,20 @@ impl JobRepo {
     ) -> rusqlite::Result<()> {
         let row_id = id.as_ref().to_string();
         let pgid = pgid.map(|p| i64::from(p.get()));
+        let title = meta.title.clone();
+        let client_id = meta.owner.as_ref().map(|a| a.client_id().to_string());
+        let client_name = meta
+            .owner
+            .as_ref()
+            .and_then(|a| a.name())
+            .map(str::to_string);
         self.db
             .call(move |conn| {
                 conn.execute(
                     "INSERT INTO jobs \
-                     (id, title, status, started_unix, pgid, boot_id, interactive) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                     (id, title, status, started_unix, pgid, boot_id, interactive, \
+                      client_id, client_name) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                     rusqlite::params![
                         row_id,
                         title,
@@ -84,7 +93,9 @@ impl JobRepo {
                         started_unix,
                         pgid,
                         boot_id,
-                        interactive
+                        interactive,
+                        client_id,
+                        client_name
                     ],
                 )
             })
@@ -187,7 +198,7 @@ impl JobRepo {
             .db
             .call(move |conn| {
                 let mut stmt = conn.prepare(
-                    "SELECT id, status, code, error FROM jobs \
+                    "SELECT id, status, code, error, client_id, client_name FROM jobs \
                      ORDER BY started_unix DESC, id DESC LIMIT ?1 OFFSET ?2",
                 )?;
                 let mapped = stmt.query_map([fetch, offset], |r| {
@@ -198,6 +209,7 @@ impl JobRepo {
                             r.get::<_, Option<i64>>(2)?,
                             r.get::<_, Option<String>>(3)?,
                         ),
+                        owner: Agent::from_columns(r.get(4)?, r.get(5)?),
                     })
                 })?;
                 let mut rows = Vec::new();
@@ -219,6 +231,24 @@ impl JobRepo {
         Ok((rows, more))
     }
 
+    /// The agent recorded as starting job `id`; `None` for no such row, or a row
+    /// from before owners were recorded.
+    pub(super) async fn owner(&self, id: &JobId) -> rusqlite::Result<Option<Agent>> {
+        let row_id = id.as_ref().to_string();
+        let columns = self
+            .db
+            .call(move |conn| {
+                conn.query_row(
+                    "SELECT client_id, client_name FROM jobs WHERE id = ?1",
+                    [row_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()
+            })
+            .await?;
+        Ok(columns.and_then(|(client_id, name)| Agent::from_columns(client_id, name)))
+    }
+
     /// Rows behind `mcp-ssh jobs`: active jobs by default, or every job newest
     /// first with `all` (capped, so a long-lived box's history can't flood the
     /// terminal).
@@ -226,10 +256,10 @@ impl JobRepo {
         self.db
             .call(move |conn| {
                 let sql = if all {
-                    "SELECT id, status, code, error, started_unix, title \
+                    "SELECT id, status, code, error, started_unix, title, client_id, client_name \
                      FROM jobs ORDER BY started_unix DESC LIMIT 200"
                 } else {
-                    "SELECT id, status, code, error, started_unix, title \
+                    "SELECT id, status, code, error, started_unix, title, client_id, client_name \
                      FROM jobs WHERE status = ?1 ORDER BY started_unix DESC"
                 };
                 let mut stmt = conn.prepare(sql)?;

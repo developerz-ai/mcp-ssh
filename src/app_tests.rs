@@ -625,7 +625,8 @@ async fn tools_call_exercises_bash_file_and_job() {
         "file read content: {read_text}"
     );
 
-    // ── job: list → valid JSON (array, possibly empty since bash ran inline) ─
+    // ── job: list → the presence line (the caller, as `you`: the bearer's
+    // client reached the tool through rmcp), then a JSON array ─
     let job_msg = call_tool(
         app.clone(),
         &token,
@@ -638,7 +639,18 @@ async fn tools_call_exercises_bash_file_and_job() {
     let job_text = job_msg["result"]["content"][0]["text"]
         .as_str()
         .expect("job list result must have text content");
-    serde_json::from_str::<serde_json::Value>(job_text).expect("job list must return valid JSON");
+    let (presence, json) = job_text.split_once('\n').expect("presence line, then JSON");
+    assert!(
+        presence.starts_with("1 agent active (last 15 min): you (client#"),
+        "{presence}"
+    );
+    let jobs = serde_json::from_str::<serde_json::Value>(json).expect("job list must be JSON");
+    let jobs = jobs.as_array().expect("an array");
+    assert!(!jobs.is_empty(), "the inline bash call is listed");
+    assert!(
+        jobs.iter().all(|job| job["by"] == "you"),
+        "the caller's own jobs read `by: you`: {jobs:?}"
+    );
 }
 
 /// A call rmcp refuses before dispatch (here a misspelt param) used to leave the

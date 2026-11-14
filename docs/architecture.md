@@ -81,8 +81,8 @@ A single SQLite database at `/var/lib/mcp-ssh/mcp-ssh.db` (sibling of the job-lo
 **In SQLite — durable, survives restarts:**
 
 - **OAuth tokens** — `access_tokens` and `refresh_tokens`, stored only as SHA-256 hashes (a copy of the DB yields no usable bearer), each bound to its client and login family. Logins survive a service restart — which matters because the agent can self-update and restart itself. Access tokens last 24h; refresh tokens 30 days, rotated on use, within a 90-day family cap; a replayed (already-rotated) refresh token ends its whole family.
-- **Registered clients** — `clients` (`client_id` → redirect URIs, no secrets), capped at 1000; a client at least 7 days old that holds no live token is swept.
-- **Job metadata** — id, title, status (`running`/`exited`/`failed`), exit code or error, start/finish time, process group + boot id, and a saved **output tail** (last 500 lines, ≤256 KiB). This is what makes `job(action="list")` show history across restarts.
+- **Registered clients** — `clients` (`client_id` → redirect URIs, the cleaned `client_name` it registered, when it last used a bearer; no secrets), capped at 1000; a client at least 7 days old that holds no live token is swept. The last-use time is rewritten at most once a minute per client, so a busy agent's requests stay reads; it is what `job(action="list")`'s presence line and `mcp-ssh sessions` read.
+- **Job metadata** — id, title, status (`running`/`exited`/`failed`), exit code or error, start/finish time, process group + boot id, the OAuth client that started it (id + name, so the owner still reads right after the client is swept), and a saved **output tail** (last 500 lines, ≤256 KiB). This is what makes `job(action="list")` show history across restarts.
 
 **On the filesystem — the high-frequency path:**
 

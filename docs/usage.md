@@ -53,7 +53,7 @@ Nothing that can be large is returned whole. Stdout and stderr are merged into o
 - When older output exists, the footer `[latest N lines shown; earlier output: job(action="poll", id="…", cursor=C)]` names the exact next call. `C` is a **byte offset** into the log (where the page you just got starts) — pass it back verbatim, never compute one. It is absolute, so a running job that keeps appending never re-serves lines as you page back.
 - Once the live log is gone (trimmed or reaped), `poll` serves the output tail saved when the job finished: its last 500 lines, at most 256 KiB.
 
-**Job history (`job(action="list")`)** is a JSON array of `{"id": …, "state": {"status": …}}`, newest first, at most `limit` (default and maximum 200) per page. When older jobs exist the reply ends with `[older jobs: job(action="list", cursor=N)]`.
+**Job history (`job(action="list")`)** opens with a presence line — the agents that used this host in the last 15 minutes, you first — then a JSON array of `{"id": …, "state": {"status": …}, "by": …}`, newest first, at most `limit` (default and maximum 200) per page. When older jobs exist the reply ends with `[older jobs: job(action="list", cursor=N)]`.
 
 **Files (`file(action="read")`) page forward by line:** `cursor` is the line to start at (default 0), `limit` the line count (default 200, at most 1000), and a page also stops at 64 KiB. When more remains the reply ends with `[lines A..B of ≥T; next_cursor=B]` — the total is a lower bound, since the file is never scanned to the end. An empty file reads `[empty file]`; a cursor past the end says how many lines the file has.
 
@@ -97,6 +97,21 @@ job(action="list")                                     # newest 200 jobs + statu
 job(action="list", cursor=200)                         # the next (older) page
 job(action="kill", id="job-23-30-07")
 ```
+
+**Several agents on one host.** Each MCP client logs in on its own and gets its own bearer; their calls run concurrently (a slow command or job of one never holds up another). An agent is shown by the `client_name` its client registered plus a 4-hex tag that tells two clients of the same name apart (`Claude Code#4f2a`), or `client#<tag>` when it registered none. Names are cleaned before anyone sees them: control and invisible characters are dropped, whitespace collapsed, at most 32 characters.
+
+```
+job(action="list")
+→ 2 agents active (last 15 min): you (Claude Code#4f2a), cursor#9b1c
+  [
+    { "id": "deploy-10-12-03", "state": { "status": "running" }, "by": "cursor#9b1c" },
+    { "id": "build-10-11-40", "state": { "status": "exited", "code": 0 }, "by": "you" }
+  ]
+```
+
+- `by` is `you`, another agent's label, or `unknown` for a job started before owners were recorded.
+- An agent counts as active once it has used its bearer in the last 15 minutes (tracked per client, to the minute).
+- Jobs are shared, not isolated: every agent runs as the same service user, so any agent can `poll` or `kill` any job. A reply about another agent's job opens with `[started by another agent: cursor#9b1c]`.
 
 `kill` signals the job's whole process group (`SIGTERM`, a 2s grace, then `SIGKILL`) and only reports success once the group is verifiably gone:
 
