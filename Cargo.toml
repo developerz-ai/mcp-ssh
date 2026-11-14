@@ -1,6 +1,6 @@
 [package]
 name = "mcp-ssh"
-version = "2.1.0"
+version = "2.2.0"
 edition = "2024"
 rust-version = "1.100"  # = rust-toolchain.toml + Dockerfile base; bump together
 description = "Remote shell + file access for AI agents over authenticated MCP-HTTP — an ssh replacement you talk to over /mcp"
