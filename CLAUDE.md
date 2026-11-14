@@ -2,16 +2,24 @@
 
 `mcp-ssh` — a single Rust binary. An MCP server giving an AI agent remote shell + file access to **one** host (the box it runs on), over authenticated MCP Streamable HTTP at `/mcp`. Executes commands **locally** as the service user. Runs as a systemd service. "ssh, but over `/mcp` from any MCP client."
 
+## NEVER
+
+- Log or return the password / token — not in responses, errors, or logs.
+- Run as root. Dedicated service user, full stop.
+- Serve without TLS. Always behind a TLS-terminating reverse proxy.
+- Ship without `MCP_SSH_ALLOWED_HOSTS` set.
+- Weaken or bypass the auth middleware.
+- Add more MCP tools to dodge a param. Parametrize the existing surface.
+- Force-push `main`.
+- `--no-verify` on commits — fix the hook.
+
 ## Response Rules
 
-- Execute. No preamble. No "I'll start by…". No restating the task.
-- Lead with action or answer. Reasoning after, only if non-obvious.
-- Parallel tool calls when independent.
-- Read before speculating.
-- Disagree when user is wrong. State the correction.
-- Terse. Fragments OK. Drop articles, filler, hedging.
-- Code/commands/paths: verbatim. Only prose gets compressed.
-- End-of-turn summary: 1–2 sentences. Nothing else.
+- Execute, no preamble, no restating the task. Lead with action or answer; reasoning after, only if non-obvious.
+- Parallel tool calls when independent. Read before speculating.
+- Disagree when the user is wrong — state the correction.
+- Terse; fragments OK. Code/commands/paths verbatim; only prose compresses.
+- End-of-turn summary: 1–2 sentences.
 
 ## Stack
 
@@ -34,17 +42,17 @@ Deps pinned to latest stable at implementation time.
 
 | Task | Command |
 |---|---|
-| Build | `cargo build` |
-| Run locally (watch + reload, loads `.env`) | `bin/dev` |
-| Full gate (fmt --check + clippy -D warnings + test, e2e included; all `--locked`) | `bin/check` |
-| End-to-end suite only (real binary over HTTP) | `bin/e2e` |
-| Test | `cargo test` |
-| Single test by pattern | `cargo test <pattern>` |
-| Format + lint | `cargo fmt && cargo clippy` |
+| First-time setup (`cargo build --locked`; seeds `.env` from `.env.example` if absent; activates the pre-commit hook) | `bin/setup` |
+| Full gate (fmt --check + clippy --locked --all-targets -D warnings + cargo test --locked; e2e + dev_scripts included) | `bin/check` |
+| Run locally (watch + reload, loads `.env`, state in `.local/`) | `bin/dev` |
+| Stop `bin/dev` (targets the pid in `.local/dev.pid` and its children only, args-checked — never a name-based hunt for `mcp-ssh serve`) | `bin/stop` |
+| End-to-end suite only (real binary over HTTP, `--test-threads=1`) | `bin/e2e` |
+| Mint a bearer for a headless client (OAuth PKCE, creds from `.env`) | `bin/mcp-token` |
+| Build / test / single test / format + lint | `cargo build` / `cargo test` / `cargo test <pattern>` / `cargo fmt && cargo clippy` |
 | Run the binary | `cargo run -- serve` |
-| Mint a bearer for a headless client (OAuth PKCE) | `bin/mcp-token` |
 
-Secrets and local config: copy `.env.example` → `.env`. `.env` is gitignored.
+`.githooks/pre-commit` (activated by `bin/setup`) runs `bin/check` on every commit.
+Secrets and local config: copy `.env.example` → `.env`; `.env` is gitignored.
 
 ## Module map
 
@@ -52,20 +60,20 @@ Keep this accurate — it's the navigation aid. One row per non-test file (`test
 
 | Module | Owns |
 |---|---|
-| `src/main.rs` | entry: CLI parse, Sentry + tracing init, config load, serve with a 10s graceful drain (`DRAIN_DEADLINE`); dispatches `set-auth` (writes creds, then revokes every session) and the admin subcommands. Tests in `src/main_tests.rs` |
+| `src/main.rs` | entry: CLI parse, Sentry + tracing init, config load, serve with a 10s graceful drain (`DRAIN_DEADLINE`); dispatches `set-auth` (writes creds, then revokes every session) + the admin subcommands. Tests in `src/main_tests.rs` |
 | `src/cli.rs` | clap command definitions (`serve`/`set-auth`/`jobs`/`job kill`/`sessions [--revoke]`) |
-| `src/app.rs` | builds the axum router: `/mcp` (rmcp `StreamableHttpService` behind `auth::require_auth`) + the OAuth routes, both behind the `Host` allowlist guard; `/healthz` outside it; the shutdown token that ends every SSE stream. In-process router tests in `src/app_tests.rs` |
-| `src/agent.rs` | `Agent`: the OAuth client behind a request or a job — `client_id` + `ClientName` (the DCR `client_name`, untrusted: control/invisible chars stripped, whitespace collapsed, ≤32 chars), shown as `label()` = `<name>#<4-hex of SHA-256(client_id)>`; `Debug` shows only the label. Tests in `src/agent/tests.rs` |
-| `src/admin.rs` | local admin subcommands (`jobs` with a `BY` owner column/`job kill`/`sessions [--revoke]`, which also lists each logged-in agent's last activity): open the existing DB (`Db::open_existing` — no create, no migration) through `jobs::JobRepo` / `oauth` — never builds a `JobStore` (that would start a reaper + reconcile and fail the live server's running rows); `job kill` only renders `jobs::kill_persisted`'s `KillOutcome`. Never prints token values |
-| `src/config.rs` | env + TOML file config; fails fast on missing/empty creds or a non-loopback bind without `MCP_SSH_ALLOWED_HOSTS`; clamps `inline_timeout` ≤60s; `Password` with redacted `Debug`; TOML parse errors scrubbed of the file's text. `db_path()` resolves the DB path alone for the cred-free admin commands |
+| `src/app.rs` | builds the axum router: `/mcp` (rmcp `StreamableHttpService` behind `auth::require_auth`) + the OAuth routes, both behind the `Host` allowlist guard; `/healthz` outside it; the shutdown token ending every SSE stream. In-process router tests in `src/app_tests.rs` |
+| `src/agent.rs` | `Agent`: the OAuth client behind a request or job — `client_id` + `ClientName` (the DCR `client_name`, untrusted: control/invisible chars stripped, whitespace collapsed, ≤32 chars), shown as `label()` = `<name>#<4-hex of SHA-256(client_id)>`; `Debug` shows only the label. Tests in `src/agent/tests.rs` |
+| `src/admin.rs` | local admin subcommands (`jobs` with a `BY` owner column / `job kill` / `sessions [--revoke]` + last activity per logged-in agent): opens the existing DB (`Db::open_existing` — no create, no migration) through `jobs::JobRepo` / `oauth` — never builds a `JobStore` (that would start a reaper + reconcile and fail the live server's running rows); `job kill` only renders `jobs::kill_persisted`'s `KillOutcome`. Never prints token values |
+| `src/config.rs` | env + TOML config; fails fast on missing/empty creds or a non-loopback bind without `MCP_SSH_ALLOWED_HOSTS`; clamps `inline_timeout` ≤60s; `Password` with redacted `Debug`; TOML parse errors scrubbed of the file's text; `db_path()` resolves the DB path alone for the cred-free admin commands |
 | `src/config/set_auth.rs` | `set-auth`'s config write: atomic replace, 0600 from the first byte, owner adopted from the config dir |
-| `src/db.rs` | SQLite connection (`rusqlite`, `bundled`): open/create (file 0600, WAL), `open_existing` for the admin CLI, one serialized connection driven via `spawn_blocking`, typed `DbError`. DB at `/var/lib/mcp-ssh/mcp-ssh.db`. Queries live in the repositories (`src/jobs/store.rs`, `src/oauth/store.rs`) |
-| `src/db/migrations.rs` | the schema (`jobs` incl. `interactive` and the owner's `client_id`/`client_name`, `clients` incl. `client_name`/`last_used_unix`, hashed `access_tokens`/`refresh_tokens`/`refresh_tombstones`, `clients`) as ordered forward-only steps versioned by `PRAGMA user_version`, each in its own `BEGIN IMMEDIATE` transaction. Append only |
-| `src/auth.rs` | bearer-only guard for `/mcp` (`require_auth`; puts the bearer's `Agent` in the request extensions for the tools; store outage → 503, not 401; a streaming response keeps re-checking its token — see `src/auth/revalidate.rs`) and `check_login`, the constant-time credential check the consent form uses. No HTTP Basic |
-| `src/auth/revalidate.rs` | re-checks an open `/mcp` stream's token on an interval (`STREAM_REVALIDATE`, 30s) and ends the body once it is revoked or expired; holds the token hash, never the bearer; a store outage keeps the stream |
-| `src/oauth/mod.rs` | minimal OAuth 2.1 server wiring: `AuthState` (creds, store, public URL, the stream re-check interval), the public routes (discovery, `/authorize` GET+POST, `/token`, `/register`) with a 64 KiB body limit |
+| `src/db.rs` | SQLite connection (`rusqlite`, `bundled`): open/create (file 0600, WAL), `open_existing` for the admin CLI, one serialized connection driven via `spawn_blocking`, typed `DbError`; DB at `/var/lib/mcp-ssh/mcp-ssh.db`; queries live in the repositories (`src/jobs/store.rs`, `src/oauth/store.rs`) |
+| `src/db/migrations.rs` | the schema (`jobs` incl. `interactive` + the owner's `client_id`/`client_name`, `clients` incl. `client_name`/`last_used_unix`, hashed `access_tokens`/`refresh_tokens`/`refresh_tombstones`) as ordered forward-only steps versioned by `PRAGMA user_version`, each in its own `BEGIN IMMEDIATE` transaction. Append only |
+| `src/auth.rs` | bearer-only guard for `/mcp` (`require_auth`: puts the bearer's `Agent` in the request extensions; store outage → 503, not 401; a streaming response keeps re-checking its token — see `src/auth/revalidate.rs`) and `check_login`, the consent form's constant-time credential check. No HTTP Basic |
+| `src/auth/revalidate.rs` | re-checks an open `/mcp` stream's token on an interval (`STREAM_REVALIDATE`, 30s), ending the body once it is revoked or expired; holds the token hash, never the bearer; a store outage keeps the stream |
+| `src/oauth/mod.rs` | minimal OAuth 2.1 wiring: `AuthState` (creds, store, public URL, the stream re-check interval), the public routes (discovery, `/authorize` GET+POST, `/token`, `/register`) with a 64 KiB body limit |
 | `src/oauth/metadata.rs` | RFC 8414 / RFC 9728 discovery documents; `base_url` from `MCP_SSH_PUBLIC_URL` else the allow-listed `Host` |
-| `src/oauth/flow.rs` | `/authorize`: GET validates (registered `client_id` + exact `redirect_uri`, else `invalid_request`; PKCE S256) and renders the consent page — never a code; POST takes the single-use CSRF nonce + credentials and only then redirects with a code. Flat delay on a failed login; redirect-URI rule |
+| `src/oauth/flow.rs` | `/authorize`: GET validates (registered `client_id` + exact `redirect_uri`, else `invalid_request`; PKCE S256) and renders the consent page — never a code; POST takes the single-use CSRF nonce + credentials, only then redirecting with a code. Flat delay on a failed login; redirect-URI rule |
 | `src/oauth/flow/token.rs` | `/token`: `authorization_code` (code + PKCE verifier) and `refresh_token` grants; `no-store`; store outage → 503 |
 | `src/oauth/flow/register.rs` | `/register`: Dynamic Client Registration (RFC 7591), bounded URIs per client, optional `client_name` cleaned by `ClientName::parse` before it is stored |
 | `src/oauth/consent.rs` | the consent page HTML: static template, escaped values, `no-store`, CSP `frame-ancestors 'none'`, `X-Frame-Options: DENY` |
@@ -107,31 +115,30 @@ Keep this accurate — it's the navigation aid. One row per non-test file (`test
 | `src/tools/files/shell.rs` | bounded runner behind `ls`/`find`/`grep`: streams combined output under a byte cap + 30s wall-clock deadline, killing the child on either |
 | `src/sentry.rs` | GlitchTip (Sentry-protocol) error tracking: init + the fail-closed `before_send` credential scrubber. Unset DSN ⇒ no-op |
 
-Files ≤300 **non-test** LOC; a module's tests go in a sibling `tests.rs` (`#[cfg(test)] mod tests;`, or `#[path]` for a top-level file) rather than counting against it. One responsibility per module (SRP). Split when a module grows a second reason to change. `tests/module_map.rs` fails when a `src` file is missing from this map or the map names one that doesn't exist.
+Files ≤300 **non-test** LOC; a module's tests go in a sibling `tests.rs` (`#[cfg(test)] mod tests;`, or `#[path]` for a top-level file) rather than counting against it. One responsibility per module — split when it grows a second reason to change.
 
 ## Execution model
 
-`bash` runs a command. Finishes within `MCP_SSH_INLINE_TIMEOUT_SECS` (default 2, clamped ≤60; per-call `timeout` clamped ≤600) → output returns inline. Slower (or `bg=true`) → auto-backgrounds to a **job id**; live output streams to a per-job log file (0600). `job(action="poll")` pages that log **newest-first**: no cursor = the latest page (≤`limit` lines, default 200, ≤64 KiB); the footer `[latest N lines shown; earlier output: job(action="poll", id="…", cursor=C)]` names the older page, where `C` is the **byte offset** that page starts at (absolute, so a growing log never re-serves lines). Reads walk backwards under a line/byte/scan budget — never the whole log. When the live log is gone (e.g. a finished job after a restart), poll falls back to the output tail saved in SQLite (500 lines, ≤256 KiB). This is the whole point: bounded output, no context blowups — and no server memory blowups.
-
-A job's live log is capped at 256 MiB (const) for as long as its process group holds a process — the leader, or what it left running (`server &`): past it the group is `SIGKILL`ed and the job is recorded `failed`, even one that had already `exited`. The cap is the supervisor's and ends with the server process: a group that outlives a restart is not watched.
-
-**Hybrid persistence:** structured state lives in SQLite (`src/db.rs`) — OAuth tokens + job metadata + output tail, durable across restarts; the high-frequency, append-heavy live output stays a per-job log file on disk. SQLite only sees low-frequency writes (token issue/validate, job create/finish), so one serialized connection is ample.
-
-**Reaper** (startup + hourly) **never kills.** A finished job (row + log) goes 24h after it *finished*; a running job is never aged out; a finished job whose group still holds a process keeps its row until it exits. Untracked `running` rows (left by a previous process) flip to `failed` only once their group probes gone.
+- `bash` finishing within `MCP_SSH_INLINE_TIMEOUT_SECS` (default 2, clamped ≤60; per-call `timeout` clamped ≤600) returns its output inline; slower, or `bg=true`, auto-backgrounds to a **job id** whose live output streams to a per-job log file (0600).
+- `job(action="poll")` pages that log **newest-first**: no cursor = the latest page (≤`limit` lines, default 200, ≤64 KiB); the footer `[latest N lines shown; earlier output: job(action="poll", id="…", cursor=C)]` names the older page, where `C` is the **byte offset** that page starts at (absolute, so a growing log never re-serves lines). Reads walk backwards under a line/byte/scan budget — never the whole log.
+- Live log gone (a finished job after a restart) → poll falls back to the output tail saved in SQLite (500 lines, ≤256 KiB). Bounded output is the whole point: no context blowups, no server memory blowups.
+- A live log is capped at 256 MiB (const) while its process group holds a process — the leader, or what it left running (`server &`); past it the group is `SIGKILL`ed and the job recorded `failed`, even one that had already `exited`. The cap is the supervisor's and ends with the server process: a group that outlives a restart is not watched.
+- **Hybrid persistence:** structured state in SQLite (`src/db.rs`) — OAuth tokens + job metadata + output tail, durable across restarts; the append-heavy live output stays a per-job log file. SQLite only sees low-frequency writes (token issue/validate, job create/finish), so one serialized connection is ample.
+- **Reaper** (startup + hourly) **never kills:** finished jobs (row + log) age out 24h after they *finished*; running jobs are never aged out; a finished job whose group still holds a process keeps its row until it exits; untracked `running` rows (left by a previous process) flip to `failed` only once their group probes gone.
 
 ### Kill semantics
 
 One implementation, `src/jobs/signal/kill.rs` over `src/jobs/signal.rs`, behind both `job(action="kill")` and `mcp-ssh job kill`:
 
 - Signals via `kill(2)` (`libc`) — never an external `kill` binary (the Docker image has none).
-- Tri-state probe: delivered or `EPERM` = alive, `ESRCH` = gone, any other errno = **unknown**. Unknown is never read as gone.
-- Escalation: `SIGTERM`, 2s grace, `SIGKILL`, then probe; an interactive job's leader is `SIGSTOP`ped first — on both paths; the row's `interactive` column tells `kill_persisted`. A kill that ends `Survived`/`NotSignalled` withdraws its reason, so a later exit is recorded as what it was. Success = the group probed gone, never "the leader exited".
+- Tri-state probe: delivered or `EPERM` = alive, `ESRCH` = gone, any other errno = **unknown** — never read as gone.
+- Escalation: `SIGTERM`, 2s grace, `SIGKILL`, then probe; an interactive job's leader is `SIGSTOP`ped first — on both paths (the row's `interactive` column tells `kill_persisted`). A kill ending `Survived`/`NotSignalled` withdraws its reason, so a later exit is recorded as what it was. Success = the group probed gone, never "the leader exited".
 - A persisted pgid outside `2..=i32::MAX` is refused; one recorded under another boot id is never signalled.
 - Every path returns a `KillOutcome` — `Killed`, `KilledLeftovers`, `NotRunning`, `Unknown`, `NoProcessGroup`, `CorruptProcessGroup`, `Survived`, `NotSignalled` — that callers only render (`src/tools/job_render.rs`, `src/admin.rs`). `kill_persisted` writes `failed` only on `Killed`, and only while the row still reads `running` (a real exit recorded meanwhile wins) — except that a bare `killed by signal N` the engine recorded is replaced by the kill's reason, so the waiter/kill race can't decide whether the row says why.
 
 ## MCP tool design
 
-**Constant, heavily-parametrized surface — 3 resource-oriented tools.** Group by resource; push composition into params (`action`, `cursor`, `limit`, `recursive`, `timeout`, `bg`, `interactive`) — do **NOT** add more tools. New capability = a new param or `action` on an existing tool, almost always.
+**Constant, heavily-parametrized surface — 3 resource-oriented tools.** Group by resource; push composition into params (`action`, `cursor`, `limit`, `recursive`, `timeout`, `bg`, `interactive`) — do **NOT** add more tools; new capability = a new param or `action`, almost always.
 
 Args are strict: `#[serde(deny_unknown_fields)]` on all three; a `job` `action` *string* naming no action is an error listing `poll|list|kill` (only a non-string placeholder or a missing `action` falls back to `list`). Agent-facing wording lives only in `src/tools/` (`render.rs`, `job_render.rs`, the tool descriptions in `mod.rs`).
 
@@ -145,80 +152,27 @@ Current tools (three, constant):
 
 ## Conventions
 
-Non-negotiable: SOLID, SRP, tested code. The bar: idiomatic, boring, readable Rust. No spaghetti, no premature abstraction. A function reads top to bottom without chasing state. Equally-correct options → pick the one easier to delete. `clippy -D warnings` is the floor, not the ceiling.
+The bar: idiomatic, boring, readable Rust — SOLID, SRP, tested code; no spaghetti, no premature abstraction; a function reads top to bottom without chasing state; equally-correct options → the one easier to delete; `clippy -D warnings` is the floor, not the ceiling.
 
-- Errors typed. `thiserror` for domain; `anyhow` only at the `main.rs` boundary.
-- No `unwrap`/`expect` outside `main` and tests. Panic in the request path crashes every client. Propagate with `?`; branch with `match`/`if let`/`let ... else`.
-- Newtype over bare primitives when a value has meaning (`JobId(String)`, not `String`). Make illegal states unrepresentable — `enum` over contradictory `bool`+`Option`. Validate input into a type once at the edge.
-- Borrow by default (`&str` over `String`, `&[T]` over `Vec<T>`). `.clone()` only when ownership must move — non-obvious clone gets a one-line `// why`. `Arc<T>` for shared read-only; lock only when you mutate shared state, keep the critical section tiny.
-- Functions do one thing. Need "and" to describe it → split it. Concrete first; introduce a trait when the **second** impl arrives.
-- Async end-to-end. No `std::sync::Mutex` on the request path — use `tokio::sync`. Never hold a `std::sync` guard across `.await`. No `block_on`; offload blocking I/O with `spawn_blocking`.
-- `tracing`, not `println`. Every tool dispatch is a span with `request_id`, `tool` name and the caller's `agent` label (never a `client_id`). A call refused before dispatch logs one `rejected` WARN (tool + reason word) instead.
-- Derive, don't hand-roll (`Debug`, `Clone`, serde). Every public type derives `Debug`. Keep `pub` surface minimal.
-- Comment the non-obvious *why*, never the *what*. Rename until the code doesn't need the *what*.
-
-## Coding Rules
-
-### Think before coding
-- State assumptions explicitly. Uncertain → ask, don't guess.
-- Multiple interpretations → present them, don't pick silently.
-- Simpler approach exists → say so.
-
-### Simplicity first
-- Minimum code that solves the stated problem. Nothing speculative.
-- No abstractions for single-use code. No unrequested config/flexibility.
-- 200 lines that could be 50 → write 50.
-
-### Surgical changes
-- Touch only what the task requires. No drive-by refactors/reformatting.
-- Match existing style. Every changed line traces to the request.
-- Pre-existing dead code: flag, don't delete.
-
-### Goal-driven execution
-- "Fix the bug" → reproducing test → make it pass.
-- "Add a param" → test the new behavior → make it pass.
-- Refactor → tests green before AND after.
+- Errors typed: `thiserror` for domain, `anyhow` only at the `main.rs` boundary. No `unwrap`/`expect` outside `main` and tests — panic in the request path crashes every client; propagate with `?`; branch with `match`/`if let`/`let ... else`.
+- Newtype over bare primitives when a value has meaning (`JobId(String)`, not `String`); make illegal states unrepresentable — `enum` over contradictory `bool`+`Option`; validate input into a type once at the edge.
+- Borrow by default (`&str` over `String`, `&[T]` over `Vec<T>`); `.clone()` only when ownership must move — non-obvious clone gets a one-line `// why`; `Arc<T>` for shared read-only; lock only when mutating shared state, critical section tiny.
+- Functions do one thing — need "and" to describe it → split. Concrete first; a trait when the **second** impl arrives. No abstractions for single-use code; 200 lines that could be 50 → write 50.
+- Async end-to-end: no `std::sync::Mutex` on the request path — use `tokio::sync`; never hold a `std::sync` guard across `.await`; no `block_on` — offload blocking I/O with `spawn_blocking`.
+- `tracing`, not `println`: every tool dispatch is a span with `request_id`, tool name and the caller's `agent` label (never a `client_id`); a call refused before dispatch logs one `rejected` WARN (tool + reason word) instead.
+- Derive, don't hand-roll (`Debug`, `Clone`, serde); every public type derives `Debug`; keep the `pub` surface minimal.
+- Comment the non-obvious *why*, never the *what* — rename until the code doesn't need the *what*.
+- Think before coding: state assumptions; uncertain → ask, don't guess; multiple interpretations → present them, don't pick silently; a simpler approach exists → say so.
+- Surgical changes: touch only what the task requires; no drive-by refactors/reformatting; match existing style; every changed line traces to the request; pre-existing dead code — flag, don't delete.
+- Goal-driven: bug → reproducing test first, then the fix; new param → test the new behavior first; refactor → tests green before AND after.
 
 ## Testing
 
-- Unit: pure logic (config validation, job pagination, path handling) under `#[cfg(test)]` — in the file, or its sibling `tests.rs` once that keeps the file under the LOC limit.
+- Unit: pure logic (config validation, job pagination, path handling) under `#[cfg(test)]` — in the file, or a sibling `tests.rs` once that keeps the file under the LOC limit.
 - In-process: `src/app_tests.rs` drives the axum router (auth, host guard, OAuth, MCP JSON-RPC) with `tower::ServiceExt::oneshot`, no socket.
-- End-to-end: `tests/e2e/` (`bin/e2e`, also part of `bin/check` and CI) boots the real `mcp-ssh serve` binary per test on an ephemeral port with tempdir state and drives it over HTTP — one scenario per top audit finding.
+- End-to-end: `tests/e2e/` (`bin/e2e`, also part of `bin/check` and CI) boots the real `mcp-ssh serve` binary per test on an ephemeral port with tempdir state, driven over HTTP — one scenario per top audit finding.
 - Public tree: `tests/public_tree.rs` scans every tracked file (minus `.dz/`) for facts about our own infrastructure; a failure names the file, never the value.
 - Tested code is the default, not the exception. New behavior ships with the test that proves it. Never an unbounded writer (`yes`) in a test — use sparse files.
-
-## Where to look
-
-| Concern | File |
-|---|---|
-| Startup, CLI dispatch, graceful drain | `src/main.rs` |
-| Router wiring, `Host` guard, `/healthz` | `src/app.rs` |
-| Config / env / required creds | `src/config.rs` |
-| SQLite connection | `src/db.rs` |
-| Schema + migrations | `src/db/migrations.rs` |
-| Every `jobs` query (metadata, output tail, reconcile) | `src/jobs/store.rs` + `src/jobs/store/` |
-| Bearer validation on `/mcp`, consent-form credential check | `src/auth.rs` |
-| OAuth 2.1 (discovery, registration, consent page, PKCE, tokens) | `src/oauth/` |
-| Token lifetimes, hashing, rotation, revocation | `src/oauth/store.rs` + `src/oauth/store/` |
-| Running commands, backgrounding | `src/jobs/run.rs`, `src/jobs/supervise.rs` |
-| Job log paging (newest-first, byte cursor) | `src/jobs/log.rs`, `src/jobs/poll.rs` |
-| Reaper (reconcile, retention, compaction) | `src/jobs/reaper.rs` |
-| Kill semantics + process-group signalling | `src/jobs/signal/kill.rs`, `src/jobs/signal.rs` |
-| Tool definitions / MCP surface | `src/tools/mod.rs` |
-| Agent-facing wording | `src/tools/render.rs`, `src/tools/job_render.rs` |
-| File operations | `src/tools/files.rs` + `src/tools/files/` |
-| End-to-end tests | `tests/e2e/` |
-
-## NEVER
-
-- Log or return the password / token — not in responses, errors, or logs.
-- Run as root. Dedicated service user, full stop.
-- Serve without TLS. Always behind a TLS-terminating reverse proxy.
-- Ship without `MCP_SSH_ALLOWED_HOSTS` set.
-- Weaken or bypass the auth middleware.
-- Add more MCP tools to dodge a param. Parametrize the existing surface.
-- Force-push `main`.
-- `--no-verify` on commits — fix the hook.
 
 ## Changelog
 
@@ -233,4 +187,4 @@ Non-negotiable: SOLID, SRP, tested code. The bar: idiomatic, boring, readable Ru
 
 ## Note
 
-Do not use git worktrees — work directly in this checkout. If a task is big enough to need subagents, run them as a team in this same checkout: split the work into disjoint pieces so no two agents touch the same files.
+No git worktrees — work directly in this checkout. A task big enough for subagents runs them as a team in this same checkout, split into disjoint pieces so no two agents touch the same files.
