@@ -247,8 +247,14 @@ fn no_tracked_file_carries_internal_infrastructure() {
         if full.is_dir() {
             continue; // a submodule entry, not a file
         }
-        let bytes =
-            std::fs::read(&full).unwrap_or_else(|err| panic!("tracked {path} must read: {err}"));
+        // A tracked file deleted from the working tree mid-edit (`rm`, not yet
+        // staged) is skipped, so the pre-commit gate doesn't fail every commit
+        // until the deletion is staged; any other read error is a failure.
+        let bytes = match std::fs::read(&full) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => panic!("tracked {path} must read: {err}"),
+        };
         read += 1;
         let content = String::from_utf8_lossy(&bytes);
         let mut rules = violations(path, &content);
