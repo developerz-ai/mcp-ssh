@@ -95,7 +95,7 @@ strip = "symbols"
 
 # `cargo deb` packaging — produces the downloadable .deb.
 [package.metadata.deb]
-maintainer = "developerz-ai <admin@venom.is>"
+maintainer = "developerz-ai <admin@developerz.ai>"
 copyright = "2026, developerz-ai"
 extended-description = "An MCP server giving an AI agent remote shell + file access to the host it runs on, over authenticated MCP-HTTP at /mcp."
 depends = "$auto, adduser"  # postinst calls addgroup/adduser

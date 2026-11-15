@@ -203,7 +203,7 @@ dependency build. Every `Compiling <crate> …` line (hundreds, `proc-macro2 v1.
 stderr, last lines verbatim:
 
 ```
-   Compiling mcp-ssh v1.4.0 (/home/dz-agent/workspace-ai/developerz-ai/developerz-ai/mcp-ssh)
+   Compiling mcp-ssh v1.4.0 (<checkout>)
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 3m 03s
 ```
 
