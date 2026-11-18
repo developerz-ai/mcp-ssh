@@ -62,7 +62,7 @@ Drift (evidence for queued-five #1):
   are colocated `#[cfg(test)]` plus `src/app_tests.rs` / `src/tools/files/tests.rs`
   (feature.md:64 already flags this falsification).
 - Thin: `reviewer.md:14` (Review conventions), `:18` (Gates that matter), `:22` (Never flag) are
-  TODO(setup) placeholders, and `:14` cites a `CONTRIBUTING` file that does not exist at the root
+  unfilled setup placeholders, and `:14` cites a `CONTRIBUTING` file that does not exist at the root
   (13 root files, none of them it) → **F1**.
 - Observed tension, noted not filed: `maintainer.yml:55-57` sets `release.manager: none` while
   ci.yml:41-58 ships a tag-driven release job and :60-91 a docker job (release-cut SKILL:11

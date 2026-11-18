@@ -1,4 +1,4 @@
-<!-- Read by the monthly `improve` checkup (.dz/briefs/improve.md). Edit it to steer that pass. -->
+<!-- Read by the monthly `improve` checkup (.dz/schedules/improve.md). Edit it to steer that pass. -->
 
 # Hygiene checkup
 
