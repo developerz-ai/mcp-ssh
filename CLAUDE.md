@@ -43,7 +43,7 @@ Deps pinned to latest stable at implementation time.
 | Task | Command |
 |---|---|
 | First-time setup (`cargo build --locked`; seeds `.env` from `.env.example` if absent; activates the pre-commit hook) | `bin/setup` |
-| Full gate (fmt --check + clippy --locked --all-targets -D warnings + cargo test --locked; e2e + dev_scripts included) | `bin/check` |
+| Full gate, the same checks CI runs (`cargo fmt --check`, `cargo clippy --locked --all-targets -D warnings`, `cargo test --locked` incl. `tests/e2e` + `tests/dev_scripts`, `cargo audit`, `shellcheck bin/* deploy/install.sh deploy/debian/postinst .githooks/pre-commit .claude/hooks/*.sh .github/scripts/*.sh`; the last two print a named `SKIP:` when the tool is absent); exits 0 pass · 75 a required tool (cargo/rustfmt/clippy) is missing, nothing ran · 79 every check that ran passed with shellcheck/cargo-audit deferred to CI · other non-zero red | `bin/check` |
 | Run locally (watch + reload, loads `.env`, state in `.local/`) | `bin/dev` |
 | Stop `bin/dev` (targets the pid in `.local/dev.pid` and its children only, args-checked — never a name-based hunt for `mcp-ssh serve`) | `bin/stop` |
 | End-to-end suite only (real binary over HTTP, `--test-threads=1`) | `bin/e2e` |

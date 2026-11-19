@@ -1,8 +1,78 @@
 #!/usr/bin/env bash
+# The one gate: the same checks CI runs, run from the same directory.
+#
+# Exit contract (.claude/skills/verify-change/SKILL.md):
+#   0   every check ran and passed
+#   75  a tool the gate NEEDS is missing — it refused to grade; the environment
+#       is at fault, never the change
+#   79  every check the gate RAN passed, but an optional CI gate (shellcheck or
+#       cargo audit) is not installed here — commit and let CI grade the rest
+#   1   (any other non-zero) a check that ran failed — the change is red
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-cargo fmt --check
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked
+# Preconditions FIRST, each with the fix: without these a missing tool would
+# look like a red change.
+missing_tools=0
+require() {
+  if command -v "$1" >/dev/null 2>&1; then
+    return 0
+  fi
+  printf 'bin/check: cannot grade — %s is not installed.\n  fix: %s\n' "$1" "$2" >&2
+  missing_tools=$((missing_tools + 1))
+}
+
+require cargo "install the Rust toolchain (https://rustup.rs), then re-run bin/setup"
+require rustfmt "rustup component add rustfmt"
+require cargo-clippy "rustup component add clippy"
+
+if [ "$missing_tools" -ne 0 ]; then
+  echo "bin/check: exiting 75 — a tool the gate needs is missing; the environment is at fault, not the change." >&2
+  exit 75
+fi
+
+failed=()
+skipped=()
+
+run() {
+  local name="$1"
+  shift
+  echo "==> $name: $*"
+  if ! "$@"; then
+    failed+=("$name")
+  fi
+}
+
+# CI's two optional gates (ci.yml `audit` and `shellcheck`). A tool that is not
+# installed here is a named SKIP — never a silent pass, never a red.
+run_optional() {
+  local tool="$1"
+  local name="$2"
+  shift 2
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    echo "SKIP: $name — $tool is not installed here; CI runs it (.github/workflows/ci.yml)"
+    skipped+=("$name")
+    return 0
+  fi
+  run "$name" "$@"
+}
+
+run fmt cargo fmt --check
+run clippy cargo clippy --locked --all-targets -- -D warnings
+run test cargo test --locked
+run_optional cargo-audit "cargo audit" cargo audit
+run_optional shellcheck shellcheck shellcheck bin/* deploy/install.sh deploy/debian/postinst \
+  .githooks/pre-commit .claude/hooks/*.sh .github/scripts/*.sh
+
+if [ "${#failed[@]}" -ne 0 ]; then
+  printf 'bin/check: FAILED: %s — the change is red\n' "${failed[*]}" >&2
+  exit 1
+fi
+
+if [ "${#skipped[@]}" -ne 0 ]; then
+  printf 'bin/check: exiting 79 — every check that ran passed; CI grades: %s\n' "${skipped[*]}" >&2
+  exit 79
+fi
+
+echo "bin/check: all checks passed"
