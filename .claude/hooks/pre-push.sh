@@ -4,4 +4,10 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 [ "$(git config core.hooksPath || true)" = ".githooks" ] && exit 0
-exec bin/check
+status=0
+bin/check || status=$?
+if [[ $status == 79 ]]; then
+  echo "pre-push: partial grade accepted; CI grades deferred coverage" >&2
+  exit 0
+fi
+exit "$status"
