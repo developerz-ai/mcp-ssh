@@ -3,6 +3,57 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-cargo fmt --check
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked
+# A rustup proxy on PATH does not prove the selected component is installed.
+require_tool() {
+  if ! "$@" >/dev/null 2>&1; then
+    echo "bin/check: required tool unavailable: $* (refusing to grade)" >&2
+    exit 75
+  fi
+}
+require_tool cargo --version
+require_tool rustc --version
+require_tool cargo fmt --version
+require_tool cargo clippy --version
+
+# Reduce the value to the characters that carry a word: every delimiter and
+# every White_Space character `str::trim` strips, which is how
+# tests/public_tree.rs reads the same secret. A blank, delimiter-only or
+# Unicode-whitespace-only value then reduces to empty.
+#
+# The set is built from octal bytes, one whole character at a time, because
+# `$'\u00a0'` and a bracket class are both locale-dependent: where the locale is
+# not UTF-8 bash leaves `\u00a0` as those literal characters and the class
+# matches single bytes, so the value would never reduce to empty and a run
+# without coverage would grade as a full pass. No value is printed or passed to
+# an external process.
+words=${PUBLIC_TREE_PRIVATE_WORDS:-}
+for octets in '\011' '\012' '\013' '\014' '\015' '\040' \
+  '\302\205' '\302\240' '\341\232\200' \
+  '\342\200\200' '\342\200\201' '\342\200\202' '\342\200\203' \
+  '\342\200\204' '\342\200\205' '\342\200\206' '\342\200\207' \
+  '\342\200\210' '\342\200\211' '\342\200\212' \
+  '\342\200\250' '\342\200\251' '\342\200\257' '\342\201\237' \
+  '\343\200\200' ','; do
+  printf -v char '%b' "$octets"
+  words=${words//"$char"/}
+done
+unset char octets
+partial=0
+if [[ -z "$words" ]]; then
+  if [[ ${PUBLIC_TREE_PRIVATE_WORDS_REQUIRED:-} == 1 ]]; then
+    echo "bin/check: required private-word input unavailable (refusing to grade)" >&2
+    exit 75
+  fi
+  partial=1
+fi
+unset words
+
+cargo fmt --check || exit 1
+cargo clippy --locked --all-targets -- -D warnings || exit 1
+cargo test --locked || exit 1
+
+if (( partial )); then
+  echo "bin/check: partial grade, private-word coverage deferred to CI" >&2
+  exit 79
+fi
+exit 0

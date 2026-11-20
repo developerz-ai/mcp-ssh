@@ -25,6 +25,12 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 const REPO_ROOT: &str = env!("CARGO_MANIFEST_DIR");
+const HOOKS: &[&str] = &[
+    ".githooks/pre-commit",
+    ".claude/hooks/pre-commit.sh",
+    ".claude/hooks/pre-push.sh",
+];
+const GRADING: &str = "fmt --check\nclippy --locked --all-targets -- -D warnings\ntest --locked\n";
 
 const STUB_CARGO: &str = r#"#!/bin/sh
 # Test double for `cargo`: bin/setup and bin/check must only ever reach it
@@ -35,6 +41,16 @@ if [ "$(pwd)" != "$CARGO_STUB_EXPECTED_ROOT" ]; then
   exit 90
 fi
 pwd >> "$CARGO_STUB_LOG"
+case "$*" in
+  --version|fmt\ --version|clippy\ --version)
+    echo "$*" >> "$PROBE_LOG"
+    [ "$*" != "${BAD_PROBE:-}" ] || exit 1
+    ;;
+  *)
+    echo "$*" >> "$CHECK_LOG"
+    [ "$1" != "${BAD_CHECK:-}" ] || exit "${CHECK_STATUS:-1}"
+    ;;
+esac
 "#;
 
 /// A throwaway repo: `bin/{setup,check,stop}` + `.env.example` copied from the
@@ -46,6 +62,8 @@ struct Sandbox {
     foreign: PathBuf,
     stub_dir: PathBuf,
     cargo_log: PathBuf,
+    probe_log: PathBuf,
+    check_log: PathBuf,
 }
 
 impl Sandbox {
@@ -58,19 +76,11 @@ impl Sandbox {
         fs::create_dir_all(repo.join("bin")).expect("create sandbox bin/");
         fs::create_dir_all(&foreign).expect("create foreign CWD dir");
         fs::create_dir_all(&stub_dir).expect("create stub PATH dir");
-        // bin/setup wires the pre-commit gate with `git config core.hooksPath`,
-        // which fails outside a repo — a fresh checkout is a repo, so the
-        // sandbox is one too.
-        let init = Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(&repo)
-            .output()
-            .expect("git-init the sandbox repo");
-        assert!(
-            init.status.success(),
-            "git init failed in the sandbox: {}",
-            String::from_utf8_lossy(&init.stderr)
-        );
+        // Isolate tool selection completely, including from installed rustup proxies.
+        for name in ["bash", "dirname", "cp", "chmod", "cat", "rm", "ps", "pgrep"] {
+            std::os::unix::fs::symlink(format!("/usr/bin/{name}"), stub_dir.join(name))
+                .expect("link sandbox utility");
+        }
         for script in ["setup", "check", "stop"] {
             let src = Path::new(REPO_ROOT).join("bin").join(script);
             let dst = repo.join("bin").join(script);
@@ -86,7 +96,27 @@ impl Sandbox {
         fs::write(stub_dir.join("cargo"), STUB_CARGO).expect("write cargo stub");
         fs::set_permissions(stub_dir.join("cargo"), fs::Permissions::from_mode(0o755))
             .expect("make cargo stub executable");
+        for (name, body) in [
+            (
+                "rustc",
+                "#!/bin/sh\necho rustc >> \"$PROBE_LOG\"\n[ \"${BAD_PROBE:-}\" != rustc ]\n",
+            ),
+            (
+                "git",
+                "#!/bin/sh\nif [ $# = 3 ]; then echo \"$3\" > .hooks-path; else cat .hooks-path 2>/dev/null; fi\n",
+            ),
+        ] {
+            fs::write(stub_dir.join(name), body).unwrap();
+            fs::set_permissions(stub_dir.join(name), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        for hook in HOOKS {
+            let dst = repo.join(hook);
+            fs::create_dir_all(dst.parent().unwrap()).unwrap();
+            fs::copy(Path::new(REPO_ROOT).join(hook), dst).unwrap();
+        }
         Self {
+            probe_log: temp.path().join("probes.log"),
+            check_log: temp.path().join("checks.log"),
             _temp: temp,
             repo,
             foreign,
@@ -97,16 +127,22 @@ impl Sandbox {
 
     /// Run `bin/<script>` from the foreign CWD with the stub first on PATH.
     fn run(&self, script: &str) -> Output {
-        // System PATH kept after the stub so bash/dirname/cp/chmod still resolve.
-        let path = match std::env::var("PATH") {
-            Ok(system) => format!("{}:{system}", self.stub_dir.display()),
-            Err(_) => format!("{}:/usr/bin:/bin", self.stub_dir.display()),
-        };
-        Command::new(self.repo.join("bin").join(script))
+        self.run_path(&format!("bin/{script}"), &[])
+    }
+
+    fn run_path(&self, path: &str, env: &[(&str, &str)]) -> Output {
+        Command::new("/bin/bash")
+            .arg(self.repo.join(path))
             .current_dir(&self.foreign)
-            .env("PATH", path)
+            .env_clear()
+            .env("PATH", &self.stub_dir)
             .env("CARGO_STUB_EXPECTED_ROOT", &self.repo)
             .env("CARGO_STUB_LOG", &self.cargo_log)
+            .env("PROBE_LOG", &self.probe_log)
+            .env("CHECK_LOG", &self.check_log)
+            .env("PUBLIC_TREE_PRIVATE_WORDS", "fixture-only-word")
+            .env("PUBLIC_TREE_PRIVATE_WORDS_REQUIRED", "0")
+            .envs(env.iter().copied())
             .output()
             .expect("spawn script")
     }
@@ -176,18 +212,10 @@ fn setup_seeds_env_from_example_when_absent() {
     );
     // bin/setup must leave the checkout's pre-commit gate wired: a fresh
     // checkout gets .githooks as core.hooksPath.
-    let hooks = Command::new("git")
-        .args(["config", "core.hooksPath"])
-        .current_dir(&sandbox.repo)
-        .output()
-        .expect("read core.hooksPath in the sandbox repo");
-    assert!(
-        hooks.status.success(),
-        "git config core.hooksPath failed in the sandbox: {}",
-        String::from_utf8_lossy(&hooks.stderr)
-    );
     assert_eq!(
-        String::from_utf8_lossy(&hooks.stdout).trim(),
+        fs::read_to_string(sandbox.repo.join(".hooks-path"))
+            .unwrap()
+            .trim(),
         ".githooks",
         "bin/setup must set core.hooksPath to .githooks"
     );
@@ -224,6 +252,135 @@ fn check_runs_the_gate_from_the_repo_root() {
         String::from_utf8_lossy(&output.stderr)
     );
     sandbox.assert_cargo_ran_from_repo_root();
+    assert_eq!(fs::read_to_string(&sandbox.check_log).unwrap(), GRADING);
+    assert_eq!(
+        fs::read_to_string(&sandbox.probe_log).unwrap(),
+        "--version\nrustc\nfmt --version\nclippy --version\n"
+    );
+}
+
+fn assert_status(output: &Output, expected: i32) {
+    assert_eq!(
+        output.status.code(),
+        Some(expected),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for bytes in [&output.stdout, &output.stderr] {
+        assert!(!String::from_utf8_lossy(bytes).contains("fixture-only-word"));
+    }
+}
+
+#[test]
+fn check_refuses_missing_tools_and_unusable_selected_proxies_before_grading() {
+    for tool in ["cargo", "rustc"] {
+        let sandbox = Sandbox::new();
+        fs::remove_file(sandbox.stub_dir.join(tool)).unwrap();
+        let output = sandbox.run_path("bin/check", &[("BAD_CHECK", "fmt")]);
+        assert_status(&output, 75);
+        assert!(!sandbox.check_log.exists());
+    }
+    // Present proxies are insufficient: the selected toolchain/component must run.
+    for probe in ["--version", "rustc", "fmt --version", "clippy --version"] {
+        let sandbox = Sandbox::new();
+        let output = sandbox.run_path("bin/check", &[("BAD_PROBE", probe), ("BAD_CHECK", "fmt")]);
+        assert_status(&output, 75);
+        assert!(sandbox.probe_log.exists());
+        assert!(!sandbox.check_log.exists());
+    }
+}
+
+#[test]
+fn check_private_word_coverage_controls_only_success_status() {
+    for words in ["", " , \t\r\n, ", "\u{a0},\u{2003}\n"] {
+        for required in ["0", "1"] {
+            let sandbox = Sandbox::new();
+            let output = sandbox.run_path(
+                "bin/check",
+                &[
+                    ("PUBLIC_TREE_PRIVATE_WORDS", words),
+                    ("PUBLIC_TREE_PRIVATE_WORDS_REQUIRED", required),
+                ],
+            );
+            assert_status(&output, if required == "1" { 75 } else { 79 });
+            if required == "1" {
+                assert!(!sandbox.check_log.exists());
+            } else {
+                assert_eq!(fs::read_to_string(&sandbox.check_log).unwrap(), GRADING);
+            }
+        }
+    }
+    let sandbox = Sandbox::new();
+    assert_status(
+        &sandbox.run_path("bin/check", &[("PUBLIC_TREE_PRIVATE_WORDS_REQUIRED", "1")]),
+        0,
+    );
+}
+
+#[test]
+fn check_normalizes_every_executed_failure_even_with_deferred_coverage() {
+    for stage in ["fmt", "clippy", "test"] {
+        for status in ["1", "75", "79"] {
+            for words in ["fixture-only-word", ""] {
+                let sandbox = Sandbox::new();
+                let output = sandbox.run_path(
+                    "bin/check",
+                    &[
+                        ("BAD_CHECK", stage),
+                        ("CHECK_STATUS", status),
+                        ("PUBLIC_TREE_PRIVATE_WORDS", words),
+                    ],
+                );
+                assert_status(&output, 1);
+                let log = fs::read_to_string(&sandbox.check_log).unwrap();
+                assert!(GRADING.starts_with(&log));
+                assert!(log.lines().last().unwrap().starts_with(stage));
+            }
+        }
+    }
+    let sandbox = Sandbox::new();
+    assert_status(
+        &sandbox.run_path(
+            "bin/check",
+            &[
+                ("PUBLIC_TREE_PRIVATE_WORDS", ""),
+                ("PUBLIC_TREE_PRIVATE_WORDS_REQUIRED", "1"),
+                ("BAD_CHECK", "fmt"),
+            ],
+        ),
+        75,
+    );
+    assert!(!sandbox.check_log.exists());
+}
+
+#[test]
+fn hooks_translate_only_partial_success_and_keep_agent_short_circuit() {
+    for hook in HOOKS {
+        for (status, expected) in [(0, 0), (79, 0), (75, 75), (1, 1), (42, 42)] {
+            let sandbox = Sandbox::new();
+            fs::write(
+                sandbox.repo.join("bin/check"),
+                format!(
+                    "#!/bin/sh\n[ \"$PWD\" = \"$CARGO_STUB_EXPECTED_ROOT\" ] || exit 90\necho gate >> \"$CHECK_LOG\"\nexit {status}\n"
+                ),
+            )
+            .unwrap();
+            let output = sandbox.run_path(hook, &[]);
+            assert_status(&output, expected);
+            assert!(sandbox.check_log.exists());
+            if status == 79 {
+                assert!(String::from_utf8_lossy(&output.stderr).contains("partial"));
+                assert!(String::from_utf8_lossy(&output.stderr).contains("CI"));
+            }
+        }
+    }
+    for hook in &HOOKS[1..] {
+        let sandbox = Sandbox::new();
+        fs::write(sandbox.repo.join(".hooks-path"), ".githooks\n").unwrap();
+        assert_status(&sandbox.run_path(hook, &[("BAD_CHECK", "fmt")]), 0);
+        assert!(!sandbox.check_log.exists());
+        assert!(!sandbox.probe_log.exists());
+    }
 }
 
 #[test]

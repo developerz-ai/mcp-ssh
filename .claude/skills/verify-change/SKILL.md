@@ -10,8 +10,9 @@ applies: [rust]
 
 ## The one gate
 
-`bin/check` is the gate. CI runs it and the pre-commit hook runs it, so a change that
-passes it locally passes everywhere.
+`bin/check` is the local gate, used by the pre-commit hook. CI independently runs
+the same three Rust checks, plus audit, shellcheck and packaging checks. Local
+success proves this gate's coverage, not every CI job or environment.
 
 | Step | Command | What it is |
 |------|---------|------------|
@@ -45,3 +46,86 @@ red. Exit 1 cannot carry that difference, so two codes are reserved:
   a deferral never hides a red.
 - Changed a dependency? Re-run `bin/setup` before `bin/check`, or you are proving a stale tree.
 - Add the test that fails first, then the fix — a green run that never went red proves nothing.
+
+## Concrete preflight and coverage
+
+The exit contract above is authoritative. Keep exactly three grading commands:
+`cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, and
+`cargo test --locked`. Do not add audit or shellcheck to manufacture partial coverage.
+
+- Before any grading command, require usable Cargo, rustc, rustfmt and Clippy for
+  the selected toolchain. A successful `command -v` alone is insufficient:
+  rustup proxies can exist while the selected toolchain or component is absent.
+  Probe usability without grading the source; an unmet prerequisite yields 75.
+- Treat `PUBLIC_TREE_PRIVATE_WORDS` as comma- or newline-separated entries,
+  trimmed with empty entries dropped, matching `tests/public_tree.rs`.
+  Unset, blank and delimiter-only input all mean no private-word coverage.
+  When `PUBLIC_TREE_PRIVATE_WORDS_REQUIRED=1`, this is a prerequisite refusal
+  (75), before grading. Never print the input or matched private values.
+- When that coverage is optional and absent, run all three grading commands.
+  Return 79 only if all three pass. Other public-tree rules still run; do not
+  weaken or bypass the public-tree test's own required-input enforcement.
+- Normalize every executed grading failure to 1, including a child's 75 or 79.
+  Optional coverage cannot hide a failure. Conversely, missing prerequisites
+  take precedence over a latent source failure: no grading command runs then.
+- Return 0 only after all three checks pass with private-word coverage supplied.
+  Hooks may permit 0 and 79, but must preserve refusal and failure statuses.
+
+## Status mapping in the current gate
+
+The exit table above is the contract source; this section maps it onto what
+`bin/check` ships today.
+
+| Condition | `bin/check` today |
+|-----------|-------------------|
+| Usable prerequisites, supplied coverage, all checks pass | 0 |
+| Cargo or rustc missing | 75 before grading |
+| Proxy present, selected toolchain or component unusable | 75 before grading |
+| Required private-word input empty, blank or delimiter-only | 75 before grading |
+| Optional private-word input empty, checks pass | 79 |
+| Executed fmt, clippy or test fails | 1, even for a child's 75 or 79 |
+| Missing prerequisite plus latent check failure | 75, no grading command runs |
+| Optional coverage absent plus executed failure | 1, never 79 |
+
+The hooks translate that mapping: they accept 0 and 79 as a pass, and pass 75
+and every other non-zero straight through, so a refused or red gate never
+reaches a commit.
+
+What pins each row:
+
+- **Prerequisites** (`bin/check:7-16`): one `require_tool` probe runs
+  `cargo --version`, `rustc --version`, `cargo fmt --version` and
+  `cargo clippy --version` before any grading command, and exits 75 on the
+  first that fails. A `command -v` hit is not enough: a rustup proxy on PATH
+  proves a proxy exists, not that the selected toolchain or component runs.
+- **Private-word coverage** (`bin/check:18-49`): commas and Rust
+  `str::trim`'s Unicode White_Space set are stripped from
+  `PUBLIC_TREE_PRIVATE_WORDS`, matching `tests/public_tree.rs:109-127`, so
+  unset, blank, delimiter-only and whitespace-only input all mean no coverage.
+  The reduction set is built from raw octal bytes one whole character at a
+  time, not a bracket class or `$'\u00a0'`: both of those are locale-dependent,
+  so where the locale is not UTF-8 the value never reduced to empty and a run
+  without coverage graded as a full pass. With
+  `PUBLIC_TREE_PRIVATE_WORDS_REQUIRED=1` an empty reduction is a 75 before
+  grading; otherwise the run is marked partial.
+- **Grading** (`bin/check:51-53`): exactly the three commands named above, and
+  every executed failure is normalized to 1 (`|| exit 1`).
+- **Deferral** (`bin/check:55-58`): 79 is reachable only after all three pass
+  with the run marked partial, and never on a failure.
+- **Regression coverage** (`tests/dev_scripts.rs`): `:274-291` fakes each
+  probe and asserts 75 with no grading command run, `:293-318` the
+  coverage/required mapping, `:320-340` normalization, `:356-384` the hooks.
+
+### The `command -v` finding (PR #83)
+
+PR #83 is closed and unmerged; leave it and its branch untouched. Its
+`bin/check` guarded with `command -v`, which leaves the missing-component
+case open: installed proxies do not prove usable tools, so a present rustc,
+rustfmt or Clippy component that cannot run used to surface as a child
+failure instead of a refusal. The current gate answers that finding by running
+each tool (`bin/check:7-16`), and `tests/dev_scripts.rs:274-291` keeps the
+answer honest: with every probe faked to fail, the gate exits 75 and invokes
+no grading command.
+
+`docs/changelog/unreleased.md` carries the user-visible entry for this
+gate behaviour.
