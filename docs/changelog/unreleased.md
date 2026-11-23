@@ -9,3 +9,6 @@
   -- -D warnings` and `cargo test --locked` all pass: a partial grade, deferred to CI.
   Any executed fmt, clippy or test failure is 1, including a child that itself exits 75
   or 79. The git hooks accept 0 and 79 and propagate 75 and every other non-zero.
+- **The transitive `url` dependency is bumped to 2.5.9.** This clears
+  RUSTSEC-2026-0592, a stack overflow in `Url::origin()` on nested `blob:` URLs.
+  No audit gate or advisory handling was changed.
