@@ -28,10 +28,10 @@ triage:
   qualify_into: [bug, feature, dupe, question, docs]
   # Nobody reads this tracker by hand: below this confidence the bot stops and waits for a person.
   confidence_threshold: 0.4
-  close_unanswered_repro_after_days: 14
-  stale_after_days: 30
+  close_unanswered_repro_after_days: 60
+  stale_after_days: 60
   stale_action: comment_then_close
-  close_inactive_after_days: 30
+  close_inactive_after_days: 60
   # CLAUDE.md's NEVER entries that describe a change someone could propose, plus its "NOT building"
   # list. `--no-verify` and force-pushing `main` are rules for how to work, not proposals.
   non_goals:
@@ -63,12 +63,13 @@ pr:
   auto_merge_scope: any
   require_review: true
   large_threshold_lines: 660
-  close_awaiting_author_after_days: 21
-  close_inactive_after_days: 30
+  close_awaiting_author_after_days: 60
+  close_inactive_after_days: 60
 
-# Owner, 2026-11-26: a branch idle two weeks is archive-tagged and deleted.
+# Owner, 2026-11-26: a branch idle 60 days is archive-tagged and deleted, the same clock as stale
+# PRs and issues on the open-source repos.
 branches:
-  close_inactive_after_days: 14
+  close_inactive_after_days: 60
 
 review:
   enabled: true
