@@ -122,8 +122,8 @@ review:
 scout:
   survey: broken_only
 
-# Off (owner, 2026-11-26): one PR per advisory was noise. Dependabot batches advisories weekly instead
-# (.github/dependabot.yml `*-security` groups).
+# devops: off (owner, 2026-11-26): one PR per advisory was noise. Dependabot security updates
+# (.github/dependabot.yml `*-security` groups, one PR per ecosystem) are the advisory lane.
 devops:
   watch: off
 

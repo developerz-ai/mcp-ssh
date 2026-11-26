@@ -1,8 +1,9 @@
-# Weekly, grouped, quiet (owner, 2026-11-26: "not so damn much daily prs"). Every ecosystem runs
-# Monday. Minor and patch updates arrive as one PR per ecosystem, security updates as one more; a
-# major update arrives on its own. The developerz.ai maintainer agent reviews, fixes and merges every
-# Dependabot PR (.dz/maintainer/maintainer.yml); its own advisory watch is off, so this file is the
-# one dependency-advisory lane.
+# Weekly, grouped, quiet (owner, 2026-11-26: "not so damn much daily prs"). Version updates run
+# Monday, minor and patch as one PR per ecosystem; a major arrives on its own. Security updates are
+# not scheduled: they open when an advisory lands, batched into one `*-security` PR per ecosystem.
+# Dependabot has no security updates for Docker, so the base image's advisories are not covered
+# here. The developerz.ai maintainer agent reviews, fixes and merges every Dependabot PR
+# (.dz/maintainer/maintainer.yml); its own advisory watch is off.
 # The 14-day cooldown lets a compromised release get caught before it reaches us. Security updates
 # are unaffected.
 version: 2
@@ -40,9 +41,6 @@ updates:
       docker-minor-and-patch:
         patterns: ["*"]
         update-types: ["minor", "patch"]
-      docker-security:
-        applies-to: security-updates
-        patterns: ["*"]
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
