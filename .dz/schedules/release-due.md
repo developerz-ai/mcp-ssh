@@ -1,6 +1,10 @@
 # Brief: is a release needed?
 
-Weekly checkup, Tuesdays 03:00 UTC, fired by `schedules: release-due`. It covers what people install: the `v*` tag, the image on GHCR (`ghcr.io/developerz-ai/mcp-ssh`), and the GitHub Release carrying the `.deb` files that `deploy/install.sh` downloads. The block below gathers facts and you make the call. A merge or a count never cuts a release.
+Weekly checkup, Mondays 04:00 UTC, fired by `schedules: release-due`. It covers what people install: the `v*` tag, the image on GHCR (`ghcr.io/developerz-ai/mcp-ssh`), and the GitHub Release carrying the `.deb` files that `deploy/install.sh` downloads. The block below gathers facts and you make the call. A merge or a count never cuts a release.
+
+## Cadence: weekly, judged (owner, 2026-11-26)
+
+Only this Monday checkup cuts a release: at most one a week. A merge, a fix, a count of fixes or an interactive session never cuts one; a maintainer can still cut by hand. The only off-cycle release is `.dz/schedules/security-release.md`: a fix for a *published* first-tier advisory (GitHub Security Advisories, NVD, CISA KEV, RustSec or the vendor's own) rated **high or critical (CVSS >= 7.0, or KEV-listed)** that affects what users install (the binary, the image or the `.deb`; not a dev-only, test, website or docs-tooling dependency). Our own hardening with no published advisory waits for Monday.
 
 ## Judge
 

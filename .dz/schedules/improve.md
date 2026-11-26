@@ -1,6 +1,6 @@
 # Brief: monthly improvement
 
-Fired on the first Tuesday of each month by `schedules: improve` (`weeks_of_month: [1]`).
+Fired on the first Monday of each month by `schedules: improve` (`weeks_of_month: [1]`).
 
 Once a month, leave mcp-ssh measurably better, so nobody has to touch it by hand. `CLAUDE.md` binds every change, and `non_goals` in the policy file are off limits. A red `main`, a missing publish and a stuck Dependabot PR belong to `health`.
 

@@ -66,8 +66,9 @@ pr:
   close_awaiting_author_after_days: 21
   close_inactive_after_days: 30
 
+# Owner, 2026-11-26: a branch idle two weeks is archive-tagged and deleted.
 branches:
-  close_inactive_after_days: 30
+  close_inactive_after_days: 14
 
 review:
   enabled: true
@@ -121,8 +122,10 @@ review:
 scout:
   survey: broken_only
 
+# Off (owner, 2026-11-26): one PR per advisory was noise. Dependabot batches advisories weekly instead
+# (.github/dependabot.yml `*-security` groups).
 devops:
-  watch: advisories
+  watch: off
 
 release:
   # `none`: there is no release manager. Empty channels: the agent publishes nothing itself.
@@ -139,26 +142,26 @@ escalate:
   # hardcoded asks, which this list cannot remove.
   ask_before_acting: [breaking_change]
 
-# The checkups nothing else triggers. One weekday per repo, so the fleet is not hit at once.
+# The checkups nothing else triggers. All weekly lanes run Monday (owner, 2026-11-26), hours offset from the fleet.
 schedules:
-  # Weekly and judged, so a merge never cuts a release.
+  # Weekly and judged, so a merge never cuts a release (owner, 2026-11-26: weekly, Monday only).
   - name: release-due
-    days: [tue]
-    hours_utc: [3]
+    days: [mon]
+    hours_utc: [4]
     brief_file: .dz/schedules/release-due.md
-  # The one exception, so a confirmed security fix does not wait up to a week for the slot above.
+  # The one exception: a published high/critical advisory fix that reaches users. Files an ask only.
   - name: security-release
-    days: [mon, wed, thu, fri, sat, sun]
+    days: [tue, wed, thu, fri, sat, sun]
     hours_utc: [6]
     brief_file: .dz/schedules/security-release.md
   # Weekly: the failures nothing announces.
   - name: health
-    days: [tue]
-    hours_utc: [7]
+    days: [mon]
+    hours_utc: [9]
     brief_file: .dz/schedules/health.md
-  # Monthly: the first Tuesday of the month.
+  # Monthly: the first Monday of the month.
   - name: improve
-    days: [tue]
+    days: [mon]
     weeks_of_month: [1]
-    hours_utc: [8]
+    hours_utc: [10]
     brief_file: .dz/schedules/improve.md

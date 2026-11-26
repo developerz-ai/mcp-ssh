@@ -1,6 +1,6 @@
 # Brief: is the project healthy?
 
-Weekly checkup (Tuesdays 07:00 UTC) fired by `schedules: health`: the failures no issue or PR announces.
+Weekly checkup (Mondays 09:00 UTC) fired by `schedules: health`: the failures no issue or PR announces.
 
 | Signal | Command | Healthy |
 |---|---|---|
