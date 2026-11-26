@@ -1,7 +1,9 @@
-# Cargo weekly; Docker and GitHub Actions monthly (as in developerz-ai/wurk: a weekly cadence there is
-# mostly one PR per patch release for no change in what ships). Minor and patch updates are grouped
-# per ecosystem; a major update arrives on its own. The developerz.ai maintainer agent reviews,
-# fixes and merges every Dependabot PR (.dz/maintainer/maintainer.yml).
+# Weekly, grouped, quiet (owner, 2026-11-26: "not so damn much daily prs"). Version updates run
+# Monday, minor and patch as one PR per ecosystem; a major arrives on its own. Security updates are
+# not scheduled: they open when an advisory lands, batched into one `*-security` PR per ecosystem.
+# Dependabot has no security updates for Docker, so the base image's advisories are not covered
+# here. The developerz.ai maintainer agent reviews, fixes and merges every Dependabot PR
+# (.dz/maintainer/maintainer.yml); its own advisory watch is off.
 # The 14-day cooldown lets a compromised release get caught before it reaches us. Security updates
 # are unaffected.
 version: 2
@@ -14,17 +16,23 @@ updates:
       time: "10:00"
     cooldown:
       default-days: 14
+    open-pull-requests-limit: 3
     groups:
       cargo-minor-and-patch:
         patterns: ["*"]
         update-types: ["minor", "patch"]
+      cargo-security:
+        applies-to: security-updates
+        patterns: ["*"]
   - package-ecosystem: "docker"
     directory: "/"
     schedule:
-      interval: "monthly"
+      interval: "weekly"
+      day: "monday"
       time: "10:00"
     cooldown:
       default-days: 14
+    open-pull-requests-limit: 3
     # The builder's Rust version must equal rust-toolchain.toml and Cargo.toml
     # `rust-version`; Dependabot can't bump those, so toolchain bumps are manual.
     ignore:
@@ -36,11 +44,16 @@ updates:
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: "monthly"
+      interval: "weekly"
+      day: "monday"
       time: "10:00"
     cooldown:
       default-days: 14
+    open-pull-requests-limit: 3
     groups:
       github-actions-minor-and-patch:
         patterns: ["*"]
         update-types: ["minor", "patch"]
+      github-actions-security:
+        applies-to: security-updates
+        patterns: ["*"]

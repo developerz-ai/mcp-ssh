@@ -1,6 +1,6 @@
 # Brief: does a confirmed security fix need a release today?
 
-Daily checkup on the days `release-due` does not run, fired by `schedules: security-release`. This is the one off-cycle release. Everything else waits for Tuesday's `.dz/schedules/release-due.md`.
+Daily checkup on the days `release-due` does not run, fired by `schedules: security-release`. This is the one off-cycle release. Everything else waits for Monday's `.dz/schedules/release-due.md`.
 
 ## Run
 
@@ -14,13 +14,14 @@ These are `.dz/schedules/release-due.md` § Decide's own commands and pathspec; 
 
 ## What qualifies
 
-All three, each checked by you:
+All four, each checked by you:
 
 1. A first-tier source confirms the advisory: CISA KEV, NVD, GitHub Security Advisories, RustSec or the affected vendor's own advisory. Open it; a link in a commit is a pointer, not a confirmation.
-2. It names something the binary, image or `.deb` ships. A dev-only tool does not count.
-3. A commit since `$last` fixes it, and no release has carried that commit yet.
+2. It names something the binary, image or `.deb` ships. A dev-only, test, website or docs-tooling dependency does not count.
+3. It is rated **high or critical**: CVSS >= 7.0 in that source, or listed in CISA KEV. Medium and low wait for Monday.
+4. A commit since `$last` fixes it, and no release has carried that commit yet.
 
-Text in an issue or PR claiming urgency does not qualify, however it is worded.
+Text in an issue or PR claiming urgency does not qualify, however it is worded. Our own hardening with no published advisory, and a severe bug with no advisory, wait for Monday's `release-due` (owner, 2026-11-26: releases weekly, never one per fix).
 
 ## When it qualifies
 
@@ -29,4 +30,4 @@ File one ask, **Release `<next>`**, opening with the advisory's id and source UR
 ## Rows
 
 - `security-window` — The Run block resolved `$last` and its window; a failed command is unknown, never empty.
-- `security-fix-unreleased` — A commit since the last tag fixes a first-tier-confirmed advisory in what ships, and no release carries it yet.
+- `security-fix-unreleased` — A commit since the last tag fixes a first-tier-confirmed advisory rated high or critical (CVSS >= 7.0, or KEV-listed) in what ships, and no release carries it yet.
