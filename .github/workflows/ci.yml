@@ -22,6 +22,27 @@ env:
 # Every action is pinned to a commit SHA (Dependabot's github-actions ecosystem
 # keeps them fresh). The Rust toolchain comes from rust-toolchain.toml.
 jobs:
+  # Docs-only PRs skip the image and .deb builds (nothing they ship changed). `main` pushes and
+  # tags always build. fmt/check/audit still run: the public-tree guard reads the whole tree.
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      build: ${{ steps.diff.outputs.build }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+      - id: diff
+        run: |
+          build=true
+          if [ "$GITHUB_EVENT_NAME" = pull_request ] \
+              && changed=$(git diff --name-only HEAD^1 HEAD) && [ -n "$changed" ] \
+              && ! grep -qvE '^docs/|\.md$' <<<"$changed"; then
+            build=false
+          fi
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+
   fmt:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -84,7 +105,8 @@ jobs:
   # kill) on every run, PRs included. On a tag, the smoked image is pushed by
   # digest; `image-publish` stitches the digests into one multi-arch tag.
   image:
-    needs: [fmt, check, audit, shellcheck]
+    needs: [changes, fmt, check, audit, shellcheck]
+    if: needs.changes.outputs.build == 'true'
     strategy:
       matrix:
         # PRs build amd64 only; `main` and tags build both arches.
@@ -157,7 +179,8 @@ jobs:
   # Built and smoke-tested on every run (PRs too) so a broken package is caught
   # before a tag; only `release` publishes it.
   deb:
-    needs: [fmt, check, audit, shellcheck]
+    needs: [changes, fmt, check, audit, shellcheck]
+    if: needs.changes.outputs.build == 'true'
     strategy:
       matrix:
         # 22.04 (glibc 2.35): cargo-deb's `$auto` depends on the build host's
