@@ -170,7 +170,7 @@ mcp-ssh is maintained by AI: by [developerz.ai](https://developerz.ai), the way 
 | a change that breaks a NEVER rule (secrets in output, root, no TLS, a fourth tool…) | declined with the rule quoted |
 | a breaking change or a new feature | a human decides |
 
-Scheduled checkups, briefs in [`.dz/schedules/`](.dz/schedules/): weekly `release-due` judges whether a release is needed, daily `security-release` ships a confirmed security fix off-cycle, weekly `health` catches the failures nothing announces, and monthly `improve` lands at most three small, evidenced improvements, the Rust toolchain bump included.
+Scheduled checkups, briefs in [`.dz/schedules/`](.dz/schedules/): weekly `release-due` judges whether a release is needed, the platform's advisory watch files a confirmed security fix off-cycle, and `improve` (first and third Monday) lands at most three small, evidenced improvements, the Rust toolchain bump included.
 
 ## ⭐ Star history
 
